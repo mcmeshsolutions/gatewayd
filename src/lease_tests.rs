@@ -196,3 +196,39 @@ fn status_lists_world_lease_and_revision() {
     let l = &g.status().unwrap()[0];
     assert!(l.starts_with("w1 LOCKED host=") && l.contains("epoch=1") && l.contains("latest=w1:R_0000"), "{l}");
 }
+
+fn wal_row(g: &Gateway, lease: &str, seq: i64, op: &str, cx: i32, cz: i32, hash: [u8; 32]) {
+    g.db()
+        .execute(
+            "INSERT INTO chunk_wal(lease_id,seq,op,dim,cx,cz,hash) VALUES(?,?,?,?,?,?,?)",
+            rusqlite::params![lease, seq, op, "minecraft:overworld", cx, cz, hash.as_slice()],
+        )
+        .unwrap();
+}
+
+#[test]
+fn sanity_gate_blocks_world_wipe_and_keeps_head_and_wal() {
+    let mut g = setup();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    let h = g.cas.put(b"chunk").unwrap();
+    for i in 0..100 {
+        wal_row(&g, &a.lease_id, i + 1, "put:region", i as i32, 0, h);
+    }
+    wal_row(&g, &a.lease_id, 101, "barrier", 0, 0, [0; 32]);
+    let r1 = g.commit(&a.lease_id, a.epoch, &a.base_rev, CommitKind::Autosave, false, 1_000).unwrap();
+    for i in 0..60 {
+        wal_row(&g, &a.lease_id, 102 + i, "del:region", i as i32, 0, [0; 32]);
+    }
+    wal_row(&g, &a.lease_id, 200, "barrier", 0, 0, [0; 32]);
+    let err = g.commit(&a.lease_id, a.epoch, &r1.id, CommitKind::Autosave, false, 2_000).unwrap_err();
+    assert!(matches!(err, Error::Rejected(_)), "{err:?}");
+    let rows: i64 = g.db().query_row("SELECT COUNT(*) FROM chunk_wal WHERE lease_id=?", rusqlite::params![a.lease_id], |r| r.get(0)).unwrap();
+    assert_eq!(rows, 61, "rejected frames must stay in the WAL");
+    // a normal small delete passes after the bad frames are gone
+    g.db().execute("DELETE FROM chunk_wal WHERE seq>=102", []).unwrap();
+    for i in 0..5 {
+        wal_row(&g, &a.lease_id, 102 + i, "del:region", i as i32, 0, [0; 32]);
+    }
+    wal_row(&g, &a.lease_id, 200, "barrier", 0, 0, [0; 32]);
+    g.commit(&a.lease_id, a.epoch, &r1.id, CommitKind::Autosave, false, 3_000).unwrap();
+}

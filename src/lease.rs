@@ -30,6 +30,7 @@ pub enum Error {
     BadFrame(&'static str),
     BadMac,
     MissingBlob,
+    Rejected(String),
     Store(String),
 }
 
@@ -507,7 +508,11 @@ impl Gateway {
     /// Applies `changes` to the head and advances `main`. The caller has already checked the lease.
     fn new_revision(&mut self, world: &str, lease: &str, kind: &str, changes: &[Change]) -> Result<Revision> {
         let head = self.head(world)?;
-        let root = manifest::apply(&self.cas, Some(self.revision_root(&head)?), changes)?;
+        let base = self.revision_root(&head)?;
+        let root = manifest::apply(&self.cas, Some(base), changes)?;
+        if let Err(why) = crate::sanity::check(&self.cas, base, root) {
+            return Err(Error::Rejected(why));
+        }
         let tx = self.db.transaction()?;
         let seq: i64 = tx.query_row("SELECT MAX(seq)+1 FROM revisions WHERE world_id=?", params![world], |r| r.get(0))?;
         let id = format!("{world}:R_{seq:04}");
@@ -558,7 +563,14 @@ impl Gateway {
     fn promote(&mut self, lease: &str, world: &str) -> Result<()> {
         let (changes, barrier) = self.wal_pending(lease)?;
         if barrier.is_some() {
-            self.new_revision(world, lease, "RECOVERED", &changes)?;
+            match self.new_revision(world, lease, "RECOVERED", &changes) {
+                Ok(_) => {}
+                Err(Error::Rejected(why)) => {
+                    eprintln!("sanity gate held back recovery of {world} from {lease}: {why}");
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            }
         }
         self.wal_trim(lease, barrier, true)
     }

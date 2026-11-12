@@ -10,6 +10,7 @@ mod chaos_tests;
 mod lease_tests;
 pub mod panel;
 pub mod relay;
+pub mod sanity;
 pub mod server;
 pub mod tunnel;
 pub mod wal;

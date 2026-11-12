@@ -358,6 +358,23 @@ pub fn diff(cas: &Cas, a: Option<Hash>, b: Option<Hash>) -> Result<Vec<Diff>> {
     Ok(out)
 }
 
+/// Number of chunks of one kind across all dimensions.
+pub fn chunk_count(cas: &Cas, root: Hash, kind: Kind) -> Result<u64> {
+    let r = load_root(cas, Some(root))?;
+    let mut n = 0u64;
+    for ((_, k), t) in r.subs {
+        if k != kind {
+            continue;
+        }
+        for s in load_top(cas, Some(t))?.into_values() {
+            for rh in load_arr(cas, T_SUP, 256, Some(s))?.into_iter().flatten() {
+                n += load_arr(cas, T_REG, 1024, Some(rh))?.into_iter().flatten().count() as u64;
+            }
+        }
+    }
+    Ok(n)
+}
+
 /// Every node and leaf blob hash reachable from `root`; feed the union over retained revisions to `Cas::sweep`.
 pub fn reachable(cas: &Cas, root: Hash, out: &mut HashSet<Hash>) -> Result<()> {
     if !out.insert(root) {

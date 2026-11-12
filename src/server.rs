@@ -102,6 +102,10 @@ impl IntoResponse for ApiErr {
             ApiErr::Domain(Error::StaleEpoch) => (StatusCode::CONFLICT, "STALE_EPOCH"),
             ApiErr::Domain(Error::HeadMoved) => (StatusCode::CONFLICT, "HEAD_MOVED"),
             ApiErr::Domain(Error::MissingBlob) => (StatusCode::CONFLICT, "MISSING_BLOB"),
+            ApiErr::Domain(Error::Rejected(m)) => {
+                eprintln!("sanity gate rejected a commit: {m}");
+                (StatusCode::UNPROCESSABLE_ENTITY, "REJECTED_BY_SANITY_GATE")
+            }
             ApiErr::Domain(Error::BadMac) => (StatusCode::FORBIDDEN, "BAD_MAC"),
             ApiErr::Domain(Error::BadFrame(m)) => (StatusCode::BAD_REQUEST, m),
             ApiErr::Domain(e) => {
