@@ -1,0 +1,198 @@
+use crate::lease::*;
+use rusqlite::Connection;
+
+fn test_cas() -> crate::cas::Cas {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::cas::Cas::open(std::env::temp_dir().join(format!("mcmesh-lt-{}-{n}", std::process::id()))).unwrap()
+}
+
+const W: &str = "w1";
+
+fn hw(tier: u8, score: f64) -> Hw {
+    Hw { tier, score, wants_host: true, takeover: true }
+}
+
+fn setup() -> Gateway {
+    let mut g = Gateway::open(Connection::open_in_memory().unwrap(), test_cas(), 0).unwrap();
+    g.create_world(W, "Create Full Stack", "1.21.1", "neoforge").unwrap();
+    g.add_member(W, "u-a", "alice", "dev-a", Role::HostEligible).unwrap();
+    g.add_member(W, "u-b", "bob", "dev-b", Role::HostEligible).unwrap();
+    g.add_member(W, "u-c", "carol", "dev-c", Role::ClientOnly).unwrap();
+    g
+}
+
+fn host(j: Join) -> Grant {
+    match j {
+        Join::Host(g) => g,
+        other => panic!("expected Host, got {other:?}"),
+    }
+}
+
+#[test]
+fn first_eligible_becomes_host_others_guest() {
+    let mut g = setup();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    assert_eq!(a.epoch, 1);
+    assert_eq!(g.state(W).unwrap().0, "LOCKED");
+    assert!(matches!(g.join(W, "dev-b", hw(2, 5.0), 10).unwrap(), Join::Guest { epoch: 1, .. }));
+    assert_eq!(g.live_lease_count(W).unwrap(), 1);
+}
+
+#[test]
+fn client_only_and_non_members_cannot_host() {
+    let mut g = setup();
+    assert_eq!(g.join(W, "dev-c", hw(1, 99.0), 0).unwrap(), Join::Wait { phase: "NO_HOST".into() });
+    g.add_member("w1", "u-x", "xavier", "dev-x", Role::HostEligible).unwrap();
+    g.db().execute("DELETE FROM members WHERE player_uuid='u-x'", []).unwrap();
+    assert!(matches!(g.join(W, "dev-x", hw(1, 1.0), 0), Err(Error::NotMember)));
+}
+
+#[test]
+fn expiry_elects_warm_candidate_and_fences_old_epoch() {
+    let mut g = setup();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    g.join(W, "dev-b", hw(3, 2.0), 1_000).unwrap();
+    g.heartbeat(&a.lease_id, a.epoch, 15_000).unwrap();
+    g.join(W, "dev-b", hw(3, 2.0), 40_000).unwrap();
+    g.tick(59_999).unwrap();
+    assert_eq!(g.state(W).unwrap().0, "LOCKED");
+    g.tick(60_001).unwrap();
+    assert_eq!(g.state(W).unwrap(), ("MIGRATING".into(), Some("BOOTING".into())));
+    assert!(matches!(g.heartbeat(&a.lease_id, a.epoch, 60_002), Err(Error::StaleEpoch)));
+    let b = host(g.join(W, "dev-b", hw(3, 2.0), 61_000).unwrap());
+    assert_eq!(b.epoch, 2);
+    g.host_ready(&b.lease_id, b.epoch).unwrap();
+    assert_eq!(g.state(W).unwrap().0, "LOCKED");
+    assert_eq!(g.live_lease_count(W).unwrap(), 1);
+}
+
+#[test]
+fn expiry_with_nobody_waiting_goes_idle() {
+    let mut g = setup();
+    host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    g.tick(46_000).unwrap();
+    assert_eq!(g.state(W).unwrap().0, "IDLE");
+}
+
+#[test]
+fn stale_host_cannot_commit_after_fencing() {
+    let mut g = setup();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    g.join(W, "dev-b", hw(3, 2.0), 40_000).unwrap();
+    g.tick(46_000).unwrap();
+    let r = g.commit(&a.lease_id, a.epoch, &a.base_rev, CommitKind::Autosave, false, 46_001);
+    assert!(matches!(r, Err(Error::StaleEpoch)));
+}
+
+#[test]
+fn commit_is_compare_and_swap_on_head() {
+    let mut g = setup();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    let r1 = g.commit(&a.lease_id, a.epoch, &a.base_rev, CommitKind::Autosave, false, 100).unwrap();
+    assert_eq!(r1.seq, 1);
+    assert!(matches!(
+        g.commit(&a.lease_id, a.epoch, &a.base_rev, CommitKind::Autosave, false, 200),
+        Err(Error::HeadMoved)
+    ));
+    let r2 = g.commit(&a.lease_id, a.epoch, &r1.id, CommitKind::Autosave, false, 300).unwrap();
+    assert_eq!((r2.seq, r2.parent), (2, r1.id));
+}
+
+#[test]
+fn preemption_respects_min_hold_then_hands_off() {
+    let mut g = setup();
+    let a = host(g.join(W, "dev-a", hw(3, 2.0), 0).unwrap());
+    g.join(W, "dev-b", hw(1, 9.0), 30_000).unwrap();
+    assert_eq!(g.state(W).unwrap().0, "LOCKED", "inside min hold");
+    g.heartbeat(&a.lease_id, a.epoch, 600_000).unwrap();
+    g.join(W, "dev-b", hw(1, 9.0), 600_001).unwrap();
+    assert_eq!(g.state(W).unwrap(), ("MIGRATING".into(), Some("PREPARING".into())));
+    let d = g.heartbeat(&a.lease_id, a.epoch, 601_000).unwrap();
+    assert_eq!(d, vec![Directive::MigratePrepare { target_device: Some("dev-b".into()), deadline_ms: 20_000 }]);
+    let rev = g.commit(&a.lease_id, a.epoch, &a.base_rev, CommitKind::Migrate, true, 602_000).unwrap();
+    assert_eq!(g.state(W).unwrap(), ("MIGRATING".into(), Some("BOOTING".into())));
+    let b = host(g.join(W, "dev-b", hw(1, 9.0), 603_000).unwrap());
+    assert_eq!((b.epoch, b.base_rev.as_str()), (2, rev.id.as_str()));
+    g.host_ready(&b.lease_id, b.epoch).unwrap();
+    assert!(matches!(g.heartbeat(&a.lease_id, a.epoch, 604_000), Err(Error::StaleEpoch)));
+}
+
+#[test]
+fn host_leaving_with_guests_migrates_without_guests_idles() {
+    let mut g = setup();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    g.join(W, "dev-b", hw(3, 2.0), 1_000).unwrap();
+    g.release(&a.lease_id, a.epoch, true).unwrap();
+    g.commit(&a.lease_id, a.epoch, &a.base_rev, CommitKind::Shutdown, true, 2_000).unwrap();
+    assert_eq!(g.state(W).unwrap(), ("MIGRATING".into(), Some("BOOTING".into())));
+    let b = host(g.join(W, "dev-b", hw(3, 2.0), 3_000).unwrap());
+    g.host_ready(&b.lease_id, b.epoch).unwrap();
+    g.release(&b.lease_id, b.epoch, false).unwrap();
+    g.commit(&b.lease_id, b.epoch, "w1:R_0001", CommitKind::Shutdown, true, 4_000).unwrap();
+    assert_eq!(g.state(W).unwrap().0, "IDLE");
+}
+
+#[test]
+fn silent_boot_target_is_skipped() {
+    let mut g = setup();
+    g.add_member(W, "u-d", "dave", "dev-d", Role::HostEligible).unwrap();
+    let a = host(g.join(W, "dev-a", hw(3, 2.0), 0).unwrap());
+    g.join(W, "dev-b", hw(1, 9.0), 1_000).unwrap();
+    g.join(W, "dev-d", hw(2, 5.0), 1_000).unwrap();
+    g.release(&a.lease_id, a.epoch, true).unwrap();
+    g.commit(&a.lease_id, a.epoch, &a.base_rev, CommitKind::Migrate, true, 2_000).unwrap();
+    g.join(W, "dev-d", hw(2, 5.0), 40_000).unwrap();
+    g.join(W, "dev-b", hw(1, 9.0), 40_000).unwrap();
+    g.tick(62_001).unwrap();
+    let d = host(g.join(W, "dev-d", hw(2, 5.0), 62_100).unwrap());
+    assert_eq!(d.epoch, 3, "dev-b (epoch 2) timed out, dev-d next");
+}
+
+#[test]
+fn database_refuses_two_live_leases() {
+    let mut g = setup();
+    host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    let r = g.db().execute(
+        "INSERT INTO leases(id,world_id,device_id,epoch,ref_name,base_rev,tier,hmac_key,status,granted_at) \
+         VALUES('dup','w1','dev-b',99,'main','w1:R_0000',1,zeroblob(32),'ACTIVE',0)",
+        [],
+    );
+    assert!(r.is_err());
+}
+
+#[test]
+fn restart_grants_a_full_ttl_grace() {
+    let dir = std::env::temp_dir().join(format!("mcmesh-test-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&dir);
+    {
+        let mut g = Gateway::open(Connection::open(&dir).unwrap(), test_cas(), 0).unwrap();
+        g.create_world(W, "x", "1.21.1", "neoforge").unwrap();
+        g.add_member(W, "u-a", "alice", "dev-a", Role::HostEligible).unwrap();
+        host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    }
+    let mut g = Gateway::open(Connection::open(&dir).unwrap(), test_cas(), 1_000_000).unwrap();
+    g.tick(1_030_000).unwrap();
+    assert_eq!(g.state(W).unwrap().0, "LOCKED");
+    g.tick(1_046_000).unwrap();
+    assert_eq!(g.state(W).unwrap().0, "IDLE");
+    let _ = std::fs::remove_file(&dir);
+}
+
+#[test]
+fn passive_candidate_never_migrates_a_healthy_host() {
+    let mut g = setup();
+    host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    let passive = Hw { tier: 1, score: 1000.0, wants_host: true, takeover: false };
+    assert!(matches!(g.join(W, "dev-b", passive, 100_000_000).unwrap(), Join::Guest { .. }));
+    assert_eq!(g.state(W).unwrap().0, "LOCKED");
+}
+
+#[test]
+fn status_lists_world_lease_and_revision() {
+    let mut g = setup();
+    assert!(g.status().unwrap()[0].contains("host=- "));
+    host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    let l = &g.status().unwrap()[0];
+    assert!(l.starts_with("w1 LOCKED host=") && l.contains("epoch=1") && l.contains("latest=w1:R_0000"), "{l}");
+}
