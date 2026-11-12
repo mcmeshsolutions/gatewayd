@@ -5,6 +5,8 @@ pub mod mcproto;
 pub mod chain;
 pub mod lease;
 #[cfg(test)]
+mod chaos_tests;
+#[cfg(test)]
 mod lease_tests;
 pub mod panel;
 pub mod relay;
