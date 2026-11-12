@@ -264,6 +264,7 @@ pub(crate) async fn ticket(
         let gw = s.gw();
         let dev = crate::server::auth(&gw, &h)?;
         gw.require_member(&world, &dev)?;
+        gw.require_pack(&world, &crate::server::req_pack(&h)?)?;
         gw.device_player(&dev)?.ok_or(ApiErr::Unauthorized)?
     };
     let t = rand_b64(24).map_err(ApiErr::from)?;

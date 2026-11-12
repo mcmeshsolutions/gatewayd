@@ -106,6 +106,7 @@ impl IntoResponse for ApiErr {
                 eprintln!("sanity gate rejected a commit: {m}");
                 (StatusCode::UNPROCESSABLE_ENTITY, "REJECTED_BY_SANITY_GATE")
             }
+            ApiErr::Domain(Error::PackMismatch) => (StatusCode::FORBIDDEN, "PACK_MISMATCH"),
             ApiErr::Domain(Error::BadMac) => (StatusCode::FORBIDDEN, "BAD_MAC"),
             ApiErr::Domain(Error::BadFrame(m)) => (StatusCode::BAD_REQUEST, m),
             ApiErr::Domain(e) => {
@@ -118,6 +119,15 @@ impl IntoResponse for ApiErr {
 }
 
 type R = Result<Json<Value>, ApiErr>;
+
+/// Modpack the caller was built for; clients that predate packs belong to "default".
+pub(crate) fn req_pack(h: &HeaderMap) -> Result<String, ApiErr> {
+    let p = h.get("x-mesh-pack").and_then(|v| v.to_str().ok()).unwrap_or("default");
+    if p.is_empty() || p.len() > 64 || !p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+        return Err(ApiErr::BadRequest("BAD_PACK"));
+    }
+    Ok(p.to_string())
+}
 
 pub(crate) fn auth(gw: &Gateway, h: &HeaderMap) -> Result<String, ApiErr> {
     let tok = h
@@ -183,7 +193,9 @@ async fn create_world(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): Jso
     if !ok(&b.name, 64) || !ok(&b.mc_version, 16) || !ok(&b.loader, 16) {
         return Err(ApiErr::BadRequest("BAD_WORLD"));
     }
+    let pack = req_pack(&h)?;
     let id = gw.create_world_for(&dev, &b.name, &b.mc_version, &b.loader)?;
+    gw.set_pack(&id, &pack)?;
     Ok(Json(json!({ "id": id, "base_rev": format!("{id}:R_0000") })))
 }
 
@@ -195,10 +207,12 @@ async fn list_worlds(
     let gw = s.gw();
     let dev = auth(&gw, &h)?;
     let now = s.now();
+    let pack = req_pack(&h)?;
     let hw = q.get("score").and_then(|v| v.parse::<f64>().ok()).map(|sc| (q.get("tier").and_then(|v| v.parse::<u8>().ok()).unwrap_or(1), sc));
     let worlds: Vec<Value> = gw
         .worlds_of(&dev)?
         .into_iter()
+        .filter(|w| gw.pack_of(&w.0).map(|p| p == pack).unwrap_or(false))
         .map(|(id, name, mc, role, state, host)| {
             let ready = host.is_none() || s.live_worlds.lock().unwrap_or_else(|e| e.into_inner()).contains(&id);
             let takeover = hw.filter(|_| ready).and_then(|(tier, score)| gw.takeover_in(&id, &dev, tier, score, now));
@@ -248,6 +262,8 @@ async fn join(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<St
     let now = s.now();
     let mut gw = s.gw();
     let dev = auth(&gw, &h)?;
+    gw.require_member(&world, &dev)?;
+    gw.require_pack(&world, &req_pack(&h)?)?;
     let hw = Hw { tier: b.hw.tier, score: b.hw.score, wants_host: b.hw.wants_host, takeover: b.hw.takeover };
     if let Some(b) = b.hw.bench.as_ref().filter(|v| v.is_object() && v.to_string().len() <= 2048) {
         gw.record_bench(&dev, b)?;

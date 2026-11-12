@@ -31,6 +31,7 @@ pub enum Error {
     BadMac,
     MissingBlob,
     Rejected(String),
+    PackMismatch,
     Store(String),
 }
 
@@ -179,6 +180,7 @@ impl Gateway {
         // older databases lack the activity stamp; existing sessions start their expiry clock now
         let _ = db.execute("ALTER TABLE sessions ADD COLUMN last_used INTEGER", []);
         let _ = db.execute("ALTER TABLE worlds ADD COLUMN mods_json TEXT", []);
+        let _ = db.execute("ALTER TABLE worlds ADD COLUMN pack_id TEXT NOT NULL DEFAULT 'default'", []);
         db.execute("UPDATE sessions SET last_used=? WHERE last_used IS NULL", params![unix_s()])?;
         db.execute("DELETE FROM sessions WHERE last_used>0 AND last_used<?", params![unix_s() - session_ttl_s()])?;
         let mut g = Gateway {
@@ -216,6 +218,25 @@ impl Gateway {
         tx.execute("INSERT INTO refs(world_id,name,rev_id) VALUES(?, 'main', ?)", params![id, rev])?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn pack_of(&self, world: &str) -> Result<String> {
+        self.db
+            .query_row("SELECT pack_id FROM worlds WHERE id=?", params![world], |r| r.get(0))
+            .optional()?
+            .ok_or(Error::NoSuchWorld)
+    }
+
+    pub fn set_pack(&mut self, world: &str, pack: &str) -> Result<()> {
+        if self.db.execute("UPDATE worlds SET pack_id=? WHERE id=?", params![pack, world])? == 0 {
+            return Err(Error::NoSuchWorld);
+        }
+        Ok(())
+    }
+
+    /// A caller may only touch worlds of the modpack it was built for.
+    pub fn require_pack(&self, world: &str, pack: &str) -> Result<()> {
+        if self.pack_of(world)? == pack { Ok(()) } else { Err(Error::PackMismatch) }
     }
 
     /// Creates a world with a generated id and makes the device's player its admin.

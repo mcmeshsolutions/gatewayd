@@ -9,7 +9,7 @@ use tokio::net::{TcpListener, UdpSocket};
 fn usage() -> ! {
     eprintln!(
         "usage: gatewayd serve\n       gatewayd create-world <id> <name> <mc_version> <loader>\n       \
-         gatewayd add-member <world> <mc_uuid> <name> <device> <ADMIN|HOST_ELIGIBLE|CLIENT_ONLY> <token>\n         gatewayd grant <world> <name> <ADMIN|HOST_ELIGIBLE|CLIENT_ONLY>\n         gatewayd drop-token <token>\n         gatewayd revisions <world>\n         gatewayd status\n         gatewayd revert <world> <revision>\n\
+         gatewayd add-member <world> <mc_uuid> <name> <device> <ADMIN|HOST_ELIGIBLE|CLIENT_ONLY> <token>\n         gatewayd grant <world> <name> <ADMIN|HOST_ELIGIBLE|CLIENT_ONLY>\n         gatewayd drop-token <token>\n         gatewayd revisions <world>\n         gatewayd status\n         gatewayd set-pack <world> <pack_id>\n         gatewayd revert <world> <revision>\n\
          env: MCMESH_DB (default mcmesh.db), MCMESH_CAS (default ./cas),\n         relay (needs MCMESH_WORLD, or MCMESH_RELAY=all to serve every world; MCMESH_WORLD then only picks the UDP and ticketless default): MCMESH_RELAY_ADDR (127.0.0.1:9000), MCMESH_PUBLIC_ADDR (0.0.0.0:25565), MCMESH_VOICE_ADDR (0.0.0.0:24454)\n          MCMESH_ADDR (default 127.0.0.1:8080)\n          MCMESH_CREATE=open lets any logged-in player create worlds\n          MCMESH_ADVERTISE=host:port tells clients where guests connect (with MCMESH_WORLD)"
     );
     std::process::exit(2)
@@ -36,6 +36,7 @@ async fn main() {
             gw.add_member(world, uuid, name, device, role).expect("add member");
             gw.add_token(device, token).expect("add token");
         }
+        ["set-pack", world, pack] => gw.set_pack(world, pack).expect("set pack"),
         ["revisions", world] => {
             for r in gw.revisions(world, 50).expect("revisions") {
                 println!("{r}");

@@ -243,3 +243,37 @@ async fn invites_are_admin_issued_single_use_and_never_downgrade() {
     assert_eq!(w["role"], "HOST_ELIGIBLE");
     assert_eq!(w["state"], "IDLE");
 }
+
+#[tokio::test]
+async fn pack_header_scopes_listing_and_join() {
+    let app = app();
+    let get = |tok: &'static str, pack: Option<&'static str>| {
+        let app = app.clone();
+        async move {
+            let mut r = Request::get("/v1/worlds").header("authorization", format!("Bearer {tok}"));
+            if let Some(p) = pack {
+                r = r.header("x-mesh-pack", p);
+            }
+            let resp = app.oneshot(r.body(Body::empty()).unwrap()).await.unwrap();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        }
+    };
+    assert_eq!(get("tok-a", None).await["worlds"].as_array().unwrap().len(), 1);
+    assert_eq!(get("tok-a", Some("other-pack")).await["worlds"].as_array().unwrap().len(), 0);
+    let r = Request::post("/v1/worlds/w1/join")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer tok-a")
+        .header("x-mesh-pack", "other-pack")
+        .body(Body::from(hw().to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(r).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+    let r = Request::post("/v1/worlds/w1/join")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer tok-a")
+        .header("x-mesh-pack", "bad pack!")
+        .body(Body::from(hw().to_string()))
+        .unwrap();
+    assert_eq!(app.oneshot(r).await.unwrap().status().as_u16(), 400);
+}

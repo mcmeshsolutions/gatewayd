@@ -232,3 +232,15 @@ fn sanity_gate_blocks_world_wipe_and_keeps_head_and_wal() {
     wal_row(&g, &a.lease_id, 200, "barrier", 0, 0, [0; 32]);
     g.commit(&a.lease_id, a.epoch, &r1.id, CommitKind::Autosave, false, 3_000).unwrap();
 }
+
+#[test]
+fn packs_are_isolated() {
+    let mut g = setup();
+    assert_eq!(g.pack_of(W).unwrap(), "default");
+    g.require_pack(W, "default").unwrap();
+    assert!(matches!(g.require_pack(W, "other"), Err(Error::PackMismatch)));
+    g.set_pack(W, "other").unwrap();
+    g.require_pack(W, "other").unwrap();
+    assert!(matches!(g.require_pack(W, "default"), Err(Error::PackMismatch)));
+    assert!(matches!(g.set_pack("nope", "x"), Err(Error::NoSuchWorld)));
+}
