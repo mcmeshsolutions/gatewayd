@@ -13,11 +13,12 @@ pub struct ScrubReport {
     pub revisions: u64,
     pub broken_revisions: Vec<String>,
     pub missing: Vec<String>,
+    pub chain_breaks: Vec<String>,
 }
 
 impl ScrubReport {
     pub fn ok(&self) -> bool {
-        self.corrupt.is_empty() && self.broken_revisions.is_empty() && self.missing.is_empty()
+        self.corrupt.is_empty() && self.chain_breaks.is_empty() && self.broken_revisions.is_empty() && self.missing.is_empty()
     }
 }
 
@@ -57,6 +58,25 @@ impl Gateway {
             if self.cas.get(&h).is_err() {
                 bad.insert(name.clone());
                 rep.corrupt.push(name);
+            }
+        }
+        {
+            let mut st = self.db.prepare("SELECT id, chain_hash FROM revisions ORDER BY world_id, seq")?;
+            let rows: Vec<(String, Option<Vec<u8>>)> =
+                st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
+            let mut sealed_worlds: HashSet<String> = HashSet::new();
+            for (id, stored) in rows {
+                let world = id.split(":R_").next().unwrap_or_default().to_string();
+                match stored {
+                    None if sealed_worlds.contains(&world) => rep.chain_breaks.push(id),
+                    None => {}
+                    Some(s) => {
+                        sealed_worlds.insert(world);
+                        if crate::lease::chain_hash_of(&self.db, &id)?.as_slice() != s.as_slice() {
+                            rep.chain_breaks.push(id);
+                        }
+                    }
+                }
             }
         }
         let mut st = self.db.prepare("SELECT id, root_hash FROM revisions ORDER BY id")?;

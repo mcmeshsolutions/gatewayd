@@ -180,6 +180,7 @@ impl Gateway {
         // older databases lack the activity stamp; existing sessions start their expiry clock now
         let _ = db.execute("ALTER TABLE sessions ADD COLUMN last_used INTEGER", []);
         let _ = db.execute("ALTER TABLE worlds ADD COLUMN mods_json TEXT", []);
+        let _ = db.execute("ALTER TABLE revisions ADD COLUMN chain_hash BLOB", []);
         let _ = db.execute("ALTER TABLE worlds ADD COLUMN pack_id TEXT NOT NULL DEFAULT 'default'", []);
         db.execute("UPDATE sessions SET last_used=? WHERE last_used IS NULL", params![unix_s()])?;
         db.execute("DELETE FROM sessions WHERE last_used>0 AND last_used<?", params![unix_s() - session_ttl_s()])?;
@@ -215,6 +216,7 @@ impl Gateway {
             "INSERT INTO revisions(id,world_id,parent_id,root_hash,seq,kind,created_at) VALUES(?,?,NULL,?,0,'IMPORT',?)",
             params![rev, id, empty.as_slice(), wall_s()],
         )?;
+        seal(&tx, &rev)?;
         tx.execute("INSERT INTO refs(world_id,name,rev_id) VALUES(?, 'main', ?)", params![id, rev])?;
         tx.commit()?;
         Ok(())
@@ -541,6 +543,7 @@ impl Gateway {
             "INSERT INTO revisions(id,world_id,parent_id,root_hash,seq,kind,lease_id,created_at) VALUES(?,?,?,?,?,?,?,?)",
             params![id, world, head, root.as_slice(), seq, kind, lease, wall_s()],
         )?;
+        seal(&tx, &id)?;
         tx.execute("UPDATE refs SET rev_id=? WHERE world_id=? AND name='main'", params![id, world])?;
         tx.commit()?;
         Ok(Revision { id, parent: head, seq })
@@ -771,4 +774,34 @@ mod session_tests {
         g.db.execute("UPDATE sessions SET last_used=?", params![unix_s() - session_ttl_s() - 10]).unwrap();
         assert_eq!(g.device_for_token("tok").unwrap(), None);
     }
+}
+
+/// Hash over the revision's identity, content root, author lease and the parent's chain hash.
+/// Rewriting or dropping any past revision changes every later hash.
+pub(crate) fn chain_hash_of(db: &rusqlite::Connection, id: &str) -> rusqlite::Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let (parent, root, kind, lease, at, world): (Option<String>, Vec<u8>, String, Option<String>, i64, String) = db.query_row(
+        "SELECT parent_id, root_hash, kind, lease_id, created_at, world_id FROM revisions WHERE id=?",
+        params![id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+    )?;
+    let prev: Option<Vec<u8>> = match &parent {
+        Some(p) => db.query_row("SELECT chain_hash FROM revisions WHERE id=?", params![p], |r| r.get(0))?,
+        None => None,
+    };
+    let device: Option<String> =
+        lease.as_ref().and_then(|l| db.query_row("SELECT device_id FROM leases WHERE id=?", params![l], |r| r.get(0)).ok());
+    let mut h = Sha256::new();
+    for part in [b"mcmesh-rev1".as_slice(), world.as_bytes(), id.as_bytes(), &root, kind.as_bytes(), device.unwrap_or_default().as_bytes(), prev.as_deref().unwrap_or(&[])] {
+        h.update((part.len() as u32).to_be_bytes());
+        h.update(part);
+    }
+    h.update(at.to_be_bytes());
+    Ok(h.finalize().into())
+}
+
+pub(crate) fn seal(db: &rusqlite::Connection, id: &str) -> rusqlite::Result<()> {
+    let h = chain_hash_of(db, id)?;
+    db.execute("UPDATE revisions SET chain_hash=? WHERE id=?", params![h.as_slice(), id])?;
+    Ok(())
 }

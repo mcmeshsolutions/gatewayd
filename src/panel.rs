@@ -190,6 +190,7 @@ impl Gateway {
             "INSERT INTO revisions(id,world_id,parent_id,root_hash,seq,kind,created_at) VALUES(?,?,?,?,?,'ROLLBACK',?)",
             params![id, world, head, root.as_slice(), seq, crate::lease::wall_s()],
         )?;
+        crate::lease::seal(&tx, &id)?;
         tx.execute("UPDATE refs SET rev_id=? WHERE world_id=? AND name='main'", params![id, world])?;
         tx.commit()?;
         Ok(Ok(id))

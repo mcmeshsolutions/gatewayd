@@ -39,8 +39,8 @@ async fn main() {
         ["scrub"] => {
             let cas = std::env::var("MCMESH_CAS").unwrap_or_else(|_| "cas".into());
             let r = gw.scrub(std::path::Path::new(&cas)).expect("scrub");
-            println!("blobs {} revisions {} corrupt {} broken revisions {} missing blobs {}", r.blobs, r.revisions, r.corrupt.len(), r.broken_revisions.len(), r.missing.len());
-            for l in r.corrupt.iter().chain(&r.broken_revisions).chain(&r.missing) {
+            println!("blobs {} revisions {} corrupt {} broken revisions {} missing blobs {} chain breaks {}", r.blobs, r.revisions, r.corrupt.len(), r.broken_revisions.len(), r.missing.len(), r.chain_breaks.len());
+            for l in r.corrupt.iter().chain(&r.broken_revisions).chain(&r.missing).chain(&r.chain_breaks) {
                 println!("  {l}");
             }
             if !r.ok() {

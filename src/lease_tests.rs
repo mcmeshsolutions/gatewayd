@@ -273,3 +273,24 @@ fn scrub_finds_corruption_and_backup_is_incremental() {
     let rep = g.scrub(&cas_dir).unwrap();
     assert!(rep.missing.contains(&x), "{rep:?}");
 }
+
+#[test]
+fn revision_chain_detects_tampering() {
+    let mut g = setup();
+    let root = std::env::temp_dir().join(format!("mcmesh-chain-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    g.cas = crate::cas::Cas::open(&root.join("cas")).unwrap();
+    g.create_world("w8", "m", "1.21.1", "neoforge").unwrap();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    let mut base = a.base_rev.clone();
+    for i in 0..3u8 {
+        let h = g.cas.put(&[i; 8]).unwrap();
+        wal_row(&g, &a.lease_id, 1 + 2 * i as i64, "put:region", i as i32, 0, h);
+        wal_row(&g, &a.lease_id, 2 + 2 * i as i64, "barrier", 0, 0, [0; 32]);
+        base = g.commit(&a.lease_id, a.epoch, &base, CommitKind::Autosave, false, 1_000 + i as u64).unwrap().id;
+    }
+    assert!(g.scrub(&root.join("cas")).unwrap().chain_breaks.is_empty());
+    g.db().execute("UPDATE revisions SET kind='MANUAL' WHERE id='w1:R_0002'", []).unwrap();
+    let rep = g.scrub(&root.join("cas")).unwrap();
+    assert_eq!(rep.chain_breaks, vec!["w1:R_0002".to_string()]);
+}
