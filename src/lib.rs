@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod cas;
+pub mod maintenance;
 pub mod manifest;
 pub mod mcproto;
 pub mod chain;

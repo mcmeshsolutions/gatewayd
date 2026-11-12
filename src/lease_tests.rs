@@ -244,3 +244,32 @@ fn packs_are_isolated() {
     assert!(matches!(g.require_pack(W, "default"), Err(Error::PackMismatch)));
     assert!(matches!(g.set_pack("nope", "x"), Err(Error::NoSuchWorld)));
 }
+
+#[test]
+fn scrub_finds_corruption_and_backup_is_incremental() {
+    let mut g = setup();
+    let root = std::env::temp_dir().join(format!("mcmesh-maint-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let cas_dir = root.join("cas");
+    g.cas = crate::cas::Cas::open(&cas_dir).unwrap();
+    g.create_world("w9", "m", "1.21.1", "neoforge").unwrap();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    let h = g.cas.put(b"chunk-data").unwrap();
+    wal_row(&g, &a.lease_id, 1, "put:region", 1, 1, h);
+    wal_row(&g, &a.lease_id, 2, "barrier", 0, 0, [0; 32]);
+    g.commit(&a.lease_id, a.epoch, &a.base_rev, CommitKind::Autosave, false, 1_000).unwrap();
+    assert!(g.scrub(&cas_dir).unwrap().ok());
+    let dest = root.join("bk");
+    let (c1, _) = g.backup(&cas_dir, &dest).unwrap();
+    let (c2, s2) = g.backup(&cas_dir, &dest).unwrap();
+    assert!(c1 > 0 && c2 == 0 && s2 == c1);
+    assert!(dest.join("mcmesh.db").is_file());
+    let x = crate::cas::hex(&h);
+    let blob = cas_dir.join(&x[0..2]).join(&x[2..4]).join(&x);
+    std::fs::write(&blob, b"garbage").unwrap();
+    let rep = g.scrub(&cas_dir).unwrap();
+    assert!(!rep.ok() && rep.corrupt == vec![x.clone()], "{rep:?}");
+    std::fs::remove_file(&blob).unwrap();
+    let rep = g.scrub(&cas_dir).unwrap();
+    assert!(rep.missing.contains(&x), "{rep:?}");
+}
