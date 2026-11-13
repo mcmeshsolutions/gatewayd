@@ -107,6 +107,32 @@ impl AppState {
     }
 }
 
+/// Client protocol level a request declares: the x-mesh-client header, 0 when absent or unreadable.
+fn client_level(h: &HeaderMap) -> u32 {
+    h.get("x-mesh-client").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+}
+
+/// Routes that stay open to builds below the minimum: the public status, operators (admin and panel) and API keys.
+fn exempt_from_client_gate(path: &str, h: &HeaderMap) -> bool {
+    !path.starts_with("/v1/")
+        || path == "/v1/status"
+        || path.starts_with("/v1/admin/")
+        || path.starts_with("/v1/panel/")
+        || h.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).is_some_and(|v| v.trim_start_matches("Bearer ").starts_with(crate::apikeys::PREFIX))
+}
+
+async fn client_gate(State(s): State<Arc<AppState>>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let min = s.auth.min_client;
+    if min > 0 && !exempt_from_client_gate(req.uri().path(), req.headers()) && client_level(req.headers()) < min {
+        let body = Json(json!({
+            "error": "CLIENT_TOO_OLD", "min_client": min,
+            "message": "This gateway needs a newer version of the mcmesh mod. Update the mod (or the modpack) and start the game again.",
+        }));
+        return (StatusCode::UPGRADE_REQUIRED, body).into_response();
+    }
+    next.run(req).await
+}
+
 static LAST_ANCHOR_METER_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Adds a minute to `anchor_seconds` of every world an anchor device is hosting, once a minute. Feeds per-minute anchor billing later.
@@ -779,6 +805,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(crate::crash::routes())
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::admin::gate))
         .layer(DefaultBodyLimit::max(MAX_JSON))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), client_gate))
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::ratelimit::layer))
         .with_state(state)
 }

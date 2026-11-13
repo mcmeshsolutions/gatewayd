@@ -361,6 +361,7 @@ async fn well_known(State(s): State<Arc<AppState>>) -> Json<Value> {
         "guest_tickets": s.auth.require_ticket,
         "world_creation": if s.auth.allow_create { "open" } else { "admins" },
         "require_signed_commits": s.auth.require_signed,
+        "min_client": s.auth.min_client,
         "features": ["quotas", "audit", "events", "api_keys", "handover_vote", "region_rollback", "crash_reports", "pack_versions", "metrics", "webhooks"],
     }))
 }
