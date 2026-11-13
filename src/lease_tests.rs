@@ -627,3 +627,94 @@ fn a_struggling_host_does_not_lift_the_anchor_rule() {
     g.join(W, "dev-b", hw(2, 50.0), 43_000).unwrap();
     assert!(migrating(&g));
 }
+
+fn vote_world() -> (Gateway, Grant) {
+    let mut g = setup();
+    g.add_member(W, "u-d", "dave", "dev-d", Role::HostEligible).unwrap();
+    g.ops_init().unwrap();
+    g.set_vote_enabled(W, true).unwrap();
+    let a = locked_host(&mut g, 2, 5.0);
+    (g, a)
+}
+
+const T: u64 = 70_000;
+
+#[test]
+fn a_vote_needs_the_switch_a_live_host_and_recent_guests() {
+    let mut g = setup();
+    g.add_member(W, "u-d", "dave", "dev-d", Role::HostEligible).unwrap();
+    g.ops_init().unwrap();
+    locked_host(&mut g, 2, 5.0);
+    g.join(W, "dev-b", hw(2, 9.0), T).unwrap();
+    assert_eq!(g.propose_handover(W, "dev-b", 2, 9.0, T).unwrap().unwrap_err(), VoteError::Disabled);
+    g.set_vote_enabled(W, true).unwrap();
+    assert_eq!(g.propose_handover(W, "dev-d", 2, 9.0, T).unwrap().unwrap_err(), VoteError::NotGuest, "dave never joined as a guest");
+    assert_eq!(g.propose_handover(W, "dev-a", 2, 9.0, T).unwrap().unwrap_err(), VoteError::NoLiveHost, "the host cannot propose itself");
+    assert_eq!(g.propose_handover(W, "dev-b", 2, 9.0, 30_000).unwrap().unwrap_err(), VoteError::TooEarly);
+    assert_eq!(g.propose_handover(W, "dev-b", 2, 5.5, T).unwrap().unwrap_err(), VoteError::NotBetter, "10% is under the 15% margin");
+    assert!(g.propose_handover(W, "dev-b", 2, 9.0, T).unwrap().is_ok());
+    assert_eq!(g.propose_handover(W, "dev-b", 2, 9.0, T + 1).unwrap().unwrap_err(), VoteError::RoundOpen);
+}
+
+#[test]
+fn a_majority_makes_the_takeover_immediate_and_it_goes_through_the_normal_handover() {
+    let (mut g, a) = vote_world();
+    for (d, s) in [("dev-b", 9.0), ("dev-d", 3.0), ("dev-c", 1.0)] {
+        g.join(W, d, hw(2, s), T).unwrap();
+    }
+    let r = g.propose_handover(W, "dev-b", 2, 9.0, T).unwrap().unwrap();
+    assert_eq!((r.yes, r.needed, r.approved, r.improvement_pct), (1, 2, false, 80), "three guests need two yes votes");
+    assert!(g.takeover_in(W, "dev-b", 2, 9.0, T).is_some_and(|s| s > 0), "not yet: the normal hold still applies");
+    g.join(W, "dev-b", hw(2, 9.0), T + 1).unwrap();
+    assert!(!migrating(&g), "a bid before approval still needs the normal hold");
+
+    let r = g.cast_handover_vote(W, "dev-d", true, T + 2).unwrap().unwrap();
+    assert!(r.approved && r.yes == 2);
+    assert_eq!(g.takeover_in(W, "dev-b", 2, 9.0, T + 2), Some(0));
+    assert_eq!(g.takeover_in(W, "dev-d", 2, 3.0, T + 2), None, "approval belongs to the proposer only");
+    g.join(W, "dev-b", hw(2, 9.0), T + 3).unwrap();
+    assert!(migrating(&g));
+    let dirs = g.heartbeat(&a.lease_id, a.epoch, T + 4).unwrap();
+    assert_eq!(dirs, vec![Directive::MigratePrepare { target_device: Some("dev-b".into()), deadline_ms: 20_000 }], "the host is asked to hand over as usual");
+    assert!(g.handover_round(W, "dev-b", T + 5).unwrap().is_none(), "the round is spent");
+}
+
+#[test]
+fn the_host_cannot_vote_and_a_lone_guest_can_never_force_a_move() {
+    let (mut g, _) = vote_world();
+    g.join(W, "dev-b", hw(2, 9.0), T).unwrap();
+    let r = g.propose_handover(W, "dev-b", 2, 9.0, T).unwrap().unwrap();
+    assert_eq!((r.needed, r.approved), (2, false), "at least two yes votes are always needed");
+    assert_eq!(g.cast_handover_vote(W, "dev-a", true, T + 1).unwrap().unwrap_err(), VoteError::NotGuest, "the host's own player never decides");
+    assert_eq!(g.cast_handover_vote(W, "dev-d", true, T + 1).unwrap().unwrap_err(), VoteError::NotGuest, "dave is not playing");
+    assert!(!g.takeover_in(W, "dev-b", 2, 9.0, T + 1).is_some_and(|s| s == 0));
+}
+
+#[test]
+fn a_lost_vote_starts_a_cooldown_and_a_stale_round_expires() {
+    let (mut g, _) = vote_world();
+    for (d, s) in [("dev-b", 9.0), ("dev-d", 3.0), ("dev-c", 1.0)] {
+        g.join(W, d, hw(2, s), T).unwrap();
+    }
+    g.propose_handover(W, "dev-b", 2, 9.0, T).unwrap().unwrap();
+    g.cast_handover_vote(W, "dev-d", false, T + 1).unwrap().unwrap();
+    let lost = g.cast_handover_vote(W, "dev-c", false, T + 2).unwrap();
+    assert_eq!(lost.unwrap_err(), VoteError::NoRound, "two no votes of three guests make a majority impossible");
+    assert_eq!(g.propose_handover(W, "dev-b", 2, 9.0, T + 3).unwrap().unwrap_err(), VoteError::Cooldown);
+    assert!(g.propose_handover(W, "dev-b", 2, 9.0, T + 11 * 60_000).unwrap().is_ok(), "ten minutes later the candidate may try again");
+
+    let (mut g, _) = vote_world();
+    g.join(W, "dev-b", hw(2, 9.0), T).unwrap();
+    g.propose_handover(W, "dev-b", 2, 9.0, T).unwrap().unwrap();
+    assert!(g.handover_round(W, "dev-b", T + 299_000).unwrap().is_some());
+    assert!(g.handover_round(W, "dev-b", T + 301_000).unwrap().is_none(), "a round lives five minutes");
+}
+
+#[test]
+fn switching_the_vote_off_drops_an_open_round() {
+    let (mut g, _) = vote_world();
+    g.join(W, "dev-b", hw(2, 9.0), T).unwrap();
+    g.propose_handover(W, "dev-b", 2, 9.0, T).unwrap().unwrap();
+    g.set_vote_enabled(W, false).unwrap();
+    assert!(g.handover_round(W, "dev-b", T + 1).unwrap().is_none());
+}

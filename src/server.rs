@@ -57,7 +57,7 @@ impl AppState {
             }
         }
     }
-    fn now(&self) -> u64 {
+    pub(crate) fn now(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
     }
     pub(crate) fn gw(&self) -> MutexGuard<'_, Gateway> {

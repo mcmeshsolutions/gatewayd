@@ -7,7 +7,7 @@ use axum::{
     http::{HeaderMap, Method},
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::{get, put},
+    routing::{get, post, put},
     Json, Router,
 };
 use rusqlite::{params, OptionalExtension};
@@ -50,6 +50,7 @@ impl Gateway {
                world_id TEXT NOT NULL, player_uuid TEXT NOT NULL, PRIMARY KEY(world_id, player_uuid)) WITHOUT ROWID;",
         )?;
         let _ = self.db.execute("ALTER TABLE world_policy ADD COLUMN require_signed INTEGER NOT NULL DEFAULT 0", []);
+        let _ = self.db.execute("ALTER TABLE world_policy ADD COLUMN handover_vote INTEGER NOT NULL DEFAULT 0", []);
         Ok(())
     }
 
@@ -495,7 +496,7 @@ async fn get_policy(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): P
     let dev = auth(&gw, &h)?;
     gw.require_member(&world, &dev)?;
     let owner = gw.world_owner(&world)?.and_then(|u| gw.db.query_row("SELECT name FROM players WHERE uuid=?", params![u], |r| r.get::<_, String>(0)).ok());
-    Ok(Json(json!({ "policy": gw.host_policy(&world)?, "owner": owner, "allow": gw.host_allowlist(&world)?, "require_signed": gw.world_requires_signed(&world) })))
+    Ok(Json(json!({ "policy": gw.host_policy(&world)?, "owner": owner, "allow": gw.host_allowlist(&world)?, "require_signed": gw.world_requires_signed(&world), "handover_vote": gw.vote_enabled(&world) })))
 }
 
 #[derive(Deserialize)]
@@ -603,8 +604,96 @@ async fn admin_usage(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
     })))
 }
 
+#[derive(Deserialize)]
+struct VoteSwitch {
+    enabled: bool,
+}
+
+async fn put_vote_policy(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<VoteSwitch>) -> R {
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_owner_or_admin(&s, &gw, &dev, &world)?;
+    gw.set_vote_enabled(&world, b.enabled)?;
+    gw.audit(&dev, "policy.vote", &world, "", json!({ "enabled": b.enabled }));
+    Ok(Json(json!({ "ok": true, "handover_vote": b.enabled })))
+}
+
+fn vote_error(e: crate::lease::VoteError) -> ApiErr {
+    use crate::lease::VoteError::*;
+    match e {
+        Disabled => ApiErr::Forbidden("VOTE_DISABLED"),
+        NotGuest => ApiErr::Forbidden("NOT_A_GUEST"),
+        NoLiveHost => ApiErr::Conflict("NO_LIVE_HOST"),
+        NotBetter => ApiErr::Conflict("NOT_BETTER"),
+        TooEarly => ApiErr::Conflict("TOO_EARLY"),
+        RoundOpen => ApiErr::Conflict("ROUND_OPEN"),
+        Cooldown => ApiErr::Conflict("COOLDOWN"),
+        NoRound => ApiErr::NotFound("NO_ROUND"),
+    }
+}
+
+fn round_json(r: Option<&crate::lease::RoundView>) -> Value {
+    match r {
+        None => Value::Null,
+        Some(r) => json!({
+            "candidate": r.candidate_name, "improvement_pct": r.improvement_pct, "yes": r.yes, "no": r.no, "needed": r.needed,
+            "my_vote": r.my_vote, "approved": r.approved, "expires_in_s": r.expires_in_s,
+        }),
+    }
+}
+
+async fn get_handover_vote(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> R {
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    gw.require_member(&world, &dev)?;
+    let now = s.now();
+    let round = gw.handover_round(&world, &dev, now)?;
+    Ok(Json(json!({ "enabled": gw.vote_enabled(&world), "round": round_json(round.as_ref()) })))
+}
+
+#[derive(Deserialize)]
+struct ProposeReq {
+    #[serde(default = "one")]
+    tier: u8,
+    score: f64,
+}
+
+fn one() -> u8 {
+    1
+}
+
+async fn propose_handover(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<ProposeReq>) -> R {
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    gw.require_member(&world, &dev)?;
+    if !b.score.is_finite() || b.score < 0.0 {
+        return Err(ApiErr::BadRequest("BAD_SCORE"));
+    }
+    let now = s.now();
+    let round = gw.propose_handover(&world, &dev, b.tier, b.score, now)?.map_err(vote_error)?;
+    gw.audit(&dev, "vote.propose", &world, "", json!({ "improvement_pct": round.improvement_pct }));
+    Ok(Json(json!({ "round": round_json(Some(&round)) })))
+}
+
+#[derive(Deserialize)]
+struct VoteReq {
+    yes: bool,
+}
+
+async fn cast_handover_vote(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<VoteReq>) -> R {
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    gw.require_member(&world, &dev)?;
+    let now = s.now();
+    let round = gw.cast_handover_vote(&world, &dev, b.yes, now)?.map_err(vote_error)?;
+    Ok(Json(json!({ "round": round_json(Some(&round)) })))
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/v1/worlds/:id/vote-policy", put(put_vote_policy))
+        .route("/v1/worlds/:id/handover-vote", get(get_handover_vote).post(cast_handover_vote))
+        .route("/v1/worlds/:id/handover-vote/propose", post(propose_handover))
         .route("/v1/admin/usage", get(admin_usage))
         .route("/v1/worlds/:id/signing", put(put_signing))
         .route("/v1/admin/audit", get(admin_audit))

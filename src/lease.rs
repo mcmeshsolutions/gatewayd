@@ -17,6 +17,9 @@ fn min_hold_ms() -> u64 {
         std::env::var("MCMESH_MIN_HOLD_S").ok().and_then(|v| v.parse::<u64>().ok()).map_or(DEFAULT_MIN_HOLD_MS, |s| s * 1000)
     })
 }
+mod vote;
+pub use vote::{RoundView, VoteError};
+
 const SCORE_MARGIN: f64 = 1.3;
 /// A host that reports shed level 2 or more is struggling: a clearly stronger machine may take over after a short hold.
 const STRUGGLE_LEVEL: u32 = 2;
@@ -163,6 +166,10 @@ pub struct Gateway {
     timers: HashMap<String, Timer>,
     directives: HashMap<String, Vec<Directive>>,
     failed: HashMap<String, HashSet<String>>,
+    /// (world, player uuid) to the last time that player joined the world as a guest, for the optional handover vote
+    guests_seen: HashMap<(String, String), u64>,
+    rounds: HashMap<String, vote::Round>,
+    vote_cool: HashMap<(String, String), u64>,
 }
 
 fn unix_s() -> i64 {
@@ -210,6 +217,9 @@ impl Gateway {
             timers: HashMap::new(),
             directives: HashMap::new(),
             failed: HashMap::new(),
+            guests_seen: HashMap::new(),
+            rounds: HashMap::new(),
+            vote_cool: HashMap::new(),
         };
         // restart: give every live lease a full TTL before judging it dead
         let live: Vec<(String, i64)> = {
@@ -306,6 +316,9 @@ impl Gateway {
         }
         let (lid, dev, _, cur_tier) = self.active_lease(world).ok()??;
         let t = self.timers.get(&lid)?;
+        if dev != device && self.vote_approved_now(world, device, now) && !self.anchor_blocked(device, &lid) {
+            return Some(0);
+        }
         let c = Cand { tier, score, seen: now };
         let (margin, hold) = self.takeover_terms(&lid);
         if dev == device || !Self::better_with(&c, cur_tier, t.score, margin) || self.anchor_blocked(device, &lid) {
@@ -537,7 +550,12 @@ impl Gateway {
                 let cand = &self.cands.get(&key);
                 if let Some(c) = cand {
                     let (margin, hold) = self.takeover_terms(&lid);
-                    if hw.takeover && held >= hold && Self::better_with(c, tier, t.score, margin) && !self.anchor_blocked(device, &lid) {
+                    let normal = held >= hold && Self::better_with(c, tier, t.score, margin);
+                    let approved = hw.takeover && self.vote_approved(world, device, now);
+                    if hw.takeover && (normal || approved) && !self.anchor_blocked(device, &lid) {
+                        if approved {
+                            self.vote_consumed(world);
+                        }
                         self.set_state(world, "MIGRATING", Some("PREPARING"))?;
                         self.db.execute("UPDATE leases SET status='HANDOFF' WHERE id=?", params![lid])?;
                         self.directives.entry(lid).or_default().push(Directive::MigratePrepare {
@@ -546,6 +564,7 @@ impl Gateway {
                         });
                     }
                 }
+                self.note_guest(world, device, now);
                 Ok(Join::Guest { epoch, host_device: dev })
             }
             _ => Ok(Join::Wait { phase: phase.unwrap_or_default() }),
