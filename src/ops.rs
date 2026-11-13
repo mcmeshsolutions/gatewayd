@@ -370,15 +370,61 @@ async fn status_json(State(s): State<Arc<AppState>>) -> Result<Json<Value>, ApiE
     Ok(Json(public_status(&s)?))
 }
 
-async fn status_page(State(s): State<Arc<AppState>>) -> Result<Response, ApiErr> {
+/// Polish when the client's first listed language is Polish, English otherwise. Only the public pages are translated.
+fn wants_polish(h: &HeaderMap) -> bool {
+    h.get(header::ACCEPT_LANGUAGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .is_some_and(|first| first.trim().to_ascii_lowercase().starts_with("pl"))
+}
+
+fn pl_plural<'a>(n: i64, one: &'a str, few: &'a str, many: &'a str) -> &'a str {
+    if n == 1 {
+        one
+    } else if (2..=4).contains(&(n % 10)) && !(12..=14).contains(&(n % 100)) {
+        few
+    } else {
+        many
+    }
+}
+
+fn span_pl(s: i64) -> String {
+    match s {
+        s if s >= 2 * 86_400 => format!("{} {}", s / 86_400, "dni"),
+        s if s >= 2 * 3600 => {
+            let n = s / 3600;
+            format!("{n} {}", pl_plural(n, "godzina", "godziny", "godzin"))
+        }
+        s if s >= 120 => {
+            let n = s / 60;
+            format!("{n} {}", pl_plural(n, "minuta", "minuty", "minut"))
+        }
+        s => format!("{s} {}", pl_plural(s, "sekunda", "sekundy", "sekund")),
+    }
+}
+
+async fn status_page(State(s): State<Arc<AppState>>, h: HeaderMap) -> Result<Response, ApiErr> {
     let v = public_status(&s)?;
+    let pl = wants_polish(&h);
+    let t = |en: &'static str, pl_text: &'static str| if pl { pl_text } else { en };
+    let age = |a: i64| if pl { format!("{} temu", span_pl(a)) } else { format!("{} ago", span(a)) };
+    let uptime = s.uptime_s() as i64;
     let html = include_str!("../web/status.html")
+        .replace("{{lang}}", t("en", "pl"))
+        .replace("{{t_title}}", t("Shared Worlds status", "Status Shared Worlds"))
+        .replace("{{t_h1}}", t("Gateway status", "Status bramy"))
+        .replace("{{t_ok}}", t("Operational", "Działa"))
+        .replace("{{t_worlds}}", t("Worlds stored", "Zapisane światy"))
+        .replace("{{t_hosted}}", t("Worlds being hosted now", "Światy hostowane teraz"))
+        .replace("{{t_save}}", t("Last world save", "Ostatni zapis świata"))
+        .replace("{{t_up}}", t("Running for", "Czas działania"))
+        .replace("{{t_foot}}", t("Machine-readable copy at", "Wersja dla maszyn:"))
         .replace("{{worlds}}", &v["worlds"].to_string())
         .replace("{{hosted}}", &v["hosted"].to_string())
-        .replace("{{uptime}}", &span(s.uptime_s() as i64))
-        .replace("{{last_save}}", &v["last_save_age_s"].as_i64().map_or("never".into(), |a| format!("{} ago", span(a))))
+        .replace("{{uptime}}", &if pl { span_pl(uptime) } else { span(uptime) })
+        .replace("{{last_save}}", &v["last_save_age_s"].as_i64().map_or(t("never", "nigdy").into(), age))
         .replace("{{version}}", env!("CARGO_PKG_VERSION"));
-    Ok(([(header::CACHE_CONTROL, "no-cache")], Html(html)).into_response())
+    Ok(([(header::CACHE_CONTROL, "no-cache"), (header::VARY, "accept-language")], Html(html)).into_response())
 }
 
 async fn metrics(State(s): State<Arc<AppState>>, h: HeaderMap) -> Result<Response, ApiErr> {
@@ -395,17 +441,40 @@ async fn metrics(State(s): State<Arc<AppState>>, h: HeaderMap) -> Result<Respons
     Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], text).into_response())
 }
 
-async fn invite_page(State(s): State<Arc<AppState>>, Path(code): Path<String>) -> Result<Response, ApiErr> {
+async fn invite_page(State(s): State<Arc<AppState>>, h: HeaderMap, Path(code): Path<String>) -> Result<Response, ApiErr> {
+    let pl = wants_polish(&h);
+    let t = |en: &'static str, pl_text: &'static str| if pl { pl_text } else { en };
     let page = |title: &str, code: &str, note: &str| {
-        include_str!("../web/invite.html").replace("{{title}}", title).replace("{{code}}", code).replace("{{note}}", note)
+        include_str!("../web/invite.html")
+            .replace("{{lang}}", t("en", "pl"))
+            .replace("{{t_step1}}", t("Install the modpack and the <b>mcmesh</b> mod, see", "Zainstaluj paczkę modów i mod <b>mcmesh</b>, zobacz"))
+            .replace("{{t_start}}", t("the start page", "stronę startową"))
+            .replace("{{t_step2}}", t("Open <b>Shared Worlds</b> from the title screen and press <b>Redeem</b>.", "Otwórz <b>Shared Worlds</b> z ekranu tytułowego i naciśnij <b>Redeem</b>."))
+            .replace("{{t_step3}}", t("Paste the code above, then join the world from the list. A code works once.", "Wklej powyższy kod, potem dołącz do świata z listy. Kod działa tylko raz."))
+            .replace("{{title}}", title)
+            .replace("{{code}}", code)
+            .replace("{{note}}", note)
     };
     let info = s.gw().invite_info(&code)?;
+    let vary = [(header::VARY, "accept-language")];
     Ok(match info {
         Some(Ok((world, exp))) => {
-            let note = exp.map_or("This invite does not expire.".into(), |at| format!("Expires in {}.", span(at - wall_s())));
-            Html(page(&format!("Join {}", esc(&world)), &esc(&code.to_uppercase()), &note)).into_response()
+            let note = exp.map_or(t("This invite does not expire.", "To zaproszenie nie wygasa.").into(), |at| {
+                if pl { format!("Wygasa za {}.", span_pl(at - wall_s())) } else { format!("Expires in {}.", span(at - wall_s())) }
+            });
+            let title = format!("{} {}", t("Join", "Dołącz do"), esc(&world));
+            (vary, Html(page(&title, &esc(&code.to_uppercase()), &note))).into_response()
         }
-        _ => (StatusCode::NOT_FOUND, Html(page("Invite not valid", "", "This invite was already used or has expired. Ask for a new one."))).into_response(),
+        _ => (
+            StatusCode::NOT_FOUND,
+            vary,
+            Html(page(
+                t("Invite not valid", "Zaproszenie jest nieważne"),
+                "",
+                t("This invite was already used or has expired. Ask for a new one.", "To zaproszenie zostało już użyte albo wygasło. Poproś o nowe."),
+            )),
+        )
+            .into_response(),
     })
 }
 
@@ -417,4 +486,24 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/metrics", get(metrics))
         .route("/invite/:code", get(invite_page))
         .route("/v1/worlds/:id/events", get(world_events))
+}
+
+#[cfg(test)]
+mod pl_tests {
+    use super::span_pl;
+
+    #[test]
+    fn polish_plurals_follow_the_one_few_many_rule() {
+        assert_eq!(span_pl(1), "1 sekunda");
+        assert_eq!(span_pl(2), "2 sekundy");
+        assert_eq!(span_pl(5), "5 sekund");
+        assert_eq!(span_pl(12), "12 sekund", "teens are always many");
+        assert_eq!(span_pl(22), "22 sekundy");
+        assert_eq!(span_pl(120), "2 minuty");
+        assert_eq!(span_pl(60 * 5), "5 minut");
+        assert_eq!(span_pl(3600 * 2), "2 godziny");
+        assert_eq!(span_pl(3600 * 22), "22 godziny");
+        assert_eq!(span_pl(3600 * 25), "25 godzin");
+        assert_eq!(span_pl(86_400 * 3), "3 dni");
+    }
 }

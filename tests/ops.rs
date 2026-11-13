@@ -260,3 +260,32 @@ fn status_binary_exits_zero_on_a_healthy_store() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("totals worlds=1"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn public_pages_follow_the_first_language_in_accept_language() {
+    let app = router(AppState::new(gateway()));
+    let get = |path: &str, lang: Option<&str>| {
+        let mut r = Request::builder().uri(path.to_string());
+        if let Some(l) = lang {
+            r = r.header("accept-language", l);
+        }
+        let app = app.clone();
+        let req = r.body(Body::empty()).unwrap();
+        async move {
+            let resp = app.oneshot(req).await.unwrap();
+            let vary = resp.headers().get("vary").map(|v| v.to_str().unwrap().to_string());
+            (resp.status().as_u16(), vary, String::from_utf8_lossy(&resp.into_body().collect().await.unwrap().to_bytes()).into_owned())
+        }
+    };
+    let (c, vary, html) = get("/status", Some("pl-PL,pl;q=0.9,en;q=0.8")).await;
+    assert_eq!(c, 200);
+    assert!(html.contains("lang=pl") && html.contains("Status bramy") && html.contains("Czas działania"), "{html}");
+    assert_eq!(vary.as_deref(), Some("accept-language"));
+    let (_, _, html) = get("/status", Some("en-US,pl;q=0.5")).await;
+    assert!(html.contains("lang=en") && html.contains("Gateway status"));
+    let (_, _, html) = get("/status", None).await;
+    assert!(html.contains("Gateway status") && !html.contains("{{"), "no placeholder may leak: {html}");
+    let (c, _, html) = get("/invite/NOPE", Some("pl")).await;
+    assert_eq!(c, 404);
+    assert!(html.contains("Zaproszenie jest nieważne") && !html.contains("{{"), "{html}");
+}
