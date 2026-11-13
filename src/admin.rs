@@ -46,6 +46,9 @@ impl Gateway {
              CREATE TABLE IF NOT EXISTS world_policy(
                world_id TEXT PRIMARY KEY, owner_uuid TEXT,
                host_policy TEXT NOT NULL DEFAULT 'MEMBERS' CHECK(host_policy IN('OWNER','ALLOWLIST','MEMBERS'))) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS world_aux(
+               world_id TEXT NOT NULL, ns TEXT NOT NULL, key TEXT NOT NULL, value BLOB NOT NULL, updated_by TEXT NOT NULL, updated_at INTEGER NOT NULL,
+               PRIMARY KEY(world_id, ns, key)) WITHOUT ROWID;
              CREATE TABLE IF NOT EXISTS world_templates(
                world_id TEXT PRIMARY KEY, description TEXT NOT NULL DEFAULT '', set_by TEXT NOT NULL, set_at INTEGER NOT NULL) WITHOUT ROWID;
              CREATE TABLE IF NOT EXISTS world_host_allow(
@@ -798,6 +801,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/worlds/:id/transfer", post(post_transfer))
         .route("/v1/worlds/:id/fork", post(post_fork))
         .route("/v1/worlds/:id/template", put(put_template))
+        .route("/v1/worlds/:id/aux/:ns/:key", get(aux_get).put(aux_put))
         .route("/v1/templates", get(list_templates))
         .route("/v1/templates/:id/fork", post(fork_template))
         .route("/v1/admin/blobs/batch", post(cas_blob_batch))
@@ -1072,4 +1076,55 @@ async fn cas_blob_batch(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): J
         }
     }
     Ok(out)
+}
+
+const AUX_MAX_VALUE: usize = 64 << 10;
+const AUX_MAX_KEYS: i64 = 256;
+
+fn aux_name_ok(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Small per-world key-value store for tools and mods: any member reads, the owner or an admin writes.
+async fn aux_get(State(s): State<Arc<AppState>>, h: HeaderMap, Path((world, ns, key)): Path<(String, String, String)>) -> Result<Vec<u8>, ApiErr> {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    let (uuid, _) = gw.device_player(&dev)?.ok_or(ApiErr::Unauthorized)?;
+    if !gw.is_member_uuid(&world, &uuid) && !gw.is_admin(&uuid, &s.auth.admins) {
+        return Err(ApiErr::Forbidden("NOT_A_MEMBER"));
+    }
+    let v: Option<Vec<u8>> = gw
+        .db
+        .query_row("SELECT value FROM world_aux WHERE world_id=? AND ns=? AND key=?", params![world, ns, key], |r| r.get(0))
+        .optional()
+        .map_err(|e| ApiErr::Domain(Error::Db(e)))?;
+    v.ok_or(ApiErr::NotFound("NO_SUCH_KEY"))
+}
+
+async fn aux_put(State(s): State<Arc<AppState>>, h: HeaderMap, Path((world, ns, key)): Path<(String, String, String)>, body: axum::body::Bytes) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_owner_or_admin(&s, &gw, &dev, &world)?;
+    if !aux_name_ok(&ns) || !aux_name_ok(&key) {
+        return Err(ApiErr::BadRequest("BAD_KEY"));
+    }
+    if body.len() > AUX_MAX_VALUE {
+        return Err(ApiErr::BadRequest("VALUE_TOO_LARGE"));
+    }
+    let db = |e: rusqlite::Error| ApiErr::Domain(Error::Db(e));
+    let exists = gw.db.query_row("SELECT 1 FROM world_aux WHERE world_id=? AND ns=? AND key=?", params![world, ns, key], |_| Ok(())).optional().map_err(db)?.is_some();
+    if !exists {
+        let n: i64 = gw.db.query_row("SELECT COUNT(*) FROM world_aux WHERE world_id=?", params![world], |r| r.get(0)).map_err(db)?;
+        if n >= AUX_MAX_KEYS {
+            return Err(ApiErr::Conflict("TOO_MANY_KEYS"));
+        }
+    }
+    let (uuid, _) = gw.device_player(&dev)?.ok_or(ApiErr::Unauthorized)?;
+    gw.db
+        .execute(
+            "INSERT OR REPLACE INTO world_aux(world_id, ns, key, value, updated_by, updated_at) VALUES(?,?,?,?,?,?)",
+            params![world, ns, key, body.to_vec(), uuid, wall_s()],
+        )
+        .map_err(db)?;
+    Ok(Json(json!({ "ok": true })))
 }

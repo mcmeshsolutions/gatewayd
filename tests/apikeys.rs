@@ -247,3 +247,25 @@ async fn a_cas_key_fetches_several_blobs_in_one_framed_response() {
     let (_, status_key) = make_key(&app, "grafana", json!(["read:status"])).await;
     assert_eq!(post(&status_key, vec![hash]).await.0, 403);
 }
+
+#[tokio::test]
+async fn aux_values_are_written_by_the_owner_and_read_by_members() {
+    let app = app();
+    let req = |m: &str, tok: &str, path: &str, body: Vec<u8>| {
+        Request::builder().method(m).uri(path).header("authorization", format!("Bearer {tok}")).body(Body::from(body)).unwrap()
+    };
+    let run = |r: Request<Body>| {
+        let app = app.clone();
+        async move {
+            let resp = app.oneshot(r).await.unwrap();
+            (resp.status().as_u16(), resp.into_body().collect().await.unwrap().to_bytes())
+        }
+    };
+    assert_eq!(run(req("GET", "tok-b", "/v1/worlds/w1/aux/map/home", vec![])).await.0, 404);
+    assert_eq!(run(req("PUT", "tok-b", "/v1/worlds/w1/aux/map/home", b"x".to_vec())).await.0, 403, "members cannot write");
+    assert_eq!(run(req("PUT", "tok-a", "/v1/worlds/w1/aux/map/home", b"12,64,-7".to_vec())).await.0, 200);
+    let (c, v) = run(req("GET", "tok-b", "/v1/worlds/w1/aux/map/home", vec![])).await;
+    assert_eq!((c, &v[..]), (200, &b"12,64,-7"[..]));
+    assert_eq!(run(req("PUT", "tok-a", "/v1/worlds/w1/aux/Map/home", b"x".to_vec())).await.0, 400, "names are lowercase");
+    assert_eq!(run(req("PUT", "tok-a", "/v1/worlds/w1/aux/map/big", vec![0; 65537])).await.0, 413, "the router body limit answers first");
+}
