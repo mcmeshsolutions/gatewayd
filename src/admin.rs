@@ -689,8 +689,42 @@ async fn cast_handover_vote(State(s): State<Arc<AppState>>, h: HeaderMap, Path(w
     Ok(Json(json!({ "round": round_json(Some(&round)) })))
 }
 
+#[derive(Deserialize)]
+struct RollbackReq {
+    revision: String,
+    #[serde(default = "overworld")]
+    dim: String,
+    min_cx: i32,
+    min_cz: i32,
+    max_cx: i32,
+    max_cz: i32,
+}
+
+fn overworld() -> String {
+    "minecraft:overworld".into()
+}
+
+/// Restores the chunks inside a rectangle to an older revision, leaving the rest of the world as it is. Owner or admin, idle world only.
+async fn rollback_region(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<RollbackReq>) -> R {
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_owner_or_admin(&s, &gw, &dev, &world)?;
+    match gw.rollback_region(&world, &b.revision, &b.dim, b.min_cx, b.min_cz, b.max_cx, b.max_cz)? {
+        Ok(r) => {
+            gw.audit(&dev, "world.rollback_region", &world, &r.revision, json!({ "from": b.revision, "dim": b.dim, "restored": r.restored, "removed": r.removed }));
+            Ok(Json(json!({ "revision": r.revision, "restored": r.restored, "removed": r.removed })))
+        }
+        Err("BAD_REGION") => Err(ApiErr::BadRequest("BAD_REGION")),
+        Err("NO_SUCH_REVISION") => Err(ApiErr::NotFound("NO_SUCH_REVISION")),
+        Err("REVISION_PRUNED") => Err(ApiErr::Gone("REVISION_PRUNED")),
+        Err("WORLD_RUNNING") => Err(ApiErr::Conflict("WORLD_RUNNING")),
+        Err(code) => Err(ApiErr::Conflict(code)),
+    }
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/v1/worlds/:id/rollback", post(rollback_region))
         .route("/v1/worlds/:id/vote-policy", put(put_vote_policy))
         .route("/v1/worlds/:id/handover-vote", get(get_handover_vote).post(cast_handover_vote))
         .route("/v1/worlds/:id/handover-vote/propose", post(propose_handover))

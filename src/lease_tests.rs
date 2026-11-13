@@ -718,3 +718,65 @@ fn switching_the_vote_off_drops_an_open_round() {
     g.set_vote_enabled(W, false).unwrap();
     assert!(g.handover_round(W, "dev-b", T + 1).unwrap().is_none());
 }
+
+#[test]
+fn a_region_rollback_restores_only_the_chunks_inside_the_rectangle() {
+    use crate::manifest::Item;
+    let mut g = setup();
+    let root = std::env::temp_dir().join(format!("mcmesh-rollback-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    g.cas = crate::cas::Cas::open(root.join("cas")).unwrap();
+    g.create_world("w5", "m", "1.21.1", "neoforge").unwrap();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    let put = |g: &Gateway, text: &str| g.cas.put(text.as_bytes()).unwrap();
+    // revision 1: chunks 1 and 2 as "v1"; revision 2: both change, chunk 3 appears; the second one ends the session
+    let (a1, b1) = (put(&g, "a1"), put(&g, "b1"));
+    wal_row(&g, &a.lease_id, 1, "put:region", 1, 1, a1);
+    wal_row(&g, &a.lease_id, 2, "put:region", 2, 1, b1);
+    wal_row(&g, &a.lease_id, 3, "barrier", 0, 0, [0; 32]);
+    let r1 = g.commit(&a.lease_id, a.epoch, &a.base_rev, CommitKind::Autosave, false, 1_000).unwrap();
+    let (a2, b2, c2) = (put(&g, "a2"), put(&g, "b2"), put(&g, "c2"));
+    wal_row(&g, &a.lease_id, 4, "put:region", 1, 1, a2);
+    wal_row(&g, &a.lease_id, 5, "put:region", 2, 1, b2);
+    wal_row(&g, &a.lease_id, 6, "put:region", 3, 1, c2);
+    wal_row(&g, &a.lease_id, 7, "barrier", 0, 0, [0; 32]);
+    let r2 = g.commit(&a.lease_id, a.epoch, &r1.id, CommitKind::Shutdown, true, 2_000).unwrap();
+
+    let leaves = |g: &Gateway, rev: &str| {
+        let mut m = std::collections::BTreeMap::new();
+        crate::manifest::for_each_leaf(&g.cas, g.revision_root(rev).unwrap(), &mut |item, h| {
+            if let Item::Chunk(k) = item {
+                m.insert(k.cx, h);
+            }
+            Ok(())
+        })
+        .unwrap();
+        m
+    };
+    assert_eq!(g.rollback_region(W, &r1.id, "minecraft:overworld", 2, 0, 1, 9).unwrap(), Err("BAD_REGION"));
+    assert_eq!(g.rollback_region(W, "nope", "minecraft:overworld", 0, 0, 9, 9).unwrap(), Err("NO_SUCH_REVISION"));
+    assert_eq!(g.rollback_region(W, &r1.id, "minecraft:the_nether", 0, 0, 9, 9).unwrap(), Err("NOTHING_TO_ROLLBACK"), "nothing in that dimension differs");
+
+    let done = g.rollback_region(W, &r1.id, "minecraft:overworld", 0, 0, 1, 9).unwrap().unwrap();
+    assert_eq!((done.restored, done.removed), (1, 0), "only chunk 1 is inside the rectangle");
+    assert_eq!(g.head(W).unwrap(), done.revision);
+    let now = leaves(&g, &done.revision);
+    assert_eq!(now[&1], a1, "inside: back to the old content");
+    assert_eq!(now[&2], b2, "outside: untouched");
+    assert_eq!(now[&3], c2, "outside: untouched");
+
+    // chunk 3 did not exist in revision 1, so a rectangle around it removes it
+    let gone = g.rollback_region(W, &r1.id, "minecraft:overworld", 3, 0, 3, 9).unwrap().unwrap();
+    assert_eq!((gone.restored, gone.removed), (0, 1));
+    assert!(!leaves(&g, &gone.revision).contains_key(&3));
+    let kind: String = g.db.query_row("SELECT kind FROM revisions WHERE id=?", rusqlite::params![gone.revision], |row| row.get(0)).unwrap();
+    assert_eq!(kind, "ROLLBACK");
+    assert!(g.scan_revision(&r2.id).unwrap().ok(), "earlier revisions stay intact");
+}
+
+#[test]
+fn a_region_rollback_is_refused_while_a_host_is_running() {
+    let mut g = setup();
+    let a = locked_host(&mut g, 2, 5.0);
+    assert_eq!(g.rollback_region(W, &a.base_rev, "minecraft:overworld", 0, 0, 1, 1).unwrap(), Err("WORLD_RUNNING"));
+}

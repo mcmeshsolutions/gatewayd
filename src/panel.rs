@@ -191,8 +191,13 @@ impl Gateway {
 
     /// New head with the content of `rev`, kept as a ROLLBACK revision so nothing is lost. The caller checks the world is idle.
     pub(crate) fn rollback_to(&mut self, world: &str, rev: &str) -> Result<String, Error> {
-        let head = self.head(world)?;
         let root = self.revision_root(rev)?;
+        self.rollback_root(world, root)
+    }
+
+    /// Makes `root` the head as a new ROLLBACK revision on top of the current head.
+    pub(crate) fn rollback_root(&mut self, world: &str, root: crate::cas::Hash) -> Result<String, Error> {
+        let head = self.head(world)?;
         let tx = self.db.transaction()?;
         let seq: i64 = tx.query_row("SELECT MAX(seq)+1 FROM revisions WHERE world_id=?", params![world], |r| r.get(0))?;
         let id = format!("{world}:R_{seq:04}");
@@ -386,4 +391,60 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/worlds/:id/revert", post(post_revert))
         .route("/v1/panel/code", post(panel_code))
         .route("/v1/panel/login", post(panel_login))
+}
+
+/// What a region rollback changed.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RegionRollback {
+    pub revision: String,
+    pub restored: usize,
+    pub removed: usize,
+}
+
+impl Gateway {
+    /// Puts the chunks inside the rectangle (chunk coordinates, inclusive, one dimension; region, entity and poi data alike)
+    /// back to how they were in `rev`, and leaves everything else as it is now. A new ROLLBACK revision records it, so it can
+    /// be undone like any other. Only while the world is idle. Err carries a short code for the API.
+    pub fn rollback_region(&mut self, world: &str, rev: &str, dim: &str, min_cx: i32, min_cz: i32, max_cx: i32, max_cz: i32) -> Result<Result<RegionRollback, &'static str>, Error> {
+        use crate::manifest::{self, Change, Item};
+        if min_cx > max_cx || min_cz > max_cz {
+            return Ok(Err("BAD_REGION"));
+        }
+        if self.revision_world(rev)?.as_deref() != Some(world) {
+            return Ok(Err("NO_SUCH_REVISION"));
+        }
+        if self.world_state(world)?.0 != "IDLE" {
+            return Ok(Err("WORLD_RUNNING"));
+        }
+        let old_root = match self.revision_root(rev) {
+            Ok(r) => r,
+            Err(Error::Pruned) => return Ok(Err("REVISION_PRUNED")),
+            Err(e) => return Err(e),
+        };
+        let head_root = self.revision_root(&self.head(world)?)?;
+        let inside = |k: &manifest::Key| k.dim == dim && (min_cx..=max_cx).contains(&k.cx) && (min_cz..=max_cz).contains(&k.cz);
+        let (mut changes, mut restored, mut removed) = (Vec::new(), 0, 0);
+        for d in manifest::diff(&self.cas, Some(head_root), Some(old_root))? {
+            let Item::Chunk(k) = d.item else { continue };
+            if !inside(&k) {
+                continue;
+            }
+            match d.new {
+                Some(h) => {
+                    restored += 1;
+                    changes.push(Change::Put(k, h));
+                }
+                None => {
+                    removed += 1;
+                    changes.push(Change::Delete(k));
+                }
+            }
+        }
+        if changes.is_empty() {
+            return Ok(Err("NOTHING_TO_ROLLBACK"));
+        }
+        let root = manifest::apply(&self.cas, Some(head_root), &changes)?;
+        let revision = self.rollback_root(world, root)?;
+        Ok(Ok(RegionRollback { revision, restored, removed }))
+    }
 }
