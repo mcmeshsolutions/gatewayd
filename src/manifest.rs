@@ -401,3 +401,61 @@ pub fn reachable(cas: &Cas, root: Hash, out: &mut HashSet<Hash>) -> Result<()> {
     }
     Ok(())
 }
+
+/// Visits every leaf of a revision: aux files first, then chunks in (dim, kind, region) order so a region's chunks are contiguous.
+pub fn for_each_leaf(cas: &Cas, root: Hash, f: &mut dyn FnMut(Item, Hash) -> Result<()>) -> Result<()> {
+    let r = load_root(cas, Some(root))?;
+    for (p, h) in load_aux(cas, r.aux)? {
+        f(Item::Aux(p), h)?;
+    }
+    for ((dim, kind), t) in r.subs {
+        for (s, sh) in load_top(cas, Some(t))? {
+            let sup = load_arr(cas, T_SUP, 256, Some(sh))?;
+            for (si, rh) in sup.into_iter().enumerate() {
+                let Some(rh) = rh else { continue };
+                let (rx, rz) = (s.0 * 16 + (si as i32 & 15), s.1 * 16 + (si as i32 >> 4));
+                for (ri, h) in load_arr(cas, T_REG, 1024, Some(rh))?.into_iter().enumerate() {
+                    if let Some(h) = h {
+                        let key = Key { dim: dim.clone(), kind, cx: rx * 32 + (ri as i32 & 31), cz: rz * 32 + (ri as i32 >> 5) };
+                        f(Item::Chunk(key), h)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Like `reachable`, but keeps going past nodes it cannot read: those are listed in `unreadable` and their children are skipped.
+pub fn reachable_lenient(cas: &Cas, root: Hash, out: &mut HashSet<Hash>, unreadable: &mut Vec<Hash>) {
+    if !out.insert(root) {
+        return;
+    }
+    let Ok(r) = load_root(cas, Some(root)) else { return unreadable.push(root) };
+    if let Some(a) = r.aux {
+        out.insert(a);
+        match load_aux(cas, Some(a)) {
+            Ok(m) => out.extend(m.into_values()),
+            Err(_) => unreadable.push(a),
+        }
+    }
+    for t in r.subs.into_values() {
+        out.insert(t);
+        let Ok(top) = load_top(cas, Some(t)) else { unreadable.push(t); continue };
+        for s in top.into_values() {
+            if !out.insert(s) {
+                continue;
+            }
+            let Ok(sup) = load_arr(cas, T_SUP, 256, Some(s)) else { unreadable.push(s); continue };
+            for rh in sup.into_iter().flatten() {
+                if !out.insert(rh) {
+                    continue;
+                }
+                match load_arr(cas, T_REG, 1024, Some(rh)) {
+                    Ok(leaves) => out.extend(leaves.into_iter().flatten()),
+                    Err(_) => unreadable.push(rh),
+                }
+            }
+        }
+    }
+}

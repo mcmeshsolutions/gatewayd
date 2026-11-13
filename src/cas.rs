@@ -29,6 +29,7 @@ pub fn parse_hex(s: &str) -> Option<Hash> {
 }
 
 /// Blobs are named by the SHA-256 of their uncompressed bytes and stored zstd-compressed.
+#[derive(Clone)]
 pub struct Cas {
     root: PathBuf,
 }
@@ -47,6 +48,11 @@ impl Cas {
 
     pub fn has(&self, h: &Hash) -> bool {
         self.path(h).is_file()
+    }
+
+    /// On-disk (compressed) size of a blob.
+    pub fn stored_len(&self, h: &Hash) -> io::Result<u64> {
+        Ok(fs::metadata(self.path(h))?.len())
     }
 
     pub fn put(&self, raw: &[u8]) -> io::Result<Hash> {
