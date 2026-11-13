@@ -186,6 +186,7 @@ impl Gateway {
         let _ = db.execute("ALTER TABLE revisions ADD COLUMN chain_hash BLOB", []);
         let _ = db.execute("ALTER TABLE worlds ADD COLUMN pack_id TEXT NOT NULL DEFAULT 'default'", []);
         crate::quota::migrate(&db, &cas)?;
+        let _ = db.execute("ALTER TABLE leases ADD COLUMN players INTEGER", []);
         db.execute("UPDATE sessions SET last_used=? WHERE last_used IS NULL", params![unix_s()])?;
         db.execute("DELETE FROM sessions WHERE last_used>0 AND last_used<?", params![unix_s() - session_ttl_s()])?;
         let mut g = Gateway {
@@ -512,11 +513,32 @@ impl Gateway {
     }
 
     pub fn heartbeat(&mut self, lease: &str, epoch: i64, now: u64) -> Result<Vec<Directive>> {
+        self.heartbeat_players(lease, epoch, None, now)
+    }
+
+    /// `players` is the real player count on the host; None leaves the stored value untouched.
+    pub fn heartbeat_players(&mut self, lease: &str, epoch: i64, players: Option<u32>, now: u64) -> Result<Vec<Directive>> {
         self.require_live(lease, epoch)?;
         if let Some(t) = self.timers.get_mut(lease) {
             t.last_hb = now;
         }
+        if let Some(n) = players {
+            self.db.execute("UPDATE leases SET players=? WHERE id=?", params![n, lease])?;
+        }
         Ok(self.directives.remove(lease).unwrap_or_default())
+    }
+
+    /// Last reported real player count of the world's live host; None when unknown or no live lease.
+    pub fn lease_players(&self, world: &str) -> Result<Option<u32>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT players FROM leases WHERE world_id=? AND status IN('ACTIVE','HANDOFF')",
+                params![world],
+                |r| r.get::<_, Option<u32>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     pub(crate) fn require_live(&self, lease: &str, epoch: i64) -> Result<(String, String)> {
