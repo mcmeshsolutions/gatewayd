@@ -9,7 +9,7 @@ use tokio::net::{TcpListener, UdpSocket};
 fn usage() -> ! {
     eprintln!(
         "usage: gatewayd serve\n       gatewayd create-world <id> <name> <mc_version> <loader>\n       \
-         gatewayd add-member <world> <mc_uuid> <name> <device> <ADMIN|HOST_ELIGIBLE|CLIENT_ONLY> <token>\n         gatewayd grant <world> <name> <ADMIN|HOST_ELIGIBLE|CLIENT_ONLY>\n         gatewayd drop-token <token>\n         gatewayd revisions <world>\n         gatewayd status\n         gatewayd scrub\n         gatewayd backup <dir>\n         gatewayd set-pack <world> <pack_id>\n         gatewayd set-admin <name> <admin|user>\n         gatewayd revert <world> <revision>\n\
+         gatewayd add-member <world> <mc_uuid> <name> <device> <ADMIN|HOST_ELIGIBLE|CLIENT_ONLY> <token>\n         gatewayd grant <world> <name> <ADMIN|HOST_ELIGIBLE|CLIENT_ONLY>\n         gatewayd drop-token <token>\n         gatewayd revisions <world>\n         gatewayd status\n         gatewayd scrub\n         gatewayd backup <dir>\n         gatewayd set-pack <world> <pack_id>\n         gatewayd set-admin <name> <admin|user>\n         gatewayd set-limit <user|world> <id|*> <storage_bytes> <world_count> <keep_revisions> <keep_days>   (- = unlimited, replaces the row)\n         gatewayd set-anchor <device> <on|off>\n         gatewayd revert <world> <revision>\n\
          env: MCMESH_DB (default mcmesh.db), MCMESH_CAS (default ./cas),\n         relay (needs MCMESH_WORLD, or MCMESH_RELAY=all to serve every world; MCMESH_WORLD then only picks the UDP and ticketless default): MCMESH_RELAY_ADDR (127.0.0.1:9000), MCMESH_PUBLIC_ADDR (0.0.0.0:25565), MCMESH_VOICE_ADDR (0.0.0.0:24454)\n          MCMESH_ADDR (default 127.0.0.1:8080)\n          MCMESH_CREATE=open lets any logged-in player create worlds\n          MCMESH_ADVERTISE=host:port tells clients where guests connect (with MCMESH_WORLD)\n          MCMESH_METRICS_TOKEN=secret enables GET /metrics (Prometheus) behind that bearer token\n          MCMESH_ADMINS=uuid,uuid are gateway admins on top of `set-admin`; MCMESH_BAN_GRACE_S (120) is how long a banned host may wind down\n          MCMESH_WEBHOOKS=url,url posts gateway events as JSON; MCMESH_WEBHOOK_SECRET signs them"
     );
     std::process::exit(2)
@@ -61,6 +61,13 @@ async fn main() {
             };
             gw.set_gateway_admin(&uuid, match *role { "admin" => true, "user" => false, _ => usage() }, "cli").expect("set admin");
         }
+        ["set-limit", scope, id, storage, worlds, keep_revs, keep_days] => {
+            let scope = match *scope { "user" => gatewayd::quota::Scope::User, "world" => gatewayd::quota::Scope::World, _ => usage() };
+            let n = |v: &str| if v == "-" { None } else { Some(v.parse::<u64>().unwrap_or_else(|_| usage())) };
+            let l = gatewayd::quota::Limits { storage_bytes: n(storage), world_count: n(worlds), keep_revisions: n(keep_revs), keep_days: n(keep_days) };
+            gw.set_limits(scope, id, &l).expect("set limits");
+        }
+        ["set-anchor", device, state] => gw.set_anchor(device, match *state { "on" => true, "off" => false, _ => usage() }).expect("set anchor"),
         ["revisions", world] => {
             for r in gw.revisions(world, 50).expect("revisions") {
                 println!("{r}");

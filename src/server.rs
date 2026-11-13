@@ -144,6 +144,11 @@ impl IntoResponse for ApiErr {
             ApiErr::Domain(Error::PackMismatch) => (StatusCode::FORBIDDEN, "PACK_MISMATCH"),
             ApiErr::Domain(Error::BadMac) => (StatusCode::FORBIDDEN, "BAD_MAC"),
             ApiErr::Domain(Error::BadFrame(m)) => (StatusCode::BAD_REQUEST, m),
+            ApiErr::Domain(Error::Quota(h)) => {
+                let status = if h.code == "QUOTA_WORLD_COUNT" { StatusCode::FORBIDDEN } else { StatusCode::INSUFFICIENT_STORAGE };
+                return (status, Json(json!({ "error": h.code, "limit": h.limit, "used": h.used }))).into_response();
+            }
+            ApiErr::Domain(Error::Pruned) => (StatusCode::GONE, "REVISION_PRUNED"),
             ApiErr::Domain(e) => {
                 eprintln!("internal error: {e:?}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL")
@@ -369,6 +374,8 @@ struct EpochReq {
     sync_done: u64,
     #[serde(default)]
     sync_total: u64,
+    #[serde(default)]
+    players: Option<u32>,
 }
 
 async fn heartbeat(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Path<String>, Json(b): Json<EpochReq>) -> R {
@@ -376,7 +383,7 @@ async fn heartbeat(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Pa
     let mut gw = s.gw();
     let dev = auth(&gw, &h)?;
     own_lease(&gw, &dev, &lease)?;
-    let pending = gw.heartbeat(&lease, b.epoch, now)?;
+    let pending = gw.heartbeat_players(&lease, b.epoch, b.players, now)?;
     if b.sync_total > 0 {
         s.sync.lock().unwrap_or_else(|e| e.into_inner()).insert(lease.clone(), (b.sync_done, b.sync_total, Instant::now()));
     }
@@ -665,4 +672,64 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::admin::gate))
         .layer(DefaultBodyLimit::max(MAX_BLOB))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod core_wiring_tests {
+    use super::*;
+    use crate::lease::Role;
+    use crate::quota::QuotaHit;
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    async fn body_of(e: ApiErr) -> (u16, Value) {
+        let r = e.into_response();
+        let code = r.status().as_u16();
+        let bytes = r.into_body().collect().await.unwrap().to_bytes();
+        (code, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn quota_and_pruned_errors_follow_the_contract() {
+        let hit = |code| ApiErr::Domain(Error::Quota(QuotaHit { code, limit: 10, used: 12 }));
+        let (c, v) = body_of(hit("QUOTA_WORLD_COUNT")).await;
+        assert_eq!((c, v["error"].as_str(), v["limit"].as_u64(), v["used"].as_u64()), (403, Some("QUOTA_WORLD_COUNT"), Some(10), Some(12)));
+        let (c, v) = body_of(hit("QUOTA_STORAGE_WORLD")).await;
+        assert_eq!((c, v["error"].as_str()), (507, Some("QUOTA_STORAGE_WORLD")));
+        let (c, v) = body_of(hit("QUOTA_STORAGE_USER")).await;
+        assert_eq!((c, v["error"].as_str()), (507, Some("QUOTA_STORAGE_USER")));
+        let (c, v) = body_of(ApiErr::Domain(Error::Pruned)).await;
+        assert_eq!((c, v["error"].as_str()), (410, Some("REVISION_PRUNED")));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_stores_the_players_field_and_old_clients_keep_it() {
+        let cas = crate::cas::Cas::open(std::env::temp_dir().join(format!("mcmesh-hbp-{}", std::process::id()))).unwrap();
+        let mut g = Gateway::open(rusqlite::Connection::open_in_memory().unwrap(), cas, 0).unwrap();
+        g.create_world("w1", "x", "1.21.1", "neoforge").unwrap();
+        g.add_member("w1", "u-a", "alice", "dev-a", Role::HostEligible).unwrap();
+        g.add_token("dev-a", "tok-a").unwrap();
+        let state = AppState::new(g);
+        let app = router(state.clone());
+        let post = |path: String, body: Value| {
+            let app = app.clone();
+            async move {
+                let r = Request::post(path).header("content-type", "application/json").header("authorization", "Bearer tok-a").body(Body::from(body.to_string())).unwrap();
+                let resp = app.oneshot(r).await.unwrap();
+                let code = resp.status().as_u16();
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                (code, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+            }
+        };
+        let (_, v) = post("/v1/worlds/w1/join".into(), json!({ "hw": { "tier": 2, "score": 5.0 } })).await;
+        let lease = v["lease"]["id"].as_str().unwrap().to_string();
+        assert_eq!(state.gw().lease_players("w1").unwrap(), None);
+        let (c, _) = post(format!("/v1/leases/{lease}/heartbeat"), json!({ "epoch": 1, "players": 3 })).await;
+        assert_eq!(c, 200);
+        assert_eq!(state.gw().lease_players("w1").unwrap(), Some(3));
+        let (c, _) = post(format!("/v1/leases/{lease}/heartbeat"), json!({ "epoch": 1 })).await;
+        assert_eq!(c, 200);
+        assert_eq!(state.gw().lease_players("w1").unwrap(), Some(3));
+    }
 }
