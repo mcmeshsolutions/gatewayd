@@ -294,3 +294,50 @@ fn revision_chain_detects_tampering() {
     let rep = g.scrub(&root.join("cas")).unwrap();
     assert_eq!(rep.chain_breaks, vec!["w1:R_0002".to_string()]);
 }
+
+#[test]
+fn heartbeat_stores_players_and_missing_field_keeps_it() {
+    let mut g = setup();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    assert_eq!(g.lease_players(W).unwrap(), None);
+    g.heartbeat(&a.lease_id, a.epoch, 1_000).unwrap();
+    assert_eq!(g.lease_players(W).unwrap(), None);
+    g.heartbeat_players(&a.lease_id, a.epoch, Some(3), 2_000).unwrap();
+    assert_eq!(g.lease_players(W).unwrap(), Some(3));
+    g.heartbeat(&a.lease_id, a.epoch, 3_000).unwrap();
+    assert_eq!(g.lease_players(W).unwrap(), Some(3));
+    g.heartbeat_players(&a.lease_id, a.epoch, Some(0), 4_000).unwrap();
+    assert_eq!(g.lease_players(W).unwrap(), Some(0));
+    g.heartbeat_players(&a.lease_id, a.epoch, None, 5_000).unwrap();
+    assert_eq!(g.lease_players(W).unwrap(), Some(0));
+}
+
+#[test]
+fn players_rejects_stale_epoch_and_resets_for_new_lease() {
+    let mut g = setup();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    assert!(matches!(g.heartbeat_players(&a.lease_id, a.epoch + 1, Some(5), 1_000), Err(Error::StaleEpoch)));
+    assert_eq!(g.lease_players(W).unwrap(), None);
+    g.heartbeat_players(&a.lease_id, a.epoch, Some(4), 1_000).unwrap();
+    g.tick(100_000).unwrap();
+    assert_eq!(g.lease_players(W).unwrap(), None);
+    let b = host(g.join(W, "dev-b", hw(2, 5.0), 100_000).unwrap());
+    assert_eq!(b.epoch, 2);
+    assert_eq!(g.lease_players(W).unwrap(), None);
+}
+
+#[test]
+fn players_survive_restart() {
+    let dir = std::env::temp_dir().join(format!("mcmesh-test-players-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&dir);
+    {
+        let mut g = Gateway::open(Connection::open(&dir).unwrap(), test_cas(), 0).unwrap();
+        g.create_world(W, "x", "1.21.1", "neoforge").unwrap();
+        g.add_member(W, "u-a", "alice", "dev-a", Role::HostEligible).unwrap();
+        let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+        g.heartbeat_players(&a.lease_id, a.epoch, Some(2), 1_000).unwrap();
+    }
+    let g = Gateway::open(Connection::open(&dir).unwrap(), test_cas(), 1_000_000).unwrap();
+    assert_eq!(g.lease_players(W).unwrap(), Some(2));
+    let _ = std::fs::remove_file(&dir);
+}
