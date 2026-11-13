@@ -46,6 +46,8 @@ impl Gateway {
              CREATE TABLE IF NOT EXISTS world_policy(
                world_id TEXT PRIMARY KEY, owner_uuid TEXT,
                host_policy TEXT NOT NULL DEFAULT 'MEMBERS' CHECK(host_policy IN('OWNER','ALLOWLIST','MEMBERS'))) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS world_templates(
+               world_id TEXT PRIMARY KEY, description TEXT NOT NULL DEFAULT '', set_by TEXT NOT NULL, set_at INTEGER NOT NULL) WITHOUT ROWID;
              CREATE TABLE IF NOT EXISTS world_host_allow(
                world_id TEXT NOT NULL, player_uuid TEXT NOT NULL, PRIMARY KEY(world_id, player_uuid)) WITHOUT ROWID;",
         )?;
@@ -795,6 +797,9 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/admin/usage", get(admin_usage))
         .route("/v1/worlds/:id/transfer", post(post_transfer))
         .route("/v1/worlds/:id/fork", post(post_fork))
+        .route("/v1/worlds/:id/template", put(put_template))
+        .route("/v1/templates", get(list_templates))
+        .route("/v1/templates/:id/fork", post(fork_template))
         .route("/v1/admin/blobs/:hash", get(cas_blob))
         .route("/v1/admin/worlds/:id/revisions", get(cas_revisions))
         .route("/v1/admin/worlds/:id/revisions/:rev/manifest", get(cas_manifest))
@@ -959,6 +964,77 @@ async fn post_fork(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Pa
         }
         Err("REVISION_PRUNED") => Err(ApiErr::Gone("REVISION_PRUNED")),
         Err(code @ "NO_SUCH_REVISION") => Err(ApiErr::NotFound(code)),
+        Err(code) => Err(ApiErr::Conflict(code)),
+    }
+}
+
+#[derive(Deserialize)]
+struct TemplateReq {
+    on: bool,
+    #[serde(default)]
+    description: String,
+}
+
+/// Owner or admin lists a world as a template that any logged-in player can fork, or takes it off the list.
+async fn put_template(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<TemplateReq>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_owner_or_admin(&s, &gw, &dev, &world)?;
+    if b.description.len() > 280 {
+        return Err(ApiErr::BadRequest("BAD_DESCRIPTION"));
+    }
+    if b.on {
+        let (uuid, _) = gw.device_player(&dev)?.ok_or(ApiErr::Unauthorized)?;
+        gw.db
+            .execute(
+                "INSERT OR REPLACE INTO world_templates(world_id, description, set_by, set_at) VALUES(?,?,?,?)",
+                params![world, b.description, uuid, wall_s()],
+            )
+            .map_err(|e| ApiErr::Domain(Error::Db(e)))?;
+    } else {
+        gw.db.execute("DELETE FROM world_templates WHERE world_id=?", params![world]).map_err(|e| ApiErr::Domain(Error::Db(e)))?;
+    }
+    gw.audit(&dev, if b.on { "world.template.on" } else { "world.template.off" }, &world, &world, json!({}));
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn list_templates(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
+    let gw = s.gw();
+    auth(&gw, &h)?;
+    let db = |e: rusqlite::Error| ApiErr::Domain(Error::Db(e));
+    let mut st = gw
+        .db
+        .prepare("SELECT w.id, w.name, w.mc_version, w.loader, t.description FROM world_templates t JOIN worlds w ON w.id=t.world_id ORDER BY w.name")
+        .map_err(db)?;
+    let rows = st
+        .query_map([], |r| Ok(json!({ "id": r.get::<_, String>(0)?, "name": r.get::<_, String>(1)?, "mc_version": r.get::<_, String>(2)?, "loader": r.get::<_, String>(3)?, "description": r.get::<_, String>(4)? })))
+        .map_err(db)?;
+    Ok(Json(json!({ "templates": rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db)? })))
+}
+
+#[derive(Deserialize)]
+struct TemplateForkReq {
+    name: String,
+}
+
+/// Forks the template's current head into a new world owned by the caller; the caller does not need to be a member.
+async fn fork_template(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<TemplateForkReq>) -> R {
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    let listed = gw.db.query_row("SELECT 1 FROM world_templates WHERE world_id=?", params![world], |_| Ok(())).optional().map_err(|e| ApiErr::Domain(Error::Db(e)))?.is_some();
+    if !listed {
+        return Err(ApiErr::NotFound("NO_SUCH_TEMPLATE"));
+    }
+    if b.name.is_empty() || b.name.len() > 64 {
+        return Err(ApiErr::BadRequest("BAD_NAME"));
+    }
+    let head = gw.head(&world)?;
+    match gw.fork_world(&dev, &world, &head, &b.name)? {
+        Ok(id) => {
+            gw.audit(&dev, "world.fork", &world, &id, json!({ "rev": head, "template": true }));
+            Ok(Json(json!({ "id": id })))
+        }
+        Err("REVISION_PRUNED") => Err(ApiErr::Gone("REVISION_PRUNED")),
         Err(code) => Err(ApiErr::Conflict(code)),
     }
 }

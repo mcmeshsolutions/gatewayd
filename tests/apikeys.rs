@@ -199,3 +199,24 @@ async fn a_fork_starts_from_an_old_revision_and_shares_its_blobs() {
     let (_, after) = call(&app, "GET", &key, "/v1/admin/worlds/w1/revisions", Value::Null).await;
     assert_eq!(after["head"], json!(rev), "the source world is untouched");
 }
+
+#[tokio::test]
+async fn a_listed_template_can_be_forked_by_anyone_logged_in_and_only_then() {
+    let app = app();
+    let (c, v) = call(&app, "POST", "tok-b", "/v1/templates/w1/fork", json!({ "name": "mine" })).await;
+    assert_eq!((c, v["error"].as_str()), (404, Some("NO_SUCH_TEMPLATE")), "not listed yet");
+    let (c, _) = call(&app, "PUT", "tok-b", "/v1/worlds/w1/template", json!({ "on": true })).await;
+    assert_eq!(c, 403, "only the owner or an admin lists a template");
+    let (c, _) = call(&app, "PUT", "tok-a", "/v1/worlds/w1/template", json!({ "on": true, "description": "spawn town" })).await;
+    assert_eq!(c, 200);
+    let (c, v) = call(&app, "GET", "tok-b", "/v1/templates", Value::Null).await;
+    assert_eq!((c, v["templates"][0]["description"].as_str()), (200, Some("spawn town")));
+    let (c, v) = call(&app, "POST", "tok-b", "/v1/templates/w1/fork", json!({ "name": "mine" })).await;
+    assert_eq!(c, 200, "{v}");
+    let (c, v2) = call(&app, "GET", "tok-b", "/v1/worlds", Value::Null).await;
+    assert_eq!(c, 200);
+    assert!(v2.to_string().contains(v["id"].as_str().unwrap()), "bob owns the fork");
+    let (c, _) = call(&app, "PUT", "tok-a", "/v1/worlds/w1/template", json!({ "on": false })).await;
+    assert_eq!(c, 200);
+    assert_eq!(call(&app, "POST", "tok-b", "/v1/templates/w1/fork", json!({ "name": "again" })).await.0, 404);
+}
