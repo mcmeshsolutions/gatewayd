@@ -153,3 +153,21 @@ async fn a_cas_key_downloads_a_blob_by_hash_from_a_manifest_leaf() {
     let (_, status_key) = make_key(&app, "grafana", json!(["read:status"])).await;
     assert_eq!(get(&status_key, &hash).await.0, 403);
 }
+
+#[tokio::test]
+async fn an_owner_hands_a_world_to_a_member_and_loses_owner_only_rights() {
+    let app = app();
+    let (c, v) = call(&app, "POST", "tok-a", "/v1/worlds/w1/transfer", json!({ "to": "nobody" })).await;
+    assert_eq!((c, v["error"].as_str()), (404, Some("NO_SUCH_PLAYER")));
+    let (c, v) = call(&app, "POST", "tok-a", "/v1/worlds/w1/transfer", json!({ "to": "alice" })).await;
+    assert_eq!((c, v["error"].as_str()), (409, Some("ALREADY_OWNER")));
+    let (c, v) = call(&app, "POST", "tok-b", "/v1/worlds/w1/transfer", json!({ "to": "bob" })).await;
+    assert_eq!((c, v["error"].as_str()), (403, Some("OWNER_ONLY")), "a plain member cannot give themselves the world");
+    let (c, v) = call(&app, "POST", "tok-a", "/v1/worlds/w1/transfer", json!({ "to": "bob" })).await;
+    assert_eq!((c, v["owner"].as_str()), (200, Some("bob")), "{v}");
+    let (c, v) = call(&app, "GET", "tok-a", "/v1/admin/audit", Value::Null).await;
+    assert_eq!(c, 200);
+    assert!(v.to_string().contains("world.transfer"));
+    let (c, _) = call(&app, "POST", "tok-b", "/v1/worlds/w1/transfer", json!({ "to": "alice" })).await;
+    assert_eq!(c, 200, "bob is the owner now and can hand it back");
+}

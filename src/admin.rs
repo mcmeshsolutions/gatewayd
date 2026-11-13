@@ -793,6 +793,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/worlds/:id/handover-vote", get(get_handover_vote).post(cast_handover_vote))
         .route("/v1/worlds/:id/handover-vote/propose", post(propose_handover))
         .route("/v1/admin/usage", get(admin_usage))
+        .route("/v1/worlds/:id/transfer", post(post_transfer))
         .route("/v1/admin/blobs/:hash", get(cas_blob))
         .route("/v1/admin/worlds/:id/revisions", get(cas_revisions))
         .route("/v1/admin/worlds/:id/revisions/:rev/manifest", get(cas_manifest))
@@ -861,4 +862,44 @@ async fn cas_blob(State(s): State<Arc<AppState>>, h: HeaderMap, Path(hash): Path
         return Err(ApiErr::NotFound("NO_SUCH_BLOB"));
     }
     gw.cas().get(&want).map_err(|e| ApiErr::Domain(Error::Store(e.to_string())))
+}
+
+impl Gateway {
+    /// Hands the world to another member by name: they become ADMIN and the owner in both owner records.
+    /// The previous owner keeps their ADMIN seat. The new owner's world-count limit still applies.
+    pub fn transfer_world(&mut self, world: &str, to: &str) -> Result<std::result::Result<String, &'static str>, Error> {
+        let uuid: Option<String> = self.db.query_row("SELECT uuid FROM players WHERE name=? COLLATE NOCASE", params![to], |r| r.get(0)).optional()?;
+        let Some(uuid) = uuid else { return Ok(Err("NO_SUCH_PLAYER")) };
+        let is_member: bool = self.db.query_row("SELECT 1 FROM members WHERE world_id=? AND player_uuid=?", params![world, uuid], |_| Ok(())).optional()?.is_some();
+        if !is_member {
+            return Ok(Err("NOT_A_MEMBER"));
+        }
+        if self.world_owner(world)?.as_deref() == Some(uuid.as_str()) {
+            return Ok(Err("ALREADY_OWNER"));
+        }
+        self.check_world_count(&uuid)?;
+        self.db.execute("UPDATE members SET role='ADMIN' WHERE world_id=? AND player_uuid=?", params![world, uuid])?;
+        self.db.execute("UPDATE worlds SET owner_uuid=? WHERE id=?", params![uuid, world])?;
+        self.set_world_owner(world, &uuid)?;
+        Ok(Ok(uuid))
+    }
+}
+
+#[derive(Deserialize)]
+struct TransferReq {
+    to: String,
+}
+
+async fn post_transfer(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<TransferReq>) -> R {
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_owner_or_admin(&s, &gw, &dev, &world)?;
+    match gw.transfer_world(&world, &b.to)? {
+        Ok(uuid) => {
+            gw.audit(&dev, "world.transfer", &world, &uuid, json!({ "to": b.to }));
+            Ok(Json(json!({ "ok": true, "owner": b.to })))
+        }
+        Err(code @ "NO_SUCH_PLAYER") => Err(ApiErr::NotFound(code)),
+        Err(code) => Err(ApiErr::Conflict(code)),
+    }
 }
