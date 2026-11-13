@@ -793,6 +793,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/worlds/:id/handover-vote", get(get_handover_vote).post(cast_handover_vote))
         .route("/v1/worlds/:id/handover-vote/propose", post(propose_handover))
         .route("/v1/admin/usage", get(admin_usage))
+        .route("/v1/admin/worlds/:id/revisions", get(cas_revisions))
+        .route("/v1/admin/worlds/:id/revisions/:rev/manifest", get(cas_manifest))
         .route("/v1/worlds/:id/signing", put(put_signing))
         .route("/v1/admin/audit", get(admin_audit))
         .route("/v1/admin/maintenance", get(get_maintenance).put(put_maintenance))
@@ -801,4 +803,50 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/admin/users/:name/role", put(put_gateway_role))
         .route("/v1/worlds/:id/audit", get(world_audit))
         .route("/v1/worlds/:id/policy", get(get_policy).put(put_policy))
+}
+
+#[derive(Deserialize)]
+struct ListQ {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+/// Revision list for external tools. Needs `read:cas` or an admin login.
+async fn cas_revisions(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Query(q): Query<ListQ>) -> R {
+    let gw = s.gw();
+    admin_or_key(&s, &gw, &h, "read:cas")?;
+    let head = gw.head(&world).map_err(|_| ApiErr::NotFound("NO_SUCH_WORLD"))?;
+    let revisions = gw.revisions(&world, q.limit.unwrap_or(50).clamp(1, 200))?;
+    Ok(Json(json!({ "head": head, "revisions": revisions })))
+}
+
+const MANIFEST_PAGE_MAX: usize = 5000;
+
+/// Every leaf of one revision (aux files, then chunks) with its blob hash, paged. Blobs themselves are not served here.
+async fn cas_manifest(State(s): State<Arc<AppState>>, h: HeaderMap, Path((world, rev)): Path<(String, String)>, Query(q): Query<ListQ>) -> R {
+    let gw = s.gw();
+    admin_or_key(&s, &gw, &h, "read:cas")?;
+    let owned: Option<String> = gw
+        .db
+        .query_row("SELECT world_id FROM revisions WHERE id=?", params![rev], |r| r.get(0))
+        .ok();
+    if owned.as_deref() != Some(world.as_str()) {
+        return Err(ApiErr::NotFound("NO_SUCH_REVISION"));
+    }
+    let root = gw.revision_root(&rev)?;
+    let (offset, limit) = (q.offset.unwrap_or(0), q.limit.unwrap_or(1000).clamp(1, MANIFEST_PAGE_MAX));
+    let (mut total, mut leaves) = (0usize, Vec::new());
+    crate::manifest::for_each_leaf(&gw.cas, root, &mut |item, hash| {
+        if total >= offset && leaves.len() < limit {
+            let hash = crate::cas::hex(&hash);
+            leaves.push(match item {
+                crate::manifest::Item::Aux(path) => json!({ "type": "aux", "path": path, "hash": hash }),
+                crate::manifest::Item::Chunk(k) => json!({ "type": "chunk", "dim": k.dim, "kind": format!("{:?}", k.kind).to_lowercase(), "cx": k.cx, "cz": k.cz, "hash": hash }),
+            });
+        }
+        total += 1;
+        Ok(())
+    })
+    .map_err(|e| ApiErr::Domain(Error::Store(format!("{e:?}"))))?;
+    Ok(Json(json!({ "revision": rev, "total": total, "offset": offset, "leaves": leaves })))
 }

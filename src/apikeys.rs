@@ -1,6 +1,6 @@
 //! Scoped API keys for bots and scripts. A key is shown once, stored only as a SHA-256 hash, and opens only the routes its
-//! scopes name. Scopes: `read:status` (usage report, audit log, maintenance state) and `op:lifecycle` (switch maintenance
-//! mode). Everything else needs a real admin login.
+//! scopes name. Scopes: `read:status` (usage report, audit log, maintenance state), `op:lifecycle` (switch maintenance
+//! mode) and `read:cas` (revision list and per-revision manifest, for external tools such as map renderers). Everything else needs a real admin login.
 
 use crate::lease::{wall_s, Error, Gateway, Result};
 use rusqlite::{params, OptionalExtension};
@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 pub const PREFIX: &str = "mcmesh_sk_";
-pub const SCOPES: [&str; 2] = ["read:status", "op:lifecycle"];
+pub const SCOPES: [&str; 3] = ["read:status", "op:lifecycle", "read:cas"];
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum KeyCheck {

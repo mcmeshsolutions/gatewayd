@@ -78,3 +78,55 @@ async fn only_admins_manage_keys_secrets_are_shown_once_and_revoking_works() {
     assert_eq!(call(&app, "GET", &key, "/v1/admin/usage", Value::Null).await.0, 401, "a revoked key stops working at once");
     assert_eq!(call(&app, "DELETE", "tok-a", &format!("/v1/admin/api-keys/{id}"), Value::Null).await.0, 404);
 }
+
+fn app_with_chunks() -> (Router, String) {
+    use gatewayd::chain::{next_mac, Entry};
+    use gatewayd::lease::{CommitKind, Hw, Join};
+    use gatewayd::wal::Frame;
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let dir = std::env::temp_dir().join(format!("mcmesh-cas-it-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    let mut g = Gateway::open(Connection::open_in_memory().unwrap(), gatewayd::cas::Cas::open(dir).unwrap(), 0).unwrap();
+    g.create_world("w1", "x", "1.21.1", "neoforge").unwrap();
+    g.add_member("w1", "u-a", "alice", "dev-a", Role::Admin).unwrap();
+    g.add_token("dev-a", "tok-a").unwrap();
+    let Join::Host(a) = g.join("w1", "dev-a", Hw { tier: 2, score: 5.0, wants_host: true, takeover: true }, 0).unwrap() else { panic!("host") };
+    let (c1, lv) = (g.cas().put(b"chunk1").unwrap(), g.cas().put(b"level").unwrap());
+    let mut prev = [0u8; 32];
+    let mut frames = Vec::new();
+    for (seq, (op, dim, cx, cz, hash)) in [("put:region", "minecraft:overworld", 3, -4, c1), ("aux_put", "level.dat", 0, 0, lv), ("barrier", "", 0, 0, [0u8; 32])].into_iter().enumerate() {
+        let e = Entry { seq: seq as u64, dim, kind: op, cx, cz, hash: &hash };
+        prev = next_mac(&a.hmac_key, &prev, &e);
+        frames.push(Frame { seq: e.seq, op: op.into(), dim: dim.into(), cx, cz, hash, mac: prev.to_vec() });
+    }
+    g.wal_append(&a.lease_id, a.epoch, &frames).unwrap();
+    let rev = g.commit(&a.lease_id, a.epoch, &a.base_rev, CommitKind::Autosave, false, 100).unwrap();
+    let cfg = gatewayd::auth::AuthCfg { admins: vec!["u-a".into()], ..Default::default() };
+    (router(AppState::with_auth(g, cfg)), rev.id)
+}
+
+#[tokio::test]
+async fn a_cas_key_lists_revisions_and_manifests_and_nothing_else() {
+    let (app, rev) = app_with_chunks();
+    let (_, key) = make_key(&app, "renderer", json!(["read:cas"])).await;
+    let (c, v) = call(&app, "GET", &key, "/v1/admin/worlds/w1/revisions", Value::Null).await;
+    assert_eq!(c, 200, "{v}");
+    assert_eq!(v["head"], json!(rev));
+    let (c, v) = call(&app, "GET", &key, &format!("/v1/admin/worlds/w1/revisions/{rev}/manifest"), Value::Null).await;
+    assert_eq!(c, 200, "{v}");
+    assert_eq!(v["total"], 2);
+    let leaves = v["leaves"].as_array().unwrap();
+    assert!(leaves.iter().any(|l| l["type"] == "aux" && l["path"] == "level.dat"));
+    assert!(leaves.iter().any(|l| l["type"] == "chunk" && l["cx"] == 3 && l["cz"] == -4 && l["kind"] == "region" && l["hash"].as_str().unwrap().len() == 64));
+    let (_, page) = call(&app, "GET", &key, &format!("/v1/admin/worlds/w1/revisions/{rev}/manifest?offset=1&limit=1"), Value::Null).await;
+    assert_eq!((page["total"].as_u64(), page["leaves"].as_array().unwrap().len()), (Some(2), 1));
+
+    let (c, _) = call(&app, "GET", &key, "/v1/admin/worlds/nope/revisions", Value::Null).await;
+    assert_eq!(c, 404);
+    let (c, v) = call(&app, "GET", &key, "/v1/admin/worlds/other/revisions/w1:R_0001/manifest", Value::Null).await;
+    assert_eq!((c, v["error"].as_str()), (404, Some("NO_SUCH_REVISION")));
+    assert_eq!(call(&app, "GET", &key, "/v1/admin/usage", Value::Null).await.0, 403);
+
+    let (_, status_key) = make_key(&app, "grafana", json!(["read:status"])).await;
+    let (c, v) = call(&app, "GET", &status_key, "/v1/admin/worlds/w1/revisions", Value::Null).await;
+    assert_eq!((c, v["error"].as_str()), (403, Some("SCOPE_DENIED")));
+}
