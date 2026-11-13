@@ -186,6 +186,11 @@ impl Gateway {
         if self.world_state(world)?.0 != "IDLE" {
             return Ok(Err("WORLD_RUNNING"));
         }
+        self.rollback_to(world, rev).map(Ok)
+    }
+
+    /// New head with the content of `rev`, kept as a ROLLBACK revision so nothing is lost. The caller checks the world is idle.
+    pub(crate) fn rollback_to(&mut self, world: &str, rev: &str) -> Result<String, Error> {
         let head = self.head(world)?;
         let root = self.revision_root(rev)?;
         let tx = self.db.transaction()?;
@@ -198,7 +203,7 @@ impl Gateway {
         crate::lease::seal(&tx, &id)?;
         tx.execute("UPDATE refs SET rev_id=? WHERE world_id=? AND name='main'", params![id, world])?;
         tx.commit()?;
-        Ok(Ok(id))
+        Ok(id)
     }
 }
 

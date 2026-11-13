@@ -511,3 +511,73 @@ fn signed_commits_verify_against_the_registered_key_and_keep_the_signature() {
     let none: Option<Vec<u8>> = g.db.query_row("SELECT sig FROM revisions WHERE id=?", rusqlite::params![unsigned.id], |row| row.get(0)).unwrap();
     assert_eq!(none, None, "unsigned commits stay unsigned");
 }
+
+#[test]
+fn recover_head_finds_the_newest_intact_revision_and_moves_the_head_there() {
+    let mut g = setup();
+    let root = std::env::temp_dir().join(format!("mcmesh-recover-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let cas_dir = root.join("cas");
+    g.cas = crate::cas::Cas::open(&cas_dir).unwrap();
+    // creating any world writes the shared empty tree into the new store
+    g.create_world("w8", "m", "1.21.1", "neoforge").unwrap();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    let blobs: Vec<[u8; 32]> = (1..=3).map(|i| g.cas.put(format!("chunk-{i}").as_bytes()).unwrap()).collect();
+    let mut base = a.base_rev.clone();
+    let mut revs = Vec::new();
+    for (i, h) in blobs.iter().enumerate() {
+        let n = i as i64 * 2;
+        wal_row(&g, &a.lease_id, n + 1, "put:region", i as i32 + 1, 1, *h);
+        wal_row(&g, &a.lease_id, n + 2, "barrier", 0, 0, [0; 32]);
+        let last = i == 2;
+        let kind = if last { CommitKind::Shutdown } else { CommitKind::Autosave };
+        let r = g.commit(&a.lease_id, a.epoch, &base, kind, last, 1_000 + i as u64).unwrap();
+        base = r.id.clone();
+        revs.push(r.id);
+    }
+    let r = g.recover_head(W, false).unwrap();
+    assert!(r.head_ok && r.applied.is_none(), "a healthy head is left alone");
+
+    let path = |h: &[u8; 32]| {
+        let x = crate::cas::hex(h);
+        cas_dir.join(&x[0..2]).join(&x[2..4]).join(x)
+    };
+    std::fs::remove_file(path(&blobs[2])).unwrap();
+    std::fs::write(path(&blobs[1]), b"garbage").unwrap();
+    let dry = g.recover_head(W, false).unwrap();
+    assert!(!dry.head_ok);
+    assert_eq!(dry.good.as_deref(), Some(revs[0].as_str()), "the two newest are damaged, the first autosave is intact");
+    assert_eq!(dry.damaged, vec![revs[2].clone(), revs[1].clone()]);
+    assert!(dry.applied.is_none());
+    assert_eq!(g.head(W).unwrap(), revs[2], "a dry run changes nothing");
+
+    let done = g.recover_head(W, true).unwrap();
+    let new_head = done.applied.expect("head moved");
+    assert_eq!(g.head(W).unwrap(), new_head);
+    assert!(g.recover_head(W, false).unwrap().head_ok);
+    let kind: String = g.db.query_row("SELECT kind FROM revisions WHERE id=?", rusqlite::params![new_head], |row| row.get(0)).unwrap();
+    assert_eq!(kind, "ROLLBACK");
+    assert!(g.scan_revision(&revs[2]).is_ok(), "the damaged revisions stay in the history");
+}
+
+#[test]
+fn recover_head_without_an_intact_revision_reports_it_and_changes_nothing() {
+    let mut g = setup();
+    let root = std::env::temp_dir().join(format!("mcmesh-recover2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let cas_dir = root.join("cas");
+    g.cas = crate::cas::Cas::open(&cas_dir).unwrap();
+    g.create_world("w9", "m", "1.21.1", "neoforge").unwrap();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    let h = g.cas.put(b"only chunk").unwrap();
+    wal_row(&g, &a.lease_id, 1, "put:region", 1, 1, h);
+    wal_row(&g, &a.lease_id, 2, "barrier", 0, 0, [0; 32]);
+    let r = g.commit(&a.lease_id, a.epoch, &a.base_rev, CommitKind::Shutdown, true, 1_000).unwrap();
+    let x = crate::cas::hex(&h);
+    std::fs::remove_file(cas_dir.join(&x[0..2]).join(&x[2..4]).join(x)).unwrap();
+    let out = g.recover_head(W, true).unwrap();
+    assert!(!out.head_ok, "head still intact: {out:?}");
+    assert!(out.good.is_none(), "found a good revision: {out:?}");
+    assert!(out.applied.is_none(), "applied: {out:?}");
+    assert_eq!(g.head(W).unwrap(), r.id);
+}

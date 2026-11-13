@@ -587,3 +587,69 @@ mod tests {
     }
 }
 
+
+const RECOVER_LOOKBACK: usize = 20;
+
+/// What `recover_head` found, and did when asked to.
+#[derive(Debug, Default)]
+pub struct Recovery {
+    pub head: String,
+    pub head_ok: bool,
+    /// the newest revision within the lookback whose blobs are all present and intact
+    pub good: Option<String>,
+    /// revisions newer than `good` that are damaged, newest first
+    pub damaged: Vec<String>,
+    /// why nothing was applied although the head is damaged
+    pub blocked: Option<&'static str>,
+    /// the new ROLLBACK revision when the head was moved
+    pub applied: Option<String>,
+}
+
+impl Gateway {
+    /// Checks the head of a world and, when its blobs are missing or corrupt, finds the newest clean revision among the last
+    /// 20. With `apply` the head moves there as a new ROLLBACK revision (the damaged ones stay listed), but only while the
+    /// world is idle. Reads every blob of each revision it checks, so it is a maintenance job, not a request path.
+    pub fn recover_head(&mut self, world: &str, apply: bool) -> Result<Recovery> {
+        let head = self.head(world)?;
+        let mut out = Recovery { head: head.clone(), ..Default::default() };
+        let revs: Vec<String> = {
+            let mut st = self.db.prepare("SELECT id FROM revisions WHERE world_id=? AND pruned=0 AND kind!='ROLLBACK' OR (world_id=? AND id=?) ORDER BY seq DESC LIMIT ?")?;
+            let rows = st.query_map(rusqlite::params![world, world, head, RECOVER_LOOKBACK as i64], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let blobs_ok = |g: &Gateway, rev: &str| -> Result<(bool, u64)> {
+            let s = g.scan_revision(rev)?;
+            let mut leaves = 0u64;
+            crate::manifest::for_each_leaf(&g.cas, g.revision_root(rev)?, &mut |_, _| {
+                leaves += 1;
+                Ok(())
+            })
+            .map_err(|e| crate::lease::Error::Store(e.to_string()))?;
+            Ok((s.missing.is_empty() && s.corrupt.is_empty(), leaves))
+        };
+        out.head_ok = blobs_ok(self, &head)?.0;
+        if out.head_ok {
+            return Ok(out);
+        }
+        for rev in revs.into_iter().filter(|r| *r != head) {
+            // an empty tree is intact but is not a world: rolling back to it would wipe the world, so it never counts
+            match blobs_ok(self, &rev).map(|(ok, leaves)| ok && leaves > 0) {
+                Ok(true) => {
+                    out.good = Some(rev);
+                    break;
+                }
+                Ok(false) | Err(crate::lease::Error::Pruned) => out.damaged.push(rev),
+                Err(e) => return Err(e),
+            }
+        }
+        out.damaged.insert(0, head);
+        if let (true, Some(good)) = (apply, out.good.clone()) {
+            if self.world_state(world)?.0 != "IDLE" {
+                out.blocked = Some("WORLD_RUNNING");
+            } else {
+                out.applied = Some(self.rollback_to(world, &good)?);
+            }
+        }
+        Ok(out)
+    }
+}
