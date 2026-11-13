@@ -780,3 +780,24 @@ fn a_region_rollback_is_refused_while_a_host_is_running() {
     let a = locked_host(&mut g, 2, 5.0);
     assert_eq!(g.rollback_region(W, &a.base_rev, "minecraft:overworld", 0, 0, 1, 1).unwrap(), Err("WORLD_RUNNING"));
 }
+
+#[test]
+fn scrub_flags_a_signer_that_matches_no_registered_device() {
+    let mut g = setup();
+    let root = std::env::temp_dir().join(format!("mcmesh-signer-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    g.cas = crate::cas::Cas::open(&root.join("cas")).unwrap();
+    g.create_world("w9", "m", "1.21.1", "neoforge").unwrap();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    let h = g.cas.put(&[1; 8]).unwrap();
+    wal_row(&g, &a.lease_id, 1, "put:region", 0, 0, h);
+    wal_row(&g, &a.lease_id, 2, "barrier", 0, 0, [0; 32]);
+    let rev = g.commit(&a.lease_id, a.epoch, &a.base_rev, CommitKind::Autosave, false, 1_000).unwrap();
+    g.set_device_key("dev-a", &[7; 32]).unwrap();
+    g.db().execute("UPDATE revisions SET sig=?, signer=? WHERE id=?", rusqlite::params![[0u8; 64].as_slice(), [7u8; 32].as_slice(), rev.id]).unwrap();
+    assert!(g.scrub(&root.join("cas")).unwrap().unknown_signers.is_empty());
+    g.db().execute("UPDATE revisions SET signer=? WHERE id=?", rusqlite::params![[8u8; 32].as_slice(), rev.id]).unwrap();
+    let rep = g.scrub(&root.join("cas")).unwrap();
+    assert_eq!(rep.unknown_signers, vec![rev.id.clone()]);
+    assert!(!rep.ok());
+}

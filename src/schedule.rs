@@ -17,8 +17,8 @@ pub fn run_once(db: &str, cas_dir: &str, backup_dir: &Path, auto_recover: bool) 
     // back up first: the backup only copies blobs it does not have, so it can never replace a good copy with a damaged one
     let (copied, skipped) = gw.backup(Path::new(cas_dir), backup_dir).map_err(|e| format!("backup: {e:?}"))?;
     let mut summary = format!(
-        "scrub: {} blobs, {} revisions, {} corrupt, {} broken revisions, {} missing, {} chain breaks; backup: {copied} copied, {skipped} already present",
-        r.blobs, r.revisions, r.corrupt.len(), r.broken_revisions.len(), r.missing.len(), r.chain_breaks.len()
+        "scrub: {} blobs, {} revisions, {} corrupt, {} broken revisions, {} missing, {} chain breaks, {} unknown signers; backup: {copied} copied, {skipped} already present",
+        r.blobs, r.revisions, r.corrupt.len(), r.broken_revisions.len(), r.missing.len(), r.chain_breaks.len(), r.unknown_signers.len()
     );
     if auto_recover && !r.ok() {
         let worlds: Vec<String> = {

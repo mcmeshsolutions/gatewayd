@@ -14,11 +14,13 @@ pub struct ScrubReport {
     pub broken_revisions: Vec<String>,
     pub missing: Vec<String>,
     pub chain_breaks: Vec<String>,
+    /// Signed revisions whose signer key matches no registered device.
+    pub unknown_signers: Vec<String>,
 }
 
 impl ScrubReport {
     pub fn ok(&self) -> bool {
-        self.corrupt.is_empty() && self.chain_breaks.is_empty() && self.broken_revisions.is_empty() && self.missing.is_empty()
+        self.corrupt.is_empty() && self.chain_breaks.is_empty() && self.unknown_signers.is_empty() && self.broken_revisions.is_empty() && self.missing.is_empty()
     }
 }
 
@@ -110,6 +112,10 @@ impl Gateway {
                     }
                 }
             }
+        }
+        {
+            let mut st = self.db.prepare("SELECT id FROM revisions WHERE signer IS NOT NULL AND signer NOT IN (SELECT pubkey FROM devices WHERE pubkey IS NOT NULL) ORDER BY id")?;
+            rep.unknown_signers = st.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
         }
         let mut st = self.db.prepare("SELECT id, root_hash FROM revisions WHERE pruned=0 ORDER BY id")?;
         let revs: Vec<(String, Vec<u8>)> =
