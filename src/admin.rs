@@ -1203,3 +1203,39 @@ async fn world_bans(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): P
     let rows = st.query_map(params![world], |r| Ok(json!({ "name": r.get::<_, String>(0)?, "reason": r.get::<_, String>(1)?, "banned_at": r.get::<_, i64>(2)? }))).map_err(db)?;
     Ok(Json(json!({ "bans": rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db)? })))
 }
+
+impl Gateway {
+    /// Human-readable difference between two revisions: totals, every changed extra file, and the first `chunk_lines` chunks.
+    pub fn diff_report(&self, a: &str, b: &str, chunk_lines: usize) -> Result<Vec<String>, Error> {
+        use crate::manifest::{self, Item};
+        let diffs = manifest::diff(self.cas(), Some(self.revision_root(a)?), Some(self.revision_root(b)?)).map_err(|e| Error::Store(e.to_string()))?;
+        let sign = |d: &manifest::Diff| match (d.old, d.new) {
+            (None, _) => '+',
+            (_, None) => '-',
+            _ => '~',
+        };
+        let (mut add, mut chg, mut del) = (0, 0, 0);
+        let (mut aux, mut chunks) = (Vec::new(), Vec::new());
+        for d in &diffs {
+            match &d.item {
+                Item::Aux(p) => aux.push(format!("  {} {p}", sign(d))),
+                Item::Chunk(k) => {
+                    match sign(d) {
+                        '+' => add += 1,
+                        '-' => del += 1,
+                        _ => chg += 1,
+                    }
+                    chunks.push(format!("  {} {} {:?} {},{}", sign(d), k.dim, k.kind, k.cx, k.cz));
+                }
+            }
+        }
+        let mut out = vec![format!("{a} -> {b}: chunks {add} added, {chg} changed, {del} removed; {} extra files changed", aux.len())];
+        out.extend(aux);
+        let more = chunks.len().saturating_sub(chunk_lines);
+        out.extend(chunks.into_iter().take(chunk_lines));
+        if more > 0 {
+            out.push(format!("  ... {more} more chunks"));
+        }
+        Ok(out)
+    }
+}

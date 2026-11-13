@@ -801,3 +801,28 @@ fn scrub_flags_a_signer_that_matches_no_registered_device() {
     assert_eq!(rep.unknown_signers, vec![rev.id.clone()]);
     assert!(!rep.ok());
 }
+
+#[test]
+fn diff_report_lists_added_changed_and_removed_chunks() {
+    let mut g = setup();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    let (h1, h2, h3) = (g.cas.put(b"one").unwrap(), g.cas.put(b"two").unwrap(), g.cas.put(b"three").unwrap());
+    wal_row(&g, &a.lease_id, 1, "put:region", 1, 1, h1);
+    wal_row(&g, &a.lease_id, 2, "put:region", 2, 1, h2);
+    wal_row(&g, &a.lease_id, 3, "barrier", 0, 0, [0; 32]);
+    let r1 = g.commit(&a.lease_id, a.epoch, &a.base_rev, CommitKind::Autosave, false, 1_000).unwrap();
+    wal_row(&g, &a.lease_id, 4, "put:region", 2, 1, h3);
+    wal_row(&g, &a.lease_id, 5, "put:region", 3, 1, h3);
+    wal_row(&g, &a.lease_id, 6, "del:region", 1, 1, [0; 32]);
+    wal_row(&g, &a.lease_id, 7, "barrier", 0, 0, [0; 32]);
+    let r2 = g.commit(&a.lease_id, a.epoch, &r1.id, CommitKind::Autosave, false, 2_000).unwrap();
+    let out = g.diff_report(&r1.id, &r2.id, 20).unwrap();
+    assert!(out[0].ends_with("chunks 1 added, 1 changed, 1 removed; 0 extra files changed"), "{out:?}");
+    assert!(out.iter().any(|l| l.starts_with("  + ") && l.ends_with("3,1")), "{out:?}");
+    assert!(out.iter().any(|l| l.starts_with("  ~ ") && l.ends_with("2,1")), "{out:?}");
+    assert!(out.iter().any(|l| l.starts_with("  - ") && l.ends_with("1,1")), "{out:?}");
+    let short = g.diff_report(&r1.id, &r2.id, 1).unwrap();
+    assert_eq!(short.len(), 3, "header, one chunk, and the rest counted: {short:?}");
+    assert!(short[2].contains("2 more chunks"));
+    assert!(g.diff_report(&r1.id, "R_nope", 5).is_err());
+}
