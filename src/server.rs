@@ -13,7 +13,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub struct AppState {
     gw: Mutex<Gateway>,
@@ -26,6 +26,8 @@ pub struct AppState {
     pub(crate) live_worlds: Mutex<std::collections::HashSet<String>>,
     /// Host's world download progress by lease id: (done, total, when reported).
     pub(crate) sync: Mutex<std::collections::HashMap<String, (u64, u64, Instant)>>,
+    /// Last `world.wanted` event per world, so a retrying joiner does not flood the event log.
+    wanted: Mutex<std::collections::HashMap<String, Instant>>,
     pub(crate) hooks: crate::ops::Hooks,
     /// Relayed bytes by world since the last tick: (to host, to guests).
     relay_bytes: Mutex<std::collections::HashMap<String, (u64, u64)>>,
@@ -42,7 +44,16 @@ impl AppState {
             eprintln!("ops init failed: {e:?}");
         }
         let hooks = crate::ops::Hooks::new(&auth.webhooks, auth.webhook_secret.clone());
-        Arc::new(AppState { gw: Mutex::new(gw), start: Instant::now(), auth, challenges: Mutex::new(Default::default()), tickets: Mutex::new(Default::default()), panel_codes: Mutex::new(Default::default()), live_worlds: Mutex::new(Default::default()), sync: Mutex::new(Default::default()), hooks, relay_bytes: Mutex::new(Default::default()), limiter: crate::ratelimit::Limiter::from_env() })
+        Arc::new(AppState { gw: Mutex::new(gw), start: Instant::now(), auth, challenges: Mutex::new(Default::default()), tickets: Mutex::new(Default::default()), panel_codes: Mutex::new(Default::default()), live_worlds: Mutex::new(Default::default()), sync: Mutex::new(Default::default()), wanted: Mutex::new(Default::default()), hooks, relay_bytes: Mutex::new(Default::default()), limiter: crate::ratelimit::Limiter::from_env() })
+    }
+    /// True at most once per 30 s per world.
+    fn wanted_due(&self, world: &str) -> bool {
+        let mut m = self.wanted.lock().unwrap_or_else(|e| e.into_inner());
+        let due = m.get(world).is_none_or(|t| t.elapsed() >= Duration::from_secs(30));
+        if due {
+            m.insert(world.to_string(), Instant::now());
+        }
+        due
     }
     pub(crate) fn uptime_s(&self) -> u64 {
         self.start.elapsed().as_secs()
@@ -429,6 +440,7 @@ async fn join(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<St
     }
     gw.meter(&world, "joins", 1);
     let before = gw.lease_of_world(&world);
+    let wanted = before.is_none() && s.wanted_due(&world);
     let mut out = match gw.join(&world, &dev, hw, now)? {
         Join::Host(g) => {
             if before.as_deref() != Some(g.lease_id.as_str()) {
@@ -445,6 +457,10 @@ async fn join(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<St
         Join::Guest { epoch, host_device } => json!({ "decision": "GUEST", "epoch": epoch, "host": { "device": host_device } }),
         Join::Wait { phase } => json!({ "decision": "WAIT", "phase": phase, "retry_ms": 1500 }),
     };
+    if wanted && out["decision"] != "HOST" {
+        let player = gw.device_player(&dev)?.map(|p| p.1);
+        s.hooks.emit("world.wanted", &world, json!({ "player": player, "decision": out["decision"] }));
+    }
     out["host_allowed"] = json!(host_allowed);
     Ok(Json(out))
 }

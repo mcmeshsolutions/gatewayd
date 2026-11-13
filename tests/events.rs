@@ -124,3 +124,25 @@ async fn the_discovery_document_is_public_and_lists_features_without_secrets() {
     let text = String::from_utf8_lossy(&bytes).to_lowercase();
     assert!(!text.contains("token") && !text.contains("secret"), "nothing sensitive: {text}");
 }
+
+#[tokio::test]
+async fn a_player_who_cannot_host_an_idle_world_raises_world_wanted_once() {
+    let app = app();
+    let join = |tok: &'static str| {
+        let app = app.clone();
+        async move { call(&app, "POST", Some(tok), "/v1/worlds/w1/join", json!({ "hw": { "tier": 2, "score": 5.0 } })).await }
+    };
+    let (c, v) = join("tok-c").await;
+    assert_eq!(c, 200);
+    assert_ne!(v["decision"], "HOST", "a client-only member never hosts");
+    join("tok-c").await;
+    let (_, ev) = call(&app, "GET", Some("tok-c"), "/v1/worlds/w1/events", Value::Null).await;
+    let wanted: Vec<_> = ev["events"].as_array().unwrap().iter().filter(|e| e["event"] == "world.wanted").collect();
+    assert_eq!(wanted.len(), 1, "a retrying joiner must not flood the log: {ev}");
+    assert_eq!(wanted[0]["data"]["player"], "cara");
+    host(&app, "tok-a", "w1").await;
+    join("tok-c").await;
+    let (_, ev) = call(&app, "GET", Some("tok-c"), "/v1/worlds/w1/events", Value::Null).await;
+    let n = ev["events"].as_array().unwrap().iter().filter(|e| e["event"] == "world.wanted").count();
+    assert_eq!(n, 1, "no event while a host is live");
+}
