@@ -79,7 +79,7 @@ impl Gateway {
                 }
             }
         }
-        let mut st = self.db.prepare("SELECT id, root_hash FROM revisions ORDER BY id")?;
+        let mut st = self.db.prepare("SELECT id, root_hash FROM revisions WHERE pruned=0 ORDER BY id")?;
         let revs: Vec<(String, Vec<u8>)> =
             st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
         let mut seen_missing: HashSet<Hash> = HashSet::new();

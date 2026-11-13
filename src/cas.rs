@@ -40,6 +40,10 @@ impl Cas {
         Ok(Cas { root })
     }
 
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
     fn path(&self, h: &Hash) -> PathBuf {
         let x = hex(h);
         self.root.join(&x[0..2]).join(&x[2..4]).join(x)

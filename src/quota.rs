@@ -230,7 +230,8 @@ impl Gateway {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chaos_tests::WalWriter;
+    use crate::chain::{next_mac, Entry};
+    use crate::wal::Frame;
     use crate::lease::{CommitKind, Hw, Join, Role};
     use crate::manifest::{Key, Kind};
 
@@ -243,6 +244,31 @@ mod tests {
         g.add_member("w", "u-a", "alice", "dev-a", Role::Admin).unwrap();
         g.db().execute("UPDATE worlds SET owner_uuid='u-a' WHERE id='w'", []).unwrap();
         g
+    }
+
+    struct WalWriter {
+        key: [u8; 32],
+        prev: [u8; 32],
+        seq: u64,
+    }
+
+    impl WalWriter {
+        fn new(g: &crate::lease::Grant) -> Self {
+            WalWriter { key: g.hmac_key, prev: [0; 32], seq: 0 }
+        }
+        fn frame(&mut self, op: &str, dim: &str, cx: i32, cz: i32, hash: Hash) -> Frame {
+            let e = Entry { seq: self.seq, dim, kind: op, cx, cz, hash: &hash };
+            let mac = next_mac(&self.key, &self.prev, &e);
+            self.prev = mac;
+            self.seq += 1;
+            Frame { seq: e.seq, op: op.into(), dim: dim.into(), cx, cz, hash, mac: mac.to_vec() }
+        }
+    }
+
+    fn missing(g: &Gateway, rev: &str) -> usize {
+        let mut reach = HashSet::new();
+        manifest::reachable(g.cas(), g.revision_root(rev).unwrap(), &mut reach).unwrap();
+        reach.iter().filter(|h| !g.cas().has(h)).count()
     }
 
     const HW: Hw = Hw { tier: 2, score: 5.0, wants_host: true, takeover: false };
@@ -373,14 +399,14 @@ mod tests {
 
         assert!(matches!(g.revision_root(&revs[0]), Err(Error::Pruned)));
         for r in [&revs[1], &revs[3], &revs[4]] {
-            assert!(g.scan_tree(g.revision_root(r).unwrap()).unwrap().1.is_empty(), "{r} lost a blob");
+            assert_eq!(missing(&g, r), 0, "{r} lost a blob");
         }
-        let scrub = g.scrub(&g.cas_root()).unwrap();
+        let scrub = g.scrub(g.cas().root()).unwrap();
         assert!(scrub.ok(), "pruned revisions keep the chain intact: {scrub:?}");
 
         // the pending WAL still commits after the sweep
         let r = g.commit(&gr.lease_id, gr.epoch, &base, CommitKind::Shutdown, true, 99).unwrap();
-        assert!(g.scan_tree(g.revision_root(&r.id).unwrap()).unwrap().1.is_empty());
+        assert_eq!(missing(&g, &r.id), 0);
     }
 
     #[test]

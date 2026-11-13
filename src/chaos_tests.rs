@@ -71,6 +71,15 @@ fn run(seed: u64, steps: usize, n: usize) {
         .map(|d| Dev { name: d, grant: None, base: String::new(), crashed: false, tier: 1 + rng.below(3) as u8, score: 1.0 + rng.below(90) as f64 / 10.0 })
         .collect();
     let (mut now, mut last_epoch, mut last_seq) = (0u64, 0i64, 0i64);
+    // odd seeds flip a storage quota the world is already over; only joins and autosaves may be refused
+    let over = seed % 2 == 1;
+    if over {
+        g.db().execute("INSERT INTO blob_world(hash,world_id,size) VALUES(zeroblob(32),?,1000)", params![W]).unwrap();
+    }
+    let quota = |g: &mut Gateway, on: bool| {
+        let l = crate::quota::Limits { storage_bytes: on.then_some(1), ..Default::default() };
+        g.set_limits(crate::quota::Scope::World, W, &l).unwrap();
+    };
 
     for step in 0..steps {
         now += 500 + rng.below(20_000);
@@ -94,6 +103,7 @@ fn run(seed: u64, steps: usize, n: usize) {
                             d.grant = Some(gr);
                         }
                         Ok(_) => {}
+                        Err(Error::Quota(_)) => assert!(over),
                         Err(e) => assert!(benign(&e), "join failed {e:?}, seed {seed} step {step}"),
                     }
                 }
@@ -125,6 +135,7 @@ fn run(seed: u64, steps: usize, n: usize) {
                             assert_eq!(g.lease_of_world(W).as_deref(), Some(gr.lease_id.as_str()), "fenced host committed, seed {seed} step {step}");
                             d.base = rev.id;
                         }
+                        Err(Error::Quota(_)) => assert!(over),
                         Err(e) => assert!(benign(&e), "commit {e:?}, seed {seed} step {step}"),
                     }
                 }
@@ -141,12 +152,14 @@ fn run(seed: u64, steps: usize, n: usize) {
                     }
                 }
             }
+            9 if over => quota(&mut g, rng.below(2) == 0),
             _ => {}
         }
         invariants(&g, seed, step, &mut last_epoch, &mut last_seq);
     }
 
     // everything healthy again: the world must be hostable within bounded time
+    quota(&mut g, false);
     for d in devs.iter_mut() {
         d.crashed = false;
     }
