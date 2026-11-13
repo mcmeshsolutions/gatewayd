@@ -476,3 +476,38 @@ fn anchor_gets_no_special_rank_in_a_fresh_election() {
         .unwrap();
     assert_eq!(elected, "dev-d");
 }
+
+#[test]
+fn signed_commits_verify_against_the_registered_key_and_keep_the_signature() {
+    use ed25519_dalek::{Signer, SigningKey};
+    let mut g = setup();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    let sk = SigningKey::from_bytes(&[9u8; 32]);
+    let pk = sk.verifying_key().to_bytes();
+    let sign = |base: &str, last: bool, barrier: i64| {
+        sk.sign(&crate::devsig::commit_message(W, &a.lease_id, a.epoch, base, if last { "SHUTDOWN" } else { "AUTOSAVE" }, last, barrier)).to_bytes()
+    };
+    let no_key = sign(&a.base_rev, false, -1);
+    assert!(matches!(g.commit_signed(&a.lease_id, a.epoch, &a.base_rev, CommitKind::Autosave, false, Some(&no_key), 1_000), Err(Error::NoDeviceKey)));
+
+    g.set_device_key("dev-a", &pk).unwrap();
+    g.set_device_key("dev-a", &pk).unwrap();
+    assert!(matches!(g.set_device_key("dev-a", &[1u8; 32]), Err(Error::DeviceKeySet)), "first key wins");
+    assert!(matches!(g.set_device_key("dev-b", &pk), Err(Error::DeviceKeySet)), "a key belongs to one device");
+
+    let wrong_barrier = sign(&a.base_rev, false, 99);
+    assert!(matches!(g.commit_signed(&a.lease_id, a.epoch, &a.base_rev, CommitKind::Autosave, false, Some(&wrong_barrier), 1_000), Err(Error::BadSignature)));
+    let wrong_kind = sign(&a.base_rev, true, -1);
+    assert!(matches!(g.commit_signed(&a.lease_id, a.epoch, &a.base_rev, CommitKind::Autosave, false, Some(&wrong_kind), 1_000), Err(Error::BadSignature)));
+    assert_eq!(g.head(W).unwrap(), a.base_rev, "a refused signature commits nothing");
+
+    let good = sign(&a.base_rev, false, -1);
+    let r = g.commit_signed(&a.lease_id, a.epoch, &a.base_rev, CommitKind::Autosave, false, Some(&good), 1_000).unwrap();
+    let (sig, signer): (Vec<u8>, Vec<u8>) =
+        g.db.query_row("SELECT sig, signer FROM revisions WHERE id=?", rusqlite::params![r.id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    assert_eq!((sig, signer), (good.to_vec(), pk.to_vec()));
+
+    let unsigned = g.commit(&a.lease_id, a.epoch, &r.id, CommitKind::Autosave, false, 2_000).unwrap();
+    let none: Option<Vec<u8>> = g.db.query_row("SELECT sig FROM revisions WHERE id=?", rusqlite::params![unsigned.id], |row| row.get(0)).unwrap();
+    assert_eq!(none, None, "unsigned commits stay unsigned");
+}

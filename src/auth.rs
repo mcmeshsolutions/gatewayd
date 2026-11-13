@@ -35,11 +35,13 @@ pub struct AuthCfg {
     pub admins: Vec<String>,
     /// How long a suspended or banned host may still wind down its lease (heartbeat, wal, blobs).
     pub ban_grace_s: u64,
+    /// MCMESH_REQUIRE_SIGNED=1: commits without a valid host signature are refused with 403 SIGNATURE_REQUIRED.
+    pub require_signed: bool,
 }
 
 impl Default for AuthCfg {
     fn default() -> Self {
-        AuthCfg { session_url: "https://sessionserver.mojang.com".into(), mojang: true, key: true, require_ticket: true, allow_create: false, advertise: String::new(), metrics_token: None, webhooks: Vec::new(), webhook_secret: None, admins: Vec::new(), ban_grace_s: 120 }
+        AuthCfg { session_url: "https://sessionserver.mojang.com".into(), mojang: true, key: true, require_ticket: true, allow_create: false, advertise: String::new(), metrics_token: None, webhooks: Vec::new(), webhook_secret: None, admins: Vec::new(), ban_grace_s: 120, require_signed: false }
     }
 }
 

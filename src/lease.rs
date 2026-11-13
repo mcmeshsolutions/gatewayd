@@ -36,6 +36,12 @@ pub enum Error {
     Quota(crate::quota::QuotaHit),
     /// the retention sweep dropped this revision's content
     Pruned,
+    /// the commit signature does not match the registered device key or the gateway's view of the WAL
+    BadSignature,
+    /// a signature was sent but the device has no registered key
+    NoDeviceKey,
+    /// the device already has a different key, or the key belongs to another device
+    DeviceKeySet,
 }
 
 impl From<rusqlite::Error> for Error {
@@ -186,6 +192,8 @@ impl Gateway {
         let _ = db.execute("ALTER TABLE revisions ADD COLUMN chain_hash BLOB", []);
         let _ = db.execute("ALTER TABLE worlds ADD COLUMN pack_id TEXT NOT NULL DEFAULT 'default'", []);
         crate::quota::migrate(&db, &cas)?;
+        let _ = db.execute("ALTER TABLE revisions ADD COLUMN sig BLOB", []);
+        let _ = db.execute("ALTER TABLE revisions ADD COLUMN signer BLOB", []);
         let _ = db.execute("ALTER TABLE leases ADD COLUMN players INTEGER", []);
         let _ = db.execute("ALTER TABLE devices ADD COLUMN anchor INTEGER NOT NULL DEFAULT 0", []);
         db.execute("UPDATE sessions SET last_used=? WHERE last_used IS NULL", params![unix_s()])?;
@@ -616,16 +624,38 @@ impl Gateway {
         last: bool,
         now: u64,
     ) -> Result<Revision> {
+        self.commit_signed(lease, epoch, base_rev, kind, last, None, now)
+    }
+
+    /// `sig`, when present, must verify against the lease device's registered key before anything is built; see PROTOCOL.md.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_signed(
+        &mut self,
+        lease: &str,
+        epoch: i64,
+        base_rev: &str,
+        kind: CommitKind,
+        last: bool,
+        sig: Option<&[u8; 64]>,
+        now: u64,
+    ) -> Result<Revision> {
         let (world, device) = self.require_live(lease, epoch)?;
         if self.head(&world)? != base_rev {
             return Err(Error::HeadMoved);
         }
+        let signer = match sig {
+            Some(s) => Some((self.verify_commit(&world, lease, &device, epoch, base_rev, kind.as_str(), last, s)?, *s)),
+            None => None,
+        };
         // a final commit is never refused for quota: the host is leaving and this is the only copy of its last minutes
         if !last {
             self.check_storage(&world)?;
         }
         let (changes, barrier) = self.wal_pending(lease)?;
         let rev = self.new_revision(&world, lease, kind.as_str(), &changes)?;
+        if let Some((key, s)) = &signer {
+            self.store_signature(&rev.id, key, s)?;
+        }
         self.wal_trim(lease, barrier, last)?;
         if let Some(t) = self.timers.get_mut(lease) {
             t.last_hb = now;

@@ -7,6 +7,7 @@ pub mod manifest;
 pub mod mcproto;
 pub mod ops;
 pub mod chain;
+pub mod devsig;
 pub mod lease;
 #[cfg(test)]
 mod chaos_tests;

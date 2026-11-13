@@ -176,6 +176,9 @@ impl IntoResponse for ApiErr {
                 return (status, Json(json!({ "error": h.code, "limit": h.limit, "used": h.used }))).into_response();
             }
             ApiErr::Domain(Error::Pruned) => (StatusCode::GONE, "REVISION_PRUNED"),
+            ApiErr::Domain(Error::BadSignature) => (StatusCode::FORBIDDEN, "BAD_SIGNATURE"),
+            ApiErr::Domain(Error::NoDeviceKey) => (StatusCode::FORBIDDEN, "NO_DEVICE_KEY"),
+            ApiErr::Domain(Error::DeviceKeySet) => (StatusCode::CONFLICT, "DEVICE_KEY_SET"),
             ApiErr::Domain(e) => {
                 eprintln!("internal error: {e:?}");
                 (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL")
@@ -431,10 +434,37 @@ struct CommitReq {
     kind: String,
     #[serde(default, rename = "final")]
     last: bool,
+    #[serde(default)]
+    sig: Option<String>,
+}
+
+fn b64_fixed<const N: usize>(s: &str) -> Option<[u8; N]> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(s).ok()?.try_into().ok()
 }
 
 fn parse_hash(s: &str) -> Option<[u8; 32]> {
     parse_hex(s.strip_prefix("sha256:")?)
+}
+
+#[derive(Deserialize)]
+struct DeviceKeyReq {
+    pubkey: String,
+    sig: String,
+}
+
+/// Registers the key the host signs commits with. The proof of possession is a signature over the device id and the key.
+async fn device_key(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): Json<DeviceKeyReq>) -> R {
+    let pk: [u8; 32] = b64_fixed(&b.pubkey).ok_or(ApiErr::BadRequest("BAD_KEY"))?;
+    let sig: [u8; 64] = b64_fixed(&b.sig).ok_or(ApiErr::BadRequest("BAD_SIG"))?;
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    if !crate::devsig::verify(&pk, &crate::devsig::device_key_message(&dev, &pk), &sig) {
+        return Err(ApiErr::Domain(Error::BadSignature));
+    }
+    gw.set_device_key(&dev, &pk)?;
+    gw.audit(&dev, "device.key", "", &dev, json!({}));
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn commit(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Path<String>, Json(b): Json<CommitReq>) -> R {
@@ -450,7 +480,14 @@ async fn commit(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Path<
     own_lease(&gw, &dev, &lease)?;
     s.check_commit(&gw, &dev, b.last)?;
     let world = gw.lease_world(&lease).unwrap_or_default();
-    let r = match gw.commit(&lease, b.epoch, &b.base_rev, kind, b.last, now) {
+    let sig: Option<[u8; 64]> = match &b.sig {
+        Some(v) => Some(b64_fixed(v).ok_or(ApiErr::BadRequest("BAD_SIG"))?),
+        None => None,
+    };
+    if sig.is_none() && s.auth.require_signed {
+        return Err(ApiErr::Forbidden("SIGNATURE_REQUIRED"));
+    }
+    let r = match gw.commit_signed(&lease, b.epoch, &b.base_rev, kind, b.last, sig.as_ref(), now) {
         Ok(r) => r,
         Err(e) => {
             if matches!(e, Error::Rejected(_)) {
@@ -689,6 +726,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/worlds/:id/export.zip", get(world_export))
         .route("/v1/worlds/:id/ticket", post(crate::auth::ticket))
         .route("/v1/devices/me", get(device_me))
+        .route("/v1/devices/key", post(device_key))
         .route("/v1/worlds", post(create_world).get(list_worlds))
         .route("/v1/worlds/:id/invite", post(create_invite))
         .route("/v1/invites/redeem", post(redeem_invite))
