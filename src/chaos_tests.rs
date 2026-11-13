@@ -26,6 +26,8 @@ struct Dev {
     crashed: bool,
     tier: u8,
     score: f64,
+    anchor: bool,
+    players: u32,
 }
 
 fn gateway(n: usize) -> Gateway {
@@ -42,6 +44,18 @@ fn gateway(n: usize) -> Gateway {
 
 fn benign(e: &Error) -> bool {
     matches!(e, Error::StaleEpoch | Error::HeadMoved | Error::NotMember)
+}
+
+fn live_host(g: &Gateway) -> Option<(String, String, Option<u32>)> {
+    let lid = g.lease_of_world(W)?;
+    let status = live_status(g, &lid)?;
+    Some((lid, status, g.lease_players(W).unwrap()))
+}
+
+fn live_status(g: &Gateway, lease: &str) -> Option<String> {
+    g.db()
+        .query_row("SELECT status FROM leases WHERE id=? AND status IN('ACTIVE','HANDOFF')", params![lease], |r| r.get(0))
+        .ok()
 }
 
 fn invariants(g: &Gateway, seed: u64, step: usize, last_epoch: &mut i64, last_seq: &mut i64) {
@@ -62,18 +76,23 @@ fn invariants(g: &Gateway, seed: u64, step: usize, last_epoch: &mut i64, last_se
     *last_seq = head;
 }
 
-fn run(seed: u64, steps: usize, n: usize) {
+fn run(seed: u64, steps: usize, n: usize, anchors: bool) {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let mut prng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1);
     let mut g = gateway(n);
     let mut devs: Vec<Dev> = DEVS
         .iter()
         .take(n)
-        .map(|d| Dev { name: d, grant: None, base: String::new(), crashed: false, tier: 1 + rng.below(3) as u8, score: 1.0 + rng.below(90) as f64 / 10.0 })
+        .map(|d| Dev { name: d, grant: None, base: String::new(), crashed: false, tier: 1 + rng.below(3) as u8, score: 1.0 + rng.below(90) as f64 / 10.0, anchor: false, players: 0 })
         .collect();
+    for d in devs.iter_mut() {
+        d.anchor = anchors && prng.below(2) == 0;
+        g.set_anchor(d.name, d.anchor).unwrap();
+    }
     let (mut now, mut last_epoch, mut last_seq) = (0u64, 0i64, 0i64);
 
     for step in 0..steps {
-        now += 500 + rng.below(20_000);
+        now += 500 + rng.below(if anchors { 6_000 } else { 20_000 });
         if rng.below(40) == 0 {
             now += 60_000 + rng.below(120_000);
         }
@@ -88,7 +107,16 @@ fn run(seed: u64, steps: usize, n: usize) {
                 }
                 if !d.crashed {
                     let hw = Hw { tier: d.tier, score: d.score, wants_host: true, takeover: rng.below(2) == 0 };
-                    match g.join(W, d.name, hw, now) {
+                    let before = live_host(&g);
+                    let joined = g.join(W, d.name, hw, now);
+                    if d.anchor {
+                        if let Some((lid, status, players)) = before {
+                            if players.map_or(true, |p| p < 2) {
+                                assert_eq!(live_status(&g, &lid).as_deref(), Some(status.as_str()), "anchor displaced a host with {players:?} players, seed {seed} step {step}");
+                            }
+                        }
+                    }
+                    match joined {
                         Ok(Join::Host(gr)) => {
                             d.base = gr.base_rev.clone();
                             d.grant = Some(gr);
@@ -100,7 +128,9 @@ fn run(seed: u64, steps: usize, n: usize) {
             }
             3..=5 => {
                 if let Some(gr) = d.grant.clone() {
-                    match g.heartbeat(&gr.lease_id, gr.epoch, now) {
+                    d.players = prng.below(5) as u32;
+                    let reported = (prng.below(3) != 0).then_some(d.players);
+                    match g.heartbeat_players(&gr.lease_id, gr.epoch, reported, now) {
                         Ok(dirs) => {
                             assert_eq!(g.lease_of_world(W).as_deref(), Some(gr.lease_id.as_str()), "fenced host heartbeat accepted, seed {seed} step {step}");
                             if !dirs.is_empty() && !d.crashed {
@@ -175,6 +205,13 @@ fn run(seed: u64, steps: usize, n: usize) {
 #[test]
 fn chaos_two_to_four_devices() {
     for seed in 1..=300u64 {
-        run(seed, 400, 2 + (seed % 3) as usize);
+        run(seed, 400, 2 + (seed % 3) as usize, false);
+    }
+}
+
+#[test]
+fn chaos_with_anchors_never_displaces_a_small_host() {
+    for seed in 1..=300u64 {
+        run(seed, 400, 2 + (seed % 3) as usize, true);
     }
 }

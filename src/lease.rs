@@ -183,6 +183,7 @@ impl Gateway {
         let _ = db.execute("ALTER TABLE revisions ADD COLUMN chain_hash BLOB", []);
         let _ = db.execute("ALTER TABLE worlds ADD COLUMN pack_id TEXT NOT NULL DEFAULT 'default'", []);
         let _ = db.execute("ALTER TABLE leases ADD COLUMN players INTEGER", []);
+        let _ = db.execute("ALTER TABLE devices ADD COLUMN anchor INTEGER NOT NULL DEFAULT 0", []);
         db.execute("UPDATE sessions SET last_used=? WHERE last_used IS NULL", params![unix_s()])?;
         db.execute("DELETE FROM sessions WHERE last_used>0 AND last_used<?", params![unix_s() - session_ttl_s()])?;
         let mut g = Gateway {
@@ -283,10 +284,28 @@ impl Gateway {
         let (lid, dev, _, cur_tier) = self.active_lease(world).ok()??;
         let t = self.timers.get(&lid)?;
         let c = Cand { tier, score, seen: now };
-        if dev == device || !Self::better(&c, cur_tier, t.score) {
+        if dev == device || !Self::better(&c, cur_tier, t.score) || self.anchor_blocked(device, &lid) {
             return None;
         }
         Some(min_hold_ms().saturating_sub(now.saturating_sub(t.granted)).div_ceil(1000))
+    }
+
+    /// Operator-set flag; an anchor never displaces a live host that has fewer than 2 real players (or an unknown count).
+    pub fn set_anchor(&mut self, device: &str, anchor: bool) -> Result<()> {
+        self.db.execute("UPDATE devices SET anchor=? WHERE id=?", params![anchor, device])?;
+        Ok(())
+    }
+
+    fn anchor_blocked(&self, device: &str, lease: &str) -> bool {
+        let anchor: bool = self
+            .db
+            .query_row("SELECT anchor FROM devices WHERE id=?", params![device], |r| r.get(0))
+            .unwrap_or(false);
+        let players: Option<u32> = self
+            .db
+            .query_row("SELECT players FROM leases WHERE id=?", params![lease], |r| r.get(0))
+            .unwrap_or(None);
+        anchor && players.is_none_or(|p| p < 2)
     }
 
     pub fn create_invite(&mut self, device: &str, world: &str, role: Role) -> Result<String> {
@@ -482,7 +501,7 @@ impl Gateway {
                 let held = now.saturating_sub(t.granted);
                 let cand = &self.cands.get(&key);
                 if let Some(c) = cand {
-                    if hw.takeover && held >= min_hold_ms() && Self::better(c, tier, t.score) {
+                    if hw.takeover && held >= min_hold_ms() && Self::better(c, tier, t.score) && !self.anchor_blocked(device, &lid) {
                         self.set_state(world, "MIGRATING", Some("PREPARING"))?;
                         self.db.execute("UPDATE leases SET status='HANDOFF' WHERE id=?", params![lid])?;
                         self.directives.entry(lid).or_default().push(Directive::MigratePrepare {
