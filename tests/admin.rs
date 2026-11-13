@@ -458,3 +458,23 @@ async fn login_is_audited_and_refused_for_restricted_accounts() {
     call(&app, "PUT", "tok-root", "/v1/admin/users/zed/status", json!({"status": "ACTIVE"})).await;
     assert_eq!(key_login(&app, 7, "zed").await.0, 200);
 }
+
+// device id
+
+#[tokio::test]
+async fn devices_me_returns_the_callers_device() {
+    let app = app();
+    for (tok, dev) in [("tok-alice", "dev-alice"), ("tok-bob", "dev-bob")] {
+        let (c, v) = get(&app, tok, "/v1/devices/me").await;
+        assert_eq!((c, v["device"].as_str()), (200, Some(dev)));
+    }
+    assert_eq!(req(&app, "GET", None, "/v1/devices/me", None).await.0, 401);
+    assert_eq!(get(&app, "bad", "/v1/devices/me").await.0, 401);
+    call(&app, "PUT", "tok-root", "/v1/admin/users/bob/status", json!({"status": "BANNED"})).await;
+    assert_eq!(err(&get(&app, "tok-bob", "/v1/devices/me").await), (403, "ACCOUNT_BANNED"));
+    // the id a key login gets is the one the endpoint reports
+    let (_, t) = key_login(&app, 3, "newbie").await;
+    let tok = t["token"].as_str().unwrap();
+    let id = get(&app, tok, "/v1/devices/me").await.1["device"].as_str().unwrap().to_string();
+    assert!(id.starts_with("d_") && id.len() == 18, "{id}");
+}

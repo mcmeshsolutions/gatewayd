@@ -239,6 +239,12 @@ async fn create_world(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): Jso
     Ok(Json(json!({ "id": id, "base_rev": format!("{id}:R_0000") })))
 }
 
+async fn device_me(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    Ok(Json(json!({ "device": dev })))
+}
+
 async fn list_worlds(
     State(s): State<Arc<AppState>>,
     h: HeaderMap,
@@ -574,6 +580,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/auth/key", post(crate::auth::key))
         .route("/v1/revisions/:rev/files", get(revision_files))
         .route("/v1/worlds/:id/ticket", post(crate::auth::ticket))
+        .route("/v1/devices/me", get(device_me))
         .route("/v1/worlds", post(create_world).get(list_worlds))
         .route("/v1/worlds/:id/invite", post(create_invite))
         .route("/v1/invites/redeem", post(redeem_invite))
