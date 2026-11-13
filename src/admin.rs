@@ -620,7 +620,7 @@ async fn admin_usage(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
     let mut users = Vec::with_capacity(owners.len());
     for (uuid, name) in owners {
         let (bytes, worlds_owned) = gw.user_usage(&uuid)?;
-        users.push(json!({ "uuid": uuid, "name": name, "storage_bytes": bytes, "worlds": worlds_owned, "limits": limit_json(&gw.limits(Scope::User, &uuid)?) }));
+        users.push(json!({ "uuid": uuid, "name": name, "storage_bytes": bytes, "worlds": worlds_owned, "relay_bytes_month": gw.user_relay_month(&uuid, &month), "limits": limit_json(&gw.limits(Scope::User, &uuid)?) }));
     }
     users.sort_by_key(|u| std::cmp::Reverse(u["storage_bytes"].as_u64().unwrap_or(0)));
     Ok(Json(json!({

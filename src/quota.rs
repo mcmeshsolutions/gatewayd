@@ -153,6 +153,19 @@ impl Gateway {
         v.unwrap_or(0).max(0) as u64
     }
 
+    /// Relayed bytes this calendar month over every world the player owns.
+    pub(crate) fn user_relay_month(&self, uuid: &str, month_meter_name: &str) -> u64 {
+        let v: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT COALESCE(SUM(m.value),0) FROM meters m JOIN worlds w ON w.id=m.world_id WHERE w.owner_uuid=? AND m.name=?",
+                params![uuid, month_meter_name],
+                |r| r.get(0),
+            )
+            .ok();
+        v.unwrap_or(0).max(0) as u64
+    }
+
     /// Whether one more guest may connect: `guests_now` is the number already connected, `now_s` unix seconds.
     /// Over a cap the guest is turned away; nothing already connected is touched and no data is deleted.
     pub(crate) fn guest_admission(&self, world: &str, guests_now: u64, now_s: i64) -> Result<()> {
@@ -166,6 +179,14 @@ impl Gateway {
             let used = self.meter_value(world, &month_meter(now_s));
             if used >= limit {
                 return Err(Error::Quota(QuotaHit { code: "QUOTA_RELAY_MONTH", limit, used }));
+            }
+        }
+        if let Some(owner) = self.owner_of(world)? {
+            if let Some(limit) = self.limits(Scope::User, &owner)?.relay_bytes_month {
+                let used = self.user_relay_month(&owner, &month_meter(now_s));
+                if used >= limit {
+                    return Err(Error::Quota(QuotaHit { code: "QUOTA_USER_RELAY_MONTH", limit, used }));
+                }
             }
         }
         Ok(())
@@ -470,6 +491,28 @@ mod tests {
         assert_eq!(month_meter(1_700_000_000), "relay_month_202311");
         assert_eq!(month_meter(1_735_689_599), "relay_month_202412");
         assert_eq!(month_meter(1_735_689_600), "relay_month_202501");
+    }
+
+    #[test]
+    fn an_owners_monthly_relay_budget_covers_all_their_worlds() {
+        let mut g = gw();
+        g.ops_init().unwrap();
+        g.create_world("w2", "w2", "1.21.1", "neoforge").unwrap();
+        g.db().execute("UPDATE worlds SET owner_uuid='u-a' WHERE id='w2'", []).unwrap();
+        g.set_limits(Scope::User, "u-a", &Limits { relay_bytes_month: Some(1_000), ..Default::default() }).unwrap();
+        let now = 1_700_000_000;
+        g.meter("w", &month_meter(now), 600);
+        g.guest_admission("w2", 0, now).unwrap();
+        g.meter("w2", &month_meter(now), 400);
+        for world in ["w", "w2"] {
+            match g.guest_admission(world, 0, now) {
+                Err(Error::Quota(h)) => assert_eq!((h.code, h.limit, h.used), ("QUOTA_USER_RELAY_MONTH", 1_000, 1_000)),
+                other => panic!("expected the owner budget on {world}, got {other:?}"),
+            }
+        }
+        g.guest_admission("w", 0, now + 40 * 86_400).unwrap();
+        g.set_limits(Scope::User, "u-a", &Limits::default()).unwrap();
+        g.guest_admission("w", 0, now).unwrap();
     }
 
     #[test]

@@ -411,7 +411,11 @@ async fn guest_session(relay: Arc<Relay>, mut sock: TcpStream, peer: SocketAddr)
             eprintln!("relay: guest turned away from {world}: {} ({} of {})", hit.code, hit.used, hit.limit);
             if first.is_some() {
                 use tokio::io::AsyncWriteExt;
-                let msg = if hit.code == "QUOTA_GUESTS" { "This world is full right now. Try again later." } else { "This world has used up its relay bandwidth for this month." };
+                let msg = match hit.code {
+                    "QUOTA_GUESTS" => "This world is full right now. Try again later.",
+                    "QUOTA_USER_RELAY_MONTH" => "The owner of this world has used up their relay bandwidth for this month.",
+                    _ => "This world has used up its relay bandwidth for this month.",
+                };
                 let _ = sock.write_all(&crate::mcproto::login_disconnect(msg)).await;
             }
             return;
