@@ -794,6 +794,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/worlds/:id/handover-vote/propose", post(propose_handover))
         .route("/v1/admin/usage", get(admin_usage))
         .route("/v1/worlds/:id/transfer", post(post_transfer))
+        .route("/v1/worlds/:id/fork", post(post_fork))
         .route("/v1/admin/blobs/:hash", get(cas_blob))
         .route("/v1/admin/worlds/:id/revisions", get(cas_revisions))
         .route("/v1/admin/worlds/:id/revisions/:rev/manifest", get(cas_manifest))
@@ -900,6 +901,64 @@ async fn post_transfer(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world)
             Ok(Json(json!({ "ok": true, "owner": b.to })))
         }
         Err(code @ "NO_SUCH_PLAYER") => Err(ApiErr::NotFound(code)),
+        Err(code) => Err(ApiErr::Conflict(code)),
+    }
+}
+
+impl Gateway {
+    /// New world, owned by the device's player, whose first revision is a copy of `rev` from `src`. Blobs are shared, not copied;
+    /// they are tagged for the new world so its owner's usage and blob visibility are right. The source is never touched.
+    pub fn fork_world(&mut self, device: &str, src: &str, rev: &str, name: &str) -> Result<std::result::Result<String, &'static str>, Error> {
+        let in_src: Option<String> = self.db.query_row("SELECT world_id FROM revisions WHERE id=?", params![rev], |r| r.get(0)).optional()?;
+        if in_src.as_deref() != Some(src) {
+            return Ok(Err("NO_SUCH_REVISION"));
+        }
+        let root = match self.revision_root(rev) {
+            Ok(r) => r,
+            Err(Error::Pruned) => return Ok(Err("REVISION_PRUNED")),
+            Err(e) => return Err(e),
+        };
+        let mut reach = std::collections::HashSet::new();
+        crate::manifest::reachable(&self.cas, root, &mut reach)?;
+        if reach.iter().any(|h| !self.cas.has(h)) {
+            return Ok(Err("REVISION_INCOMPLETE"));
+        }
+        let (mc, loader, pack): (String, String, String) =
+            self.db.query_row("SELECT mc_version, loader, pack_id FROM worlds WHERE id=?", params![src], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let id = self.create_world_for(device, name, &mc, &loader)?;
+        self.db.execute("UPDATE worlds SET pack_id=? WHERE id=?", params![pack, id])?;
+        let first = format!("{id}:R_0000");
+        self.db.execute("UPDATE revisions SET root_hash=? WHERE id=?", params![root.as_slice(), first])?;
+        crate::lease::seal(&self.db, &first)?;
+        for h in &reach {
+            self.tag_blob(&id, h)?;
+        }
+        Ok(Ok(id))
+    }
+}
+
+#[derive(Deserialize)]
+struct ForkReq {
+    rev: String,
+    name: String,
+}
+
+async fn post_fork(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<ForkReq>) -> R {
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    if gw.role(&world, &dev).is_err() {
+        return Err(ApiErr::NotFound("NO_SUCH_WORLD"));
+    }
+    if b.name.is_empty() || b.name.len() > 64 {
+        return Err(ApiErr::BadRequest("BAD_NAME"));
+    }
+    match gw.fork_world(&dev, &world, &b.rev, &b.name)? {
+        Ok(id) => {
+            gw.audit(&dev, "world.fork", &world, &id, json!({ "rev": b.rev }));
+            Ok(Json(json!({ "id": id })))
+        }
+        Err("REVISION_PRUNED") => Err(ApiErr::Gone("REVISION_PRUNED")),
+        Err(code @ "NO_SUCH_REVISION") => Err(ApiErr::NotFound(code)),
         Err(code) => Err(ApiErr::Conflict(code)),
     }
 }

@@ -171,3 +171,31 @@ async fn an_owner_hands_a_world_to_a_member_and_loses_owner_only_rights() {
     let (c, _) = call(&app, "POST", "tok-b", "/v1/worlds/w1/transfer", json!({ "to": "alice" })).await;
     assert_eq!(c, 200, "bob is the owner now and can hand it back");
 }
+
+#[tokio::test]
+async fn a_fork_starts_from_an_old_revision_and_shares_its_blobs() {
+    let (app, rev) = app_with_chunks();
+    let (c, v) = call(&app, "POST", "tok-a", "/v1/worlds/w1/fork", json!({ "rev": "w1:R_0099", "name": "copy" })).await;
+    assert_eq!((c, v["error"].as_str()), (404, Some("NO_SUCH_REVISION")));
+    let (c, _) = call(&app, "POST", "tok-a", "/v1/worlds/nope/fork", json!({ "rev": rev, "name": "copy" })).await;
+    assert_eq!(c, 404);
+    let (c, v) = call(&app, "POST", "tok-a", "/v1/worlds/w1/fork", json!({ "rev": rev, "name": "copy" })).await;
+    assert_eq!(c, 200, "{v}");
+    let fork = v["id"].as_str().unwrap().to_string();
+
+    let (_, key) = make_key(&app, "renderer", json!(["read:cas"])).await;
+    let (c, v) = call(&app, "GET", &key, &format!("/v1/admin/worlds/{fork}/revisions"), Value::Null).await;
+    assert_eq!(c, 200, "{v}");
+    let head = v["head"].as_str().unwrap().to_string();
+    assert_eq!(head, format!("{fork}:R_0000"));
+    let (_, forked) = call(&app, "GET", &key, &format!("/v1/admin/worlds/{fork}/revisions/{head}/manifest"), Value::Null).await;
+    let (_, source) = call(&app, "GET", &key, &format!("/v1/admin/worlds/w1/revisions/{rev}/manifest"), Value::Null).await;
+    assert_eq!(forked["leaves"], source["leaves"], "same content");
+    assert_eq!(forked["total"], 2);
+
+    let (_, usage) = call(&app, "GET", "tok-a", "/v1/admin/usage", Value::Null).await;
+    let bytes = |id: &str| usage["worlds"].as_array().unwrap().iter().find(|w| w["id"] == id).map(|w| w["storage_bytes"].as_u64().unwrap());
+    assert!(bytes(&fork).unwrap() > 0, "the fork's owner is charged for the shared blobs");
+    let (_, after) = call(&app, "GET", &key, "/v1/admin/worlds/w1/revisions", Value::Null).await;
+    assert_eq!(after["head"], json!(rev), "the source world is untouched");
+}
