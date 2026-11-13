@@ -1,0 +1,527 @@
+//! Audit log, account suspension, maintenance mode, gateway roles and per-world host policy.
+//! Tables are created at runtime by `admin_init` (called from `ops_init`), schema.sql is core's.
+use crate::lease::{wall_s, Error, Gateway};
+use crate::server::{auth, ApiErr, AppState};
+use axum::{
+    extract::{Path, Query, Request, State},
+    http::{HeaderMap, Method},
+    middleware::Next,
+    response::{IntoResponse, Response},
+    routing::{get, put},
+    Json, Router,
+};
+use rusqlite::{params, OptionalExtension};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+type R = Result<Json<Value>, ApiErr>;
+
+pub const DEFAULT_RETRY_AFTER_S: u64 = 300;
+pub const MAX_RETRY_AFTER_S: u64 = 86_400;
+const PAGE_DEFAULT: i64 = 50;
+const PAGE_MAX: i64 = 200;
+
+impl Gateway {
+    pub fn admin_init(&self) -> Result<(), Error> {
+        self.db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS audit_log(
+               id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+               actor TEXT NOT NULL, actor_name TEXT NOT NULL,
+               action TEXT NOT NULL, world_id TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '',
+               detail TEXT NOT NULL DEFAULT '{}');
+             CREATE INDEX IF NOT EXISTS audit_world ON audit_log(world_id, id);
+             CREATE TRIGGER IF NOT EXISTS audit_log_no_update BEFORE UPDATE ON audit_log
+               BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;
+             CREATE TRIGGER IF NOT EXISTS audit_log_no_delete BEFORE DELETE ON audit_log
+               BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END;
+             CREATE TABLE IF NOT EXISTS user_status(
+               player_uuid TEXT PRIMARY KEY, status TEXT NOT NULL CHECK(status IN('SUSPENDED','BANNED')),
+               reason TEXT NOT NULL DEFAULT '', set_by TEXT NOT NULL, set_at INTEGER NOT NULL) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS gateway_admins(
+               player_uuid TEXT PRIMARY KEY, granted_by TEXT NOT NULL, granted_at INTEGER NOT NULL) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS admin_settings(
+               key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS world_policy(
+               world_id TEXT PRIMARY KEY, owner_uuid TEXT,
+               host_policy TEXT NOT NULL DEFAULT 'MEMBERS' CHECK(host_policy IN('OWNER','ALLOWLIST','MEMBERS'))) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS world_host_allow(
+               world_id TEXT NOT NULL, player_uuid TEXT NOT NULL, PRIMARY KEY(world_id, player_uuid)) WITHOUT ROWID;",
+        )?;
+        Ok(())
+    }
+
+    /// Best effort like `meter`: the audit trail must not turn a successful action into an error.
+    pub fn audit_as(&self, uuid: &str, name: &str, action: &str, world: &str, target: &str, detail: Value) {
+        let r = self.db.execute(
+            "INSERT INTO audit_log(ts,actor,actor_name,action,world_id,target,detail) VALUES(?,?,?,?,?,?,?)",
+            params![wall_s(), uuid, name, action, world, target, detail.to_string()],
+        );
+        if let Err(e) = r {
+            eprintln!("audit {action} failed: {e}");
+        }
+    }
+
+    pub fn audit(&self, device: &str, action: &str, world: &str, target: &str, detail: Value) {
+        let (uuid, name) = self.device_player(device).ok().flatten().unwrap_or_default();
+        self.audit_as(&uuid, &name, action, world, target, detail);
+    }
+
+    /// Newest first. `before` is the id of the last row of the previous page.
+    pub fn audit_page(&self, world: Option<&str>, actor: Option<&str>, action: Option<&str>, before: Option<i64>, limit: i64) -> Result<Vec<Value>, Error> {
+        let mut st = self.db.prepare(
+            "SELECT id,ts,actor,actor_name,action,world_id,target,detail FROM audit_log \
+             WHERE (?1 IS NULL OR world_id=?1) AND (?2 IS NULL OR actor=?2) AND (?3 IS NULL OR action=?3) AND (?4 IS NULL OR id<?4) \
+             ORDER BY id DESC LIMIT ?5",
+        )?;
+        let rows = st.query_map(params![world, actor, action, before, limit], |r| {
+            let detail: String = r.get(7)?;
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?, "ts": r.get::<_, i64>(1)?, "actor": r.get::<_, String>(2)?, "actor_name": r.get::<_, String>(3)?,
+                "action": r.get::<_, String>(4)?, "world": r.get::<_, String>(5)?, "target": r.get::<_, String>(6)?,
+                "detail": serde_json::from_str::<Value>(&detail).unwrap_or(Value::Null),
+            }))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// (status, reason, set_at)
+    pub fn user_status(&self, uuid: &str) -> Result<Option<(String, String, i64)>, Error> {
+        Ok(self
+            .db
+            .query_row("SELECT status, reason, set_at FROM user_status WHERE player_uuid=?", params![uuid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()?)
+    }
+
+    /// None restores the account.
+    pub fn set_user_status(&self, uuid: &str, status: Option<&str>, reason: &str, by: &str) -> Result<(), Error> {
+        match status {
+            Some(s) => self.db.execute(
+                "INSERT INTO user_status(player_uuid,status,reason,set_by,set_at) VALUES(?,?,?,?,?) \
+                 ON CONFLICT(player_uuid) DO UPDATE SET status=excluded.status, reason=excluded.reason, set_by=excluded.set_by, set_at=excluded.set_at",
+                params![uuid, s, reason, by, wall_s()],
+            )?,
+            None => self.db.execute("DELETE FROM user_status WHERE player_uuid=?", params![uuid])?,
+        };
+        Ok(())
+    }
+
+    pub fn is_admin(&self, uuid: &str, from_config: &[String]) -> bool {
+        from_config.iter().any(|a| a == uuid)
+            || self.db.query_row("SELECT 1 FROM gateway_admins WHERE player_uuid=?", params![uuid], |_| Ok(())).is_ok()
+    }
+
+    pub fn set_gateway_admin(&self, uuid: &str, admin: bool, by: &str) -> Result<(), Error> {
+        if admin {
+            self.db.execute(
+                "INSERT OR IGNORE INTO gateway_admins(player_uuid,granted_by,granted_at) VALUES(?,?,?)",
+                params![uuid, by, wall_s()],
+            )?;
+        } else {
+            self.db.execute("DELETE FROM gateway_admins WHERE player_uuid=?", params![uuid])?;
+        }
+        Ok(())
+    }
+
+    pub fn player_by_name(&self, name: &str) -> Result<Option<(String, String)>, Error> {
+        Ok(self
+            .db
+            .query_row("SELECT uuid, name FROM players WHERE name=? COLLATE NOCASE", params![name], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?)
+    }
+
+    /// (retry_after_s, message) while maintenance mode is on.
+    pub fn maintenance(&self) -> Option<(u64, String)> {
+        let v: String = self.db.query_row("SELECT value FROM admin_settings WHERE key='maintenance'", [], |r| r.get(0)).ok()?;
+        let v: Value = serde_json::from_str(&v).ok()?;
+        Some((v["retry_after_s"].as_u64().unwrap_or(DEFAULT_RETRY_AFTER_S), v["message"].as_str().unwrap_or("").to_string()))
+    }
+
+    pub fn set_maintenance(&self, on: Option<(u64, &str)>) -> Result<(), Error> {
+        match on {
+            Some((retry, msg)) => self.db.execute(
+                "INSERT OR REPLACE INTO admin_settings(key,value) VALUES('maintenance',?)",
+                params![json!({ "retry_after_s": retry, "message": msg }).to_string()],
+            )?,
+            None => self.db.execute("DELETE FROM admin_settings WHERE key='maintenance'", [])?,
+        };
+        Ok(())
+    }
+
+    pub fn world_exists(&self, world: &str) -> bool {
+        self.db.query_row("SELECT 1 FROM worlds WHERE id=?", params![world], |_| Ok(())).is_ok()
+    }
+
+    pub fn set_world_owner(&self, world: &str, uuid: &str) -> Result<(), Error> {
+        self.db.execute(
+            "INSERT INTO world_policy(world_id, owner_uuid) VALUES(?,?) ON CONFLICT(world_id) DO UPDATE SET owner_uuid=excluded.owner_uuid",
+            params![world, uuid],
+        )?;
+        Ok(())
+    }
+
+    /// The recorded owner, else the oldest ADMIN member (worlds that predate this table).
+    pub fn world_owner(&self, world: &str) -> Result<Option<String>, Error> {
+        let rec: Option<String> = self
+            .db
+            .query_row("SELECT owner_uuid FROM world_policy WHERE world_id=?", params![world], |r| r.get(0))
+            .optional()?
+            .flatten();
+        if rec.is_some() {
+            return Ok(rec);
+        }
+        Ok(self
+            .db
+            .query_row("SELECT player_uuid FROM members WHERE world_id=? AND role='ADMIN' ORDER BY rowid LIMIT 1", params![world], |r| r.get(0))
+            .optional()?)
+    }
+
+    pub fn host_policy(&self, world: &str) -> Result<String, Error> {
+        Ok(self
+            .db
+            .query_row("SELECT host_policy FROM world_policy WHERE world_id=?", params![world], |r| r.get(0))
+            .optional()?
+            .unwrap_or_else(|| "MEMBERS".into()))
+    }
+
+    pub fn host_allowlist(&self, world: &str) -> Result<Vec<String>, Error> {
+        let mut st = self.db.prepare(
+            "SELECT p.name FROM world_host_allow a JOIN players p ON p.uuid=a.player_uuid WHERE a.world_id=? ORDER BY p.name COLLATE NOCASE",
+        )?;
+        let rows = st.query_map(params![world], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// `allow` None keeps the current list.
+    pub fn set_host_policy(&mut self, world: &str, policy: &str, allow: Option<&[String]>) -> Result<(), Error> {
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "INSERT INTO world_policy(world_id, host_policy) VALUES(?,?) ON CONFLICT(world_id) DO UPDATE SET host_policy=excluded.host_policy",
+            params![world, policy],
+        )?;
+        if let Some(allow) = allow {
+            tx.execute("DELETE FROM world_host_allow WHERE world_id=?", params![world])?;
+            for uuid in allow {
+                tx.execute("INSERT OR IGNORE INTO world_host_allow(world_id,player_uuid) VALUES(?,?)", params![world, uuid])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Whether the device's player may bid for or take the host lease under the world's policy.
+    /// Role checks (CLIENT_ONLY) stay in core; this only narrows them.
+    pub fn may_host(&self, world: &str, device: &str) -> bool {
+        let Ok(policy) = self.host_policy(world) else { return false };
+        if policy == "MEMBERS" {
+            return true;
+        }
+        let Ok(Some((uuid, _))) = self.device_player(device) else { return false };
+        if self.world_owner(world).ok().flatten().as_deref() == Some(uuid.as_str()) {
+            return true;
+        }
+        policy == "ALLOWLIST"
+            && self
+                .db
+                .query_row("SELECT 1 FROM world_host_allow WHERE world_id=? AND player_uuid=?", params![world, uuid], |_| Ok(()))
+                .is_ok()
+    }
+
+    pub(crate) fn is_member_uuid(&self, world: &str, uuid: &str) -> bool {
+        self.db.query_row("SELECT 1 FROM members WHERE world_id=? AND player_uuid=?", params![world, uuid], |_| Ok(())).is_ok()
+    }
+}
+
+fn restriction_code(status: &str) -> &'static str {
+    if status == "BANNED" {
+        "ACCOUNT_BANNED"
+    } else {
+        "ACCOUNT_SUSPENDED"
+    }
+}
+
+fn bearer(h: &HeaderMap) -> Option<&str> {
+    h.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "))
+}
+
+/// Lease-scoped traffic that lets a host wind down. Returns the last path segment.
+fn lease_action(method: &Method, path: &str) -> Option<&'static str> {
+    if method == Method::PUT && path.starts_with("/v1/blobs/") {
+        return Some("blob");
+    }
+    let rest = path.strip_prefix("/v1/leases/")?;
+    match rest.rsplit('/').next()? {
+        "commit" => Some("commit"),
+        "release" => Some("release"),
+        "heartbeat" => Some("heartbeat"),
+        "wal" => Some("wal"),
+        "host-ready" => Some("host-ready"),
+        _ => None,
+    }
+}
+
+/// Per-request gate for suspended or banned accounts and maintenance mode. Requests without a valid
+/// session pass through: the handler answers 401, and public pages stay public.
+pub(crate) async fn gate(State(s): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+    if let Some(err) = judge(&s, req.headers(), req.method(), req.uri().path()) {
+        return err.into_response();
+    }
+    next.run(req).await
+}
+
+fn judge(s: &AppState, h: &HeaderMap, method: &Method, path: &str) -> Option<ApiErr> {
+    let tok = bearer(h)?;
+    let gw = s.gw();
+    let dev = gw.device_for_token(tok).ok()??;
+    let (uuid, _) = gw.device_player(&dev).ok()??;
+    let lease = lease_action(method, path);
+    if let Some((status, _, since)) = gw.user_status(&uuid).ok()? {
+        // the final commit decision needs the body, so the handler makes it
+        let open = match lease {
+            Some("commit" | "release") => true,
+            Some(_) => (wall_s() - since).max(0) as u64 <= s.auth.ban_grace_s,
+            None => false,
+        };
+        return (!open).then(|| ApiErr::Forbidden(restriction_code(&status)));
+    }
+    let (retry, msg) = gw.maintenance()?;
+    let mutating = !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
+    let exempt = lease.is_some() || path.starts_with("/v1/auth/") || path == "/v1/logs";
+    if mutating && !exempt && !gw.is_admin(&uuid, &s.auth.admins) {
+        return Some(ApiErr::Maintenance(retry, msg));
+    }
+    None
+}
+
+impl AppState {
+    /// A commit that is not final stops for restricted accounts and, outside admins, in maintenance.
+    pub(crate) fn check_commit(&self, gw: &Gateway, device: &str, last: bool) -> Result<(), ApiErr> {
+        if last {
+            return Ok(());
+        }
+        let Some((uuid, _)) = gw.device_player(device)? else { return Ok(()) };
+        if let Some((status, _, _)) = gw.user_status(&uuid)? {
+            return Err(ApiErr::Forbidden(restriction_code(&status)));
+        }
+        if let Some((retry, msg)) = gw.maintenance() {
+            if !gw.is_admin(&uuid, &self.auth.admins) {
+                return Err(ApiErr::Maintenance(retry, msg));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// (uuid, name) of the caller when they are a gateway admin.
+fn require_admin(s: &AppState, gw: &Gateway, dev: &str) -> Result<(String, String), ApiErr> {
+    let (uuid, name) = gw.device_player(dev)?.ok_or(ApiErr::Unauthorized)?;
+    if gw.is_admin(&uuid, &s.auth.admins) {
+        Ok((uuid, name))
+    } else {
+        Err(ApiErr::Forbidden("ADMIN_ONLY"))
+    }
+}
+
+/// Owner of the world or a gateway admin. Unknown worlds look like non-ownership to everyone else.
+pub(crate) fn require_owner_or_admin(s: &AppState, gw: &Gateway, dev: &str, world: &str) -> Result<(String, String), ApiErr> {
+    let (uuid, name) = gw.device_player(dev)?.ok_or(ApiErr::Unauthorized)?;
+    if gw.is_admin(&uuid, &s.auth.admins) {
+        return if gw.world_exists(world) { Ok((uuid, name)) } else { Err(ApiErr::Domain(Error::NoSuchWorld)) };
+    }
+    if gw.world_owner(world)?.as_deref() == Some(uuid.as_str()) {
+        Ok((uuid, name))
+    } else {
+        Err(ApiErr::Forbidden("OWNER_ONLY"))
+    }
+}
+
+fn page_args(q: &HashMap<String, String>) -> Result<(i64, Option<i64>), ApiErr> {
+    let limit = match q.get("limit") {
+        None => PAGE_DEFAULT,
+        Some(v) => v.parse::<i64>().ok().filter(|n| (1..=PAGE_MAX).contains(n)).ok_or(ApiErr::BadRequest("BAD_PAGE"))?,
+    };
+    let before = match q.get("before") {
+        None => None,
+        Some(v) => Some(v.parse::<i64>().map_err(|_| ApiErr::BadRequest("BAD_PAGE"))?),
+    };
+    Ok((limit, before))
+}
+
+fn page_json(rows: Vec<Value>, limit: i64) -> Value {
+    let next = (rows.len() as i64 == limit).then(|| rows.last().and_then(|r| r["id"].as_i64())).flatten();
+    json!({ "entries": rows, "next_before": next })
+}
+
+async fn admin_audit(State(s): State<Arc<AppState>>, h: HeaderMap, Query(q): Query<HashMap<String, String>>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_admin(&s, &gw, &dev)?;
+    let (limit, before) = page_args(&q)?;
+    let rows = gw.audit_page(q.get("world").map(String::as_str), q.get("actor").map(String::as_str), q.get("action").map(String::as_str), before, limit)?;
+    Ok(Json(page_json(rows, limit)))
+}
+
+async fn world_audit(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Query(q): Query<HashMap<String, String>>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_owner_or_admin(&s, &gw, &dev, &world)?;
+    let (limit, before) = page_args(&q)?;
+    let rows = gw.audit_page(Some(&world), q.get("actor").map(String::as_str), q.get("action").map(String::as_str), before, limit)?;
+    Ok(Json(page_json(rows, limit)))
+}
+
+async fn get_user(State(s): State<Arc<AppState>>, h: HeaderMap, Path(name): Path<String>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_admin(&s, &gw, &dev)?;
+    let (uuid, name) = gw.player_by_name(&name)?.ok_or(ApiErr::NotFound("NO_SUCH_USER"))?;
+    let st = gw.user_status(&uuid)?;
+    Ok(Json(json!({
+        "uuid": uuid, "name": name,
+        "role": if gw.is_admin(&uuid, &s.auth.admins) { "admin" } else { "user" },
+        "status": st.as_ref().map_or("ACTIVE", |x| x.0.as_str()),
+        "reason": st.as_ref().map(|x| x.1.clone()),
+    })))
+}
+
+#[derive(Deserialize)]
+struct StatusReq {
+    status: String,
+    #[serde(default)]
+    reason: String,
+}
+
+async fn put_status(State(s): State<Arc<AppState>>, h: HeaderMap, Path(name): Path<String>, Json(b): Json<StatusReq>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    let (actor, _) = require_admin(&s, &gw, &dev)?;
+    let status = match b.status.as_str() {
+        "ACTIVE" => None,
+        "SUSPENDED" | "BANNED" => Some(b.status.as_str()),
+        _ => return Err(ApiErr::BadRequest("BAD_STATUS")),
+    };
+    if b.reason.len() > 256 {
+        return Err(ApiErr::BadRequest("BAD_REASON"));
+    }
+    let (uuid, name) = gw.player_by_name(&name)?.ok_or(ApiErr::NotFound("NO_SUCH_USER"))?;
+    if uuid == actor {
+        return Err(ApiErr::Conflict("CANNOT_TARGET_SELF"));
+    }
+    gw.set_user_status(&uuid, status, &b.reason, &actor)?;
+    let action = match status {
+        Some("BANNED") => "user.ban",
+        Some(_) => "user.suspend",
+        None => "user.restore",
+    };
+    gw.audit(&dev, action, "", &name, json!({ "reason": b.reason }));
+    Ok(Json(json!({ "ok": true, "status": b.status })))
+}
+
+#[derive(Deserialize)]
+struct RoleReq {
+    role: String,
+}
+
+async fn put_gateway_role(State(s): State<Arc<AppState>>, h: HeaderMap, Path(name): Path<String>, Json(b): Json<RoleReq>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    let (actor, _) = require_admin(&s, &gw, &dev)?;
+    let admin = match b.role.as_str() {
+        "admin" => true,
+        "user" => false,
+        _ => return Err(ApiErr::BadRequest("BAD_ROLE")),
+    };
+    let (uuid, name) = gw.player_by_name(&name)?.ok_or(ApiErr::NotFound("NO_SUCH_USER"))?;
+    if !admin {
+        if uuid == actor {
+            return Err(ApiErr::Conflict("CANNOT_TARGET_SELF"));
+        }
+        if s.auth.admins.contains(&uuid) {
+            return Err(ApiErr::Conflict("ADMIN_FROM_CONFIG"));
+        }
+    }
+    gw.set_gateway_admin(&uuid, admin, &actor)?;
+    gw.audit(&dev, "role.gateway", "", &name, json!({ "role": b.role }));
+    Ok(Json(json!({ "ok": true, "role": b.role })))
+}
+
+async fn get_maintenance(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_admin(&s, &gw, &dev)?;
+    Ok(Json(match gw.maintenance() {
+        Some((retry, msg)) => json!({ "on": true, "retry_after_s": retry, "message": msg }),
+        None => json!({ "on": false }),
+    }))
+}
+
+#[derive(Deserialize)]
+struct MaintReq {
+    on: bool,
+    retry_after_s: Option<u64>,
+    #[serde(default)]
+    message: String,
+}
+
+async fn put_maintenance(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): Json<MaintReq>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_admin(&s, &gw, &dev)?;
+    let retry = b.retry_after_s.unwrap_or(DEFAULT_RETRY_AFTER_S);
+    if !(1..=MAX_RETRY_AFTER_S).contains(&retry) || b.message.len() > 256 {
+        return Err(ApiErr::BadRequest("BAD_MAINTENANCE"));
+    }
+    gw.set_maintenance(b.on.then_some((retry, b.message.as_str())))?;
+    gw.audit(&dev, if b.on { "maintenance.on" } else { "maintenance.off" }, "", "", json!({ "retry_after_s": retry, "message": b.message }));
+    Ok(Json(json!({ "ok": true, "on": b.on })))
+}
+
+async fn get_policy(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    gw.require_member(&world, &dev)?;
+    let owner = gw.world_owner(&world)?.and_then(|u| gw.db.query_row("SELECT name FROM players WHERE uuid=?", params![u], |r| r.get::<_, String>(0)).ok());
+    Ok(Json(json!({ "policy": gw.host_policy(&world)?, "owner": owner, "allow": gw.host_allowlist(&world)? })))
+}
+
+#[derive(Deserialize)]
+struct PolicyReq {
+    policy: String,
+    allow: Option<Vec<String>>,
+}
+
+async fn put_policy(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<PolicyReq>) -> R {
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_owner_or_admin(&s, &gw, &dev, &world)?;
+    if !matches!(b.policy.as_str(), "OWNER" | "ALLOWLIST" | "MEMBERS") {
+        return Err(ApiErr::BadRequest("BAD_POLICY"));
+    }
+    let mut uuids = None;
+    if let Some(names) = &b.allow {
+        if names.len() > 256 {
+            return Err(ApiErr::BadRequest("BAD_POLICY"));
+        }
+        let mut v = Vec::new();
+        for n in names {
+            let (uuid, _) = gw.player_by_name(n)?.filter(|(u, _)| gw.is_member_uuid(&world, u)).ok_or(ApiErr::NotFound("NO_SUCH_MEMBER"))?;
+            v.push(uuid);
+        }
+        uuids = Some(v);
+    }
+    gw.set_host_policy(&world, &b.policy, uuids.as_deref())?;
+    gw.audit(&dev, "policy.host", &world, "", json!({ "policy": b.policy, "allow": b.allow }));
+    Ok(Json(json!({ "ok": true })))
+}
+
+pub fn routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/v1/admin/audit", get(admin_audit))
+        .route("/v1/admin/maintenance", get(get_maintenance).put(put_maintenance))
+        .route("/v1/admin/users/:name", get(get_user))
+        .route("/v1/admin/users/:name/status", put(put_status))
+        .route("/v1/admin/users/:name/role", put(put_gateway_role))
+        .route("/v1/worlds/:id/audit", get(world_audit))
+        .route("/v1/worlds/:id/policy", get(get_policy).put(put_policy))
+}

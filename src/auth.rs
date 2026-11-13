@@ -31,11 +31,15 @@ pub struct AuthCfg {
     pub webhooks: Vec<String>,
     /// Signs webhook bodies (x-mesh-signature) when set.
     pub webhook_secret: Option<String>,
+    /// Player uuids that are gateway admins regardless of the database.
+    pub admins: Vec<String>,
+    /// How long a suspended or banned host may still wind down its lease (heartbeat, wal, blobs).
+    pub ban_grace_s: u64,
 }
 
 impl Default for AuthCfg {
     fn default() -> Self {
-        AuthCfg { session_url: "https://sessionserver.mojang.com".into(), mojang: true, key: true, require_ticket: true, allow_create: false, advertise: String::new(), metrics_token: None, webhooks: Vec::new(), webhook_secret: None }
+        AuthCfg { session_url: "https://sessionserver.mojang.com".into(), mojang: true, key: true, require_ticket: true, allow_create: false, advertise: String::new(), metrics_token: None, webhooks: Vec::new(), webhook_secret: None, admins: Vec::new(), ban_grace_s: 120 }
     }
 }
 
@@ -170,10 +174,16 @@ pub(crate) struct MojangReq {
     name: String,
 }
 
-fn finish(s: &AppState, r: Result<Result<LoginOk, &'static str>, Error>) -> Result<Json<Value>, ApiErr> {
+fn finish(s: &AppState, method: &str, r: Result<Result<LoginOk, &'static str>, Error>) -> Result<Json<Value>, ApiErr> {
     match r? {
         Ok(ok) => {
-            s.gw().meter("", "logins", 1);
+            let mut gw = s.gw();
+            if let Some((status, _, _)) = gw.user_status(&ok.uuid)? {
+                gw.drop_token(&ok.token)?;
+                return Err(ApiErr::Forbidden(if status == "BANNED" { "ACCOUNT_BANNED" } else { "ACCOUNT_SUSPENDED" }));
+            }
+            gw.meter("", "logins", 1);
+            gw.audit_as(&ok.uuid, &ok.name, "login", "", "", json!({ "method": method }));
             Ok(Json(json!({ "token": ok.token, "uuid": ok.uuid, "name": ok.name })))
         }
         Err(code) => Err(ApiErr::Conflict(code)),
@@ -205,7 +215,7 @@ pub(crate) async fn mojang(State(s): State<Arc<AppState>>, Json(req): Json<Mojan
     let raw: Vec<u8> = (0..16).map(|i| u8::from_str_radix(&id[i * 2..i * 2 + 2], 16).unwrap_or(0)).collect();
     let uuid = fmt_uuid(&raw);
     let r = s.gw().login_identity(IdKind::Mojang, &uuid, real, None);
-    finish(&s, r)
+    finish(&s, "mojang", r)
 }
 
 #[derive(Deserialize)]
@@ -237,7 +247,7 @@ pub(crate) async fn key(State(s): State<Arc<AppState>>, Json(req): Json<KeyReq>)
     vk.verify_strict(&msg, &sig).map_err(|_| ApiErr::Unauthorized)?;
     let uuid = key_uuid(&pk);
     let r = s.gw().login_identity(IdKind::Key, &uuid, &req.name, Some(&pk));
-    finish(&s, r)
+    finish(&s, "key", r)
 }
 
 const TICKET_TTL: Duration = Duration::from_secs(60);

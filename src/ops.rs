@@ -35,6 +35,7 @@ impl Gateway {
                PRIMARY KEY(world_id, name)) WITHOUT ROWID;",
         )?;
         let _ = self.db.execute("ALTER TABLE invites ADD COLUMN expires_at INTEGER", []);
+        self.admin_init()?;
         Ok(())
     }
 
