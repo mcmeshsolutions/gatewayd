@@ -95,3 +95,16 @@ async fn an_idle_long_poll_times_out_empty_and_a_restart_is_reported() {
     assert_eq!(r["reset"], true);
     assert_eq!(r["events"].as_array().unwrap().len(), 1, "a stale cursor from before a restart replays the current log");
 }
+
+#[tokio::test]
+async fn the_world_list_shows_the_hosts_reported_load_and_players() {
+    let app = app();
+    let lease = host(&app, "tok-a", "w1").await;
+    let find = |v: &Value| v["worlds"].as_array().unwrap().iter().find(|w| w["id"] == "w1").cloned().unwrap();
+    let (_, v) = call(&app, "GET", Some("tok-c"), "/v1/worlds", Value::Null).await;
+    assert_eq!((find(&v)["host_load"].clone(), find(&v)["host_players"].clone()), (Value::Null, Value::Null), "unknown until the host reports");
+    let (c, _) = call(&app, "POST", Some("tok-a"), &format!("/v1/leases/{lease}/heartbeat"), json!({ "epoch": 1, "players": 3, "load": 2 })).await;
+    assert_eq!(c, 200);
+    let (_, v) = call(&app, "GET", Some("tok-c"), "/v1/worlds", Value::Null).await;
+    assert_eq!((find(&v)["host_load"].as_u64(), find(&v)["host_players"].as_u64()), (Some(2), Some(3)));
+}

@@ -593,6 +593,19 @@ impl Gateway {
             .flatten())
     }
 
+    /// Last reported load-shedding level (0 to 3) of the world's live host; None when unknown or no live lease.
+    pub fn lease_load(&self, world: &str) -> Result<Option<u32>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT load FROM leases WHERE world_id=? AND status IN('ACTIVE','HANDOFF')",
+                params![world],
+                |r| r.get::<_, Option<u32>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     pub(crate) fn require_live(&self, lease: &str, epoch: i64) -> Result<(String, String)> {
         self.db
             .query_row(

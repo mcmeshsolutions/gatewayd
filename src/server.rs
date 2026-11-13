@@ -314,7 +314,7 @@ async fn list_worlds(
                     .filter(|(_, t, at)| *t > 0 && at.elapsed().as_secs() < 30)
                     .map(|(d, t, _)| json!({ "done": d, "total": t }))
             };
-            json!({ "id": id, "name": name, "mc_version": mc, "role": role, "state": state, "host": host, "takeover_in_s": takeover, "host_ready": ready, "sync": sync, "pack_version": pack_version })
+            json!({ "id": id, "name": name, "mc_version": mc, "role": role, "state": state, "host": host, "takeover_in_s": takeover, "host_ready": ready, "sync": sync, "pack_version": pack_version, "host_load": gw.lease_load(&id).ok().flatten(), "host_players": gw.lease_players(&id).ok().flatten() })
         })
         .collect();
     Ok(Json(json!({ "worlds": worlds, "relay": s.auth.advertise, "tunnel_proof": true })))
