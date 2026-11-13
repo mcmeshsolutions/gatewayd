@@ -2,7 +2,7 @@
 use crate::lease::{wall_s, Error, Gateway};
 use crate::server::{ApiErr, AppState};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::get,
@@ -202,13 +202,36 @@ fn span(s: i64) -> String {
     }
 }
 
-/// Best-effort event delivery to the operator's webhook URLs. No retries, no ordering across URLs.
-pub struct Hooks(Option<SyncSender<String>>);
+/// Best-effort event delivery to the operator's webhook URLs, plus a bounded in-memory log that the long-poll route reads.
+/// No retries, no ordering across URLs. The log is lost on restart; `boot` tells a reader that happened.
+pub struct Hooks {
+    tx: Option<SyncSender<String>>,
+    log: std::sync::Mutex<EventLog>,
+    wake: tokio::sync::Notify,
+}
+
+const EVENT_LOG_MAX: usize = 2000;
+
+struct EventLog {
+    boot: u64,
+    next: u64,
+    events: std::collections::VecDeque<LoggedEvent>,
+}
+
+struct LoggedEvent {
+    seq: u64,
+    ts: i64,
+    event: String,
+    world: String,
+    data: Value,
+}
 
 impl Hooks {
     pub fn new(urls: &[String], secret: Option<String>) -> Self {
+        let boot = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_millis() as u64);
+        let log = std::sync::Mutex::new(EventLog { boot, next: 1, events: Default::default() });
         if urls.is_empty() {
-            return Hooks(None);
+            return Hooks { tx: None, log, wake: tokio::sync::Notify::new() };
         }
         let (tx, rx) = sync_channel::<String>(256);
         let urls = urls.to_vec();
@@ -228,13 +251,73 @@ impl Hooks {
                 }
             }
         });
-        Hooks(Some(tx))
+        Hooks { tx: Some(tx), log, wake: tokio::sync::Notify::new() }
     }
 
     pub fn emit(&self, event: &str, world: &str, data: Value) {
-        if let Some(tx) = &self.0 {
+        let ts = wall_s();
+        {
+            let mut l = self.log.lock().unwrap_or_else(|e| e.into_inner());
+            let seq = l.next;
+            l.next += 1;
+            l.events.push_back(LoggedEvent { seq, ts, event: event.into(), world: world.into(), data: data.clone() });
+            while l.events.len() > EVENT_LOG_MAX {
+                l.events.pop_front();
+            }
+        }
+        self.wake.notify_waiters();
+        if let Some(tx) = &self.tx {
             // a full queue means a stuck receiver; dropping events beats blocking the api
-            let _ = tx.try_send(json!({ "event": event, "world": world, "ts": wall_s(), "data": data }).to_string());
+            let _ = tx.try_send(json!({ "event": event, "world": world, "ts": ts, "data": data }).to_string());
+        }
+    }
+
+    /// Events of one world after `after` (at most `limit`), the highest seq seen, and this process's boot id.
+    /// A `boot` that differs from ours means the log restarted, so `after` is ignored and `reset` is true.
+    fn events_after(&self, world: &str, after: u64, boot: Option<u64>, limit: usize) -> (Vec<Value>, u64, u64, bool) {
+        let l = self.log.lock().unwrap_or_else(|e| e.into_inner());
+        let reset = boot.is_some_and(|b| b != l.boot);
+        let after = if reset { 0 } else { after };
+        let mut next = if reset { 0 } else { after };
+        let out: Vec<Value> = l
+            .events
+            .iter()
+            .filter(|e| e.seq > after && e.world == world)
+            .take(limit)
+            .map(|e| {
+                next = e.seq;
+                json!({ "seq": e.seq, "ts": e.ts, "event": e.event, "data": e.data })
+            })
+            .collect();
+        if out.is_empty() {
+            next = next.max(if reset { 0 } else { after.min(l.next.saturating_sub(1)) });
+        }
+        (out, next, l.boot, reset)
+    }
+}
+
+/// Long poll: returns as soon as the world has events after `after`, or empty after `wait` seconds (0 to 25).
+async fn world_events(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Query(q): Query<std::collections::HashMap<String, String>>) -> Result<Json<Value>, ApiErr> {
+    {
+        let gw = s.gw();
+        let dev = crate::server::auth(&gw, &h)?;
+        gw.pack_of(&world)?;
+        gw.require_member(&world, &dev)?;
+    }
+    let num = |k: &str| -> Result<Option<u64>, ApiErr> { q.get(k).map(|v| v.parse::<u64>().map_err(|_| ApiErr::BadRequest("BAD_QUERY"))).transpose() };
+    let (after, boot, wait) = (num("after")?.unwrap_or(0), num("boot")?, num("wait")?.unwrap_or(0).min(25));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait);
+    loop {
+        let notified = s.hooks.wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let (events, next, boot_id, reset) = s.hooks.events_after(&world, after, boot, 100);
+        if !events.is_empty() || reset || wait == 0 || tokio::time::Instant::now() >= deadline {
+            return Ok(Json(json!({ "events": events, "next": next, "boot": boot_id, "reset": reset })));
+        }
+        tokio::select! {
+            _ = &mut notified => {}
+            _ = tokio::time::sleep_until(deadline) => {}
         }
     }
 }
@@ -308,4 +391,5 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/status", get(status_json))
         .route("/metrics", get(metrics))
         .route("/invite/:code", get(invite_page))
+        .route("/v1/worlds/:id/events", get(world_events))
 }
