@@ -32,11 +32,28 @@ impl Gateway {
         self.db.execute_batch(
             "CREATE TABLE IF NOT EXISTS meters(
                world_id TEXT NOT NULL, name TEXT NOT NULL, value INTEGER NOT NULL,
-               PRIMARY KEY(world_id, name)) WITHOUT ROWID;",
+               PRIMARY KEY(world_id, name)) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS world_pack_version(
+               world_id TEXT PRIMARY KEY, version TEXT NOT NULL) WITHOUT ROWID;",
         )?;
         let _ = self.db.execute("ALTER TABLE invites ADD COLUMN expires_at INTEGER", []);
         self.admin_init()?;
         Ok(())
+    }
+
+    /// Pack version the last host reported; informational, a failed write must not fail the join.
+    pub fn set_pack_version(&self, world: &str, version: &str) {
+        let r = self.db.execute(
+            "INSERT INTO world_pack_version(world_id,version) VALUES(?,?) ON CONFLICT(world_id) DO UPDATE SET version=excluded.version",
+            params![world, version],
+        );
+        if let Err(e) = r {
+            eprintln!("pack version write failed: {e}");
+        }
+    }
+
+    pub fn pack_version_of(&self, world: &str) -> Option<String> {
+        self.db.query_row("SELECT version FROM world_pack_version WHERE world_id=?", params![world], |r| r.get(0)).ok()
     }
 
     /// Adds to a counter; world "" is gateway-wide. A counter must never fail the request it counts.
