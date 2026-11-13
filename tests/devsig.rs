@@ -18,7 +18,7 @@ fn app(require_signed: bool) -> Router {
     let dir = std::env::temp_dir().join(format!("mcmesh-devsig-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     let mut g = Gateway::open(Connection::open_in_memory().unwrap(), gatewayd::cas::Cas::open(dir).unwrap(), 0).unwrap();
     g.create_world("w1", "x", "1.21.1", "neoforge").unwrap();
-    g.add_member("w1", "u-a", "alice", "dev-a", Role::HostEligible).unwrap();
+    g.add_member("w1", "u-a", "alice", "dev-a", Role::Admin).unwrap();
     g.add_token("dev-a", "tok-a").unwrap();
     let cfg = gatewayd::auth::AuthCfg { require_signed, ..Default::default() };
     router(AppState::with_auth(g, cfg))
@@ -104,4 +104,43 @@ async fn require_signed_refuses_unsigned_commits_and_accepts_signed_ones() {
     assert_eq!(register(&app, &sk).await.0, 200);
     let sig = sk.sign(&commit_message("w1", &h.lease, 1, &h.base, "AUTOSAVE", false, -1)).to_bytes();
     assert_eq!(post(&app, &path, commit_body(&h, "AUTOSAVE", false, Some(sig))).await.0, 200);
+}
+
+async fn put(app: &Router, path: &str, tok: &str, body: Value) -> (u16, Value) {
+    let r = Request::put(path).header("content-type", "application/json").header("authorization", format!("Bearer {tok}"));
+    let resp = app.clone().oneshot(r.body(Body::from(body.to_string())).unwrap()).await.unwrap();
+    let code = resp.status().as_u16();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (code, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn the_owner_can_require_signatures_for_one_world() {
+    let app = app(false);
+    let h = join(&app).await;
+    let path = format!("/v1/leases/{}/commit", h.lease);
+    let (c, v) = put(&app, "/v1/worlds/w1/signing", "tok-a", json!({ "require_signed": true })).await;
+    assert_eq!((c, v["require_signed"].as_bool()), (200, Some(true)));
+    let (c, v) = post(&app, &path, commit_body(&h, "AUTOSAVE", false, None)).await;
+    assert_eq!((c, v["error"].as_str()), (403, Some("SIGNATURE_REQUIRED")));
+    let sk = SigningKey::from_bytes(&[5u8; 32]);
+    assert_eq!(register(&app, &sk).await.0, 200);
+    let sig = sk.sign(&commit_message("w1", &h.lease, 1, &h.base, "AUTOSAVE", false, -1)).to_bytes();
+    assert_eq!(post(&app, &path, commit_body(&h, "AUTOSAVE", false, Some(sig))).await.0, 200);
+    let (c, _) = put(&app, "/v1/worlds/w1/signing", "tok-a", json!({ "require_signed": false })).await;
+    assert_eq!(c, 200);
+    let (_, v) = {
+        let r = Request::get("/v1/worlds/w1/policy").header("authorization", "Bearer tok-a");
+        let resp = app.clone().oneshot(r.body(Body::empty()).unwrap()).await.unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (0, serde_json::from_slice::<Value>(&bytes).unwrap())
+    };
+    assert_eq!(v["require_signed"].as_bool(), Some(false));
+}
+
+#[tokio::test]
+async fn only_an_owner_or_admin_can_change_the_signing_requirement() {
+    let app = app(false);
+    let (c, v) = put(&app, "/v1/worlds/w1/signing", "tok-nobody", json!({ "require_signed": true })).await;
+    assert_eq!((c, v["error"].as_str()), (401, Some("UNAUTHORIZED")));
 }

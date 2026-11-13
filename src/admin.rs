@@ -49,6 +49,7 @@ impl Gateway {
              CREATE TABLE IF NOT EXISTS world_host_allow(
                world_id TEXT NOT NULL, player_uuid TEXT NOT NULL, PRIMARY KEY(world_id, player_uuid)) WITHOUT ROWID;",
         )?;
+        let _ = self.db.execute("ALTER TABLE world_policy ADD COLUMN require_signed INTEGER NOT NULL DEFAULT 0", []);
         Ok(())
     }
 
@@ -191,6 +192,18 @@ impl Gateway {
         )?;
         let rows = st.query_map(params![world], |r| r.get(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn world_requires_signed(&self, world: &str) -> bool {
+        self.db.query_row("SELECT require_signed FROM world_policy WHERE world_id=?", params![world], |r| r.get::<_, bool>(0)).unwrap_or(false)
+    }
+
+    pub fn set_require_signed(&mut self, world: &str, on: bool) -> Result<(), Error> {
+        self.db.execute(
+            "INSERT INTO world_policy(world_id, require_signed) VALUES(?,?) ON CONFLICT(world_id) DO UPDATE SET require_signed=excluded.require_signed",
+            params![world, on],
+        )?;
+        Ok(())
     }
 
     /// `allow` None keeps the current list.
@@ -482,7 +495,7 @@ async fn get_policy(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): P
     let dev = auth(&gw, &h)?;
     gw.require_member(&world, &dev)?;
     let owner = gw.world_owner(&world)?.and_then(|u| gw.db.query_row("SELECT name FROM players WHERE uuid=?", params![u], |r| r.get::<_, String>(0)).ok());
-    Ok(Json(json!({ "policy": gw.host_policy(&world)?, "owner": owner, "allow": gw.host_allowlist(&world)? })))
+    Ok(Json(json!({ "policy": gw.host_policy(&world)?, "owner": owner, "allow": gw.host_allowlist(&world)?, "require_signed": gw.world_requires_signed(&world) })))
 }
 
 #[derive(Deserialize)]
@@ -515,8 +528,24 @@ async fn put_policy(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): P
     Ok(Json(json!({ "ok": true })))
 }
 
+#[derive(Deserialize)]
+struct SigningReq {
+    require_signed: bool,
+}
+
+/// Owner switch: from now on commits to this world need a valid host signature (403 SIGNATURE_REQUIRED otherwise).
+async fn put_signing(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<SigningReq>) -> R {
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_owner_or_admin(&s, &gw, &dev, &world)?;
+    gw.set_require_signed(&world, b.require_signed)?;
+    gw.audit(&dev, "policy.signing", &world, "", json!({ "require_signed": b.require_signed }));
+    Ok(Json(json!({ "ok": true, "require_signed": b.require_signed })))
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/v1/worlds/:id/signing", put(put_signing))
         .route("/v1/admin/audit", get(admin_audit))
         .route("/v1/admin/maintenance", get(get_maintenance).put(put_maintenance))
         .route("/v1/admin/users/:name", get(get_user))

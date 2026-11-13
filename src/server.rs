@@ -484,7 +484,7 @@ async fn commit(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Path<
         Some(v) => Some(b64_fixed(v).ok_or(ApiErr::BadRequest("BAD_SIG"))?),
         None => None,
     };
-    if sig.is_none() && s.auth.require_signed {
+    if sig.is_none() && (s.auth.require_signed || gw.world_requires_signed(&world)) {
         return Err(ApiErr::Forbidden("SIGNATURE_REQUIRED"));
     }
     let r = match gw.commit_signed(&lease, b.epoch, &b.base_rev, kind, b.last, sig.as_ref(), now) {
