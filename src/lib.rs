@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod apikeys;
 pub mod auth;
 pub mod cas;
 pub mod crash;

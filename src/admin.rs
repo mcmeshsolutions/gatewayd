@@ -328,6 +328,35 @@ impl AppState {
 }
 
 /// (uuid, name) of the caller when they are a gateway admin.
+/// Who is calling an admin route that a scoped API key may also use.
+pub(crate) enum Actor {
+    Admin(String),
+    Key(i64, String),
+}
+
+impl Actor {
+    fn record(&self, gw: &Gateway, action: &str, world: &str, target: &str, detail: Value) {
+        match self {
+            Actor::Admin(dev) => gw.audit(dev, action, world, target, detail),
+            Actor::Key(id, name) => gw.audit_as(&format!("apikey:{id}"), name, action, world, target, detail),
+        }
+    }
+}
+
+/// A real admin, or an API key that carries `scope`. 401 for an unknown key, 403 `SCOPE_DENIED` for a key without the scope.
+fn admin_or_key(s: &AppState, gw: &Gateway, h: &HeaderMap, scope: &str) -> Result<Actor, ApiErr> {
+    if let Some(t) = bearer(h).filter(|t| t.starts_with(crate::apikeys::PREFIX)) {
+        return match gw.check_api_key(t, scope)? {
+            crate::apikeys::KeyCheck::Valid(id, name) => Ok(Actor::Key(id, name)),
+            crate::apikeys::KeyCheck::Denied => Err(ApiErr::Forbidden("SCOPE_DENIED")),
+            crate::apikeys::KeyCheck::Unknown => Err(ApiErr::Unauthorized),
+        };
+    }
+    let dev = auth(gw, h)?;
+    require_admin(s, gw, &dev)?;
+    Ok(Actor::Admin(dev))
+}
+
 fn require_admin(s: &AppState, gw: &Gateway, dev: &str) -> Result<(String, String), ApiErr> {
     let (uuid, name) = gw.device_player(dev)?.ok_or(ApiErr::Unauthorized)?;
     if gw.is_admin(&uuid, &s.auth.admins) {
@@ -369,8 +398,7 @@ fn page_json(rows: Vec<Value>, limit: i64) -> Value {
 
 async fn admin_audit(State(s): State<Arc<AppState>>, h: HeaderMap, Query(q): Query<HashMap<String, String>>) -> R {
     let gw = s.gw();
-    let dev = auth(&gw, &h)?;
-    require_admin(&s, &gw, &dev)?;
+    admin_or_key(&s, &gw, &h, "read:status")?;
     let (limit, before) = page_args(&q)?;
     let rows = gw.audit_page(q.get("world").map(String::as_str), q.get("actor").map(String::as_str), q.get("action").map(String::as_str), before, limit)?;
     Ok(Json(page_json(rows, limit)))
@@ -462,8 +490,7 @@ async fn put_gateway_role(State(s): State<Arc<AppState>>, h: HeaderMap, Path(nam
 
 async fn get_maintenance(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
     let gw = s.gw();
-    let dev = auth(&gw, &h)?;
-    require_admin(&s, &gw, &dev)?;
+    admin_or_key(&s, &gw, &h, "read:status")?;
     Ok(Json(match gw.maintenance() {
         Some((retry, msg)) => json!({ "on": true, "retry_after_s": retry, "message": msg }),
         None => json!({ "on": false }),
@@ -480,14 +507,13 @@ struct MaintReq {
 
 async fn put_maintenance(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): Json<MaintReq>) -> R {
     let gw = s.gw();
-    let dev = auth(&gw, &h)?;
-    require_admin(&s, &gw, &dev)?;
+    let actor = admin_or_key(&s, &gw, &h, "op:lifecycle")?;
     let retry = b.retry_after_s.unwrap_or(DEFAULT_RETRY_AFTER_S);
     if !(1..=MAX_RETRY_AFTER_S).contains(&retry) || b.message.len() > 256 {
         return Err(ApiErr::BadRequest("BAD_MAINTENANCE"));
     }
     gw.set_maintenance(b.on.then_some((retry, b.message.as_str())))?;
-    gw.audit(&dev, if b.on { "maintenance.on" } else { "maintenance.off" }, "", "", json!({ "retry_after_s": retry, "message": b.message }));
+    actor.record(&gw, if b.on { "maintenance.on" } else { "maintenance.off" }, "", "", json!({ "retry_after_s": retry, "message": b.message }));
     Ok(Json(json!({ "ok": true, "on": b.on })))
 }
 
@@ -557,8 +583,7 @@ const USAGE_MAX_WORLDS: usize = 500;
 async fn admin_usage(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
     use crate::quota::{month_meter, Scope};
     let gw = s.gw();
-    let dev = auth(&gw, &h)?;
-    require_admin(&s, &gw, &dev)?;
+    admin_or_key(&s, &gw, &h, "read:status")?;
     let db = |e: rusqlite::Error| ApiErr::Domain(Error::Db(e));
     let month = month_meter(wall_s());
     let ids: Vec<(String, String)> = {
@@ -722,8 +747,47 @@ async fn rollback_region(State(s): State<Arc<AppState>>, h: HeaderMap, Path(worl
     }
 }
 
+#[derive(Deserialize)]
+struct KeyReq {
+    name: String,
+    scopes: Vec<String>,
+}
+
+async fn create_key(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): Json<KeyReq>) -> R {
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    let (_, admin) = require_admin(&s, &gw, &dev)?;
+    match gw.create_api_key(&b.name, &b.scopes, &admin)? {
+        Ok((id, secret)) => {
+            gw.audit(&dev, "apikey.create", "", &id.to_string(), json!({ "name": b.name, "scopes": b.scopes }));
+            Ok(Json(json!({ "id": id, "name": b.name, "scopes": b.scopes, "key": secret, "note": "shown once, store it now" })))
+        }
+        Err(code) => Err(ApiErr::BadRequest(code)),
+    }
+}
+
+async fn list_keys(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_admin(&s, &gw, &dev)?;
+    Ok(Json(json!({ "keys": gw.list_api_keys()? })))
+}
+
+async fn revoke_key(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<i64>) -> R {
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_admin(&s, &gw, &dev)?;
+    if !gw.revoke_api_key(id)? {
+        return Err(ApiErr::NotFound("NO_SUCH_KEY"));
+    }
+    gw.audit(&dev, "apikey.revoke", "", &id.to_string(), json!({}));
+    Ok(Json(json!({ "ok": true })))
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/v1/admin/api-keys", get(list_keys).post(create_key))
+        .route("/v1/admin/api-keys/:id", axum::routing::delete(revoke_key))
         .route("/v1/worlds/:id/rollback", post(rollback_region))
         .route("/v1/worlds/:id/vote-policy", put(put_vote_policy))
         .route("/v1/worlds/:id/handover-vote", get(get_handover_vote).post(cast_handover_vote))
