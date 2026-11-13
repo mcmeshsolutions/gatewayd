@@ -573,12 +573,66 @@ async fn revision_files(State(s): State<Arc<AppState>>, h: HeaderMap, Path(rev):
     Ok(Json(json!({ "rev": rev, "root": hex(&root), "chunks": chunks, "aux": aux })))
 }
 
+/// Owner-only world download. `export_zip` needs `Seek`, so the zip goes through a temp file that is removed on every exit path.
+async fn world_export(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> Result<Response, ApiErr> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    struct TempZip(std::path::PathBuf);
+    impl Drop for TempZip {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let (root, cas) = {
+        let gw = s.gw();
+        let dev = auth(&gw, &h)?;
+        gw.pack_of(&world)?;
+        if gw.role(&world, &dev)? != crate::lease::Role::Admin {
+            return Err(ApiErr::Domain(Error::NotMember));
+        }
+        gw.require_pack(&world, &req_pack(&h)?)?;
+        let root = gw.revision_root(&gw.head(&world)?)?;
+        (root, gw.cas().clone())
+    };
+    let name = if world.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        format!("{world}.zip")
+    } else {
+        "world.zip".to_string()
+    };
+    let path = std::env::temp_dir().join(format!(
+        "mcmesh-export-{}-{}.zip",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let file = std::fs::File::create(&path).map_err(|e| ApiErr::Domain(e.into()))?;
+    let _cleanup = TempZip(path.clone());
+    let read_path = path.clone();
+    let bytes = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+        crate::maintenance::export_zip(&cas, root, file)?;
+        std::fs::read(read_path)
+    })
+    .await
+    .map_err(|_| ApiErr::Domain(Error::Store("export task failed".into())))?
+    .map_err(|e| match e.kind() {
+        std::io::ErrorKind::InvalidData => ApiErr::Conflict("EXPORT_CORRUPT"),
+        _ => ApiErr::Domain(e.into()),
+    })?;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "application/zip".to_string()),
+            (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\"")),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/auth/challenge", post(crate::auth::challenge))
         .route("/v1/auth/mojang", post(crate::auth::mojang))
         .route("/v1/auth/key", post(crate::auth::key))
         .route("/v1/revisions/:rev/files", get(revision_files))
+        .route("/v1/worlds/:id/export.zip", get(world_export))
         .route("/v1/worlds/:id/ticket", post(crate::auth::ticket))
         .route("/v1/devices/me", get(device_me))
         .route("/v1/worlds", post(create_world).get(list_worlds))
