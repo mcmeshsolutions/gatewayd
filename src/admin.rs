@@ -49,6 +49,9 @@ impl Gateway {
              CREATE TABLE IF NOT EXISTS world_aux(
                world_id TEXT NOT NULL, ns TEXT NOT NULL, key TEXT NOT NULL, value BLOB NOT NULL, updated_by TEXT NOT NULL, updated_at INTEGER NOT NULL,
                PRIMARY KEY(world_id, ns, key)) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS world_reports(
+               id INTEGER PRIMARY KEY AUTOINCREMENT, world_id TEXT NOT NULL, reporter TEXT NOT NULL, target TEXT NOT NULL, reason TEXT NOT NULL,
+               created_at INTEGER NOT NULL, resolved_at INTEGER, note TEXT NOT NULL DEFAULT '');
              CREATE TABLE IF NOT EXISTS world_bans(
                world_id TEXT NOT NULL, player_uuid TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', banned_by TEXT NOT NULL, banned_at INTEGER NOT NULL,
                PRIMARY KEY(world_id, player_uuid)) WITHOUT ROWID;
@@ -805,6 +808,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/worlds/:id/fork", post(post_fork))
         .route("/v1/worlds/:id/template", put(put_template))
         .route("/v1/worlds/:id/aux/:ns/:key", get(aux_get).put(aux_put))
+        .route("/v1/worlds/:id/reports", get(list_reports).post(world_report))
+        .route("/v1/worlds/:id/reports/:rid/resolve", post(resolve_report))
         .route("/v1/worlds/:id/bans", get(world_bans).post(world_ban))
         .route("/v1/worlds/:id/bans/:name", axum::routing::delete(world_unban))
         .route("/v1/templates", get(list_templates))
@@ -1238,4 +1243,89 @@ impl Gateway {
         }
         Ok(out)
     }
+}
+
+const REPORTS_OPEN_PER_REPORTER: i64 = 5;
+
+#[derive(Deserialize)]
+struct ReportReq {
+    name: String,
+    reason: String,
+}
+
+/// Any member can flag another member to the world owner; the target is never told.
+async fn world_report(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<ReportReq>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    gw.require_member(&world, &dev)?;
+    if b.reason.trim().is_empty() || b.reason.len() > 1000 {
+        return Err(ApiErr::BadRequest("BAD_REASON"));
+    }
+    let (me, _) = gw.device_player(&dev)?.ok_or(ApiErr::Unauthorized)?;
+    let (target, name) = gw.player_by_name(&b.name)?.ok_or(ApiErr::NotFound("NO_SUCH_USER"))?;
+    if target == me {
+        return Err(ApiErr::Conflict("CANNOT_TARGET_SELF"));
+    }
+    if !gw.is_member_uuid(&world, &target) {
+        return Err(ApiErr::NotFound("NOT_A_MEMBER"));
+    }
+    let db = |e: rusqlite::Error| ApiErr::Domain(Error::Db(e));
+    let open: i64 = gw.db.query_row("SELECT COUNT(*) FROM world_reports WHERE world_id=? AND reporter=? AND resolved_at IS NULL", params![world, me], |r| r.get(0)).map_err(db)?;
+    if open >= REPORTS_OPEN_PER_REPORTER {
+        return Err(ApiErr::Conflict("TOO_MANY_OPEN_REPORTS"));
+    }
+    gw.db
+        .execute("INSERT INTO world_reports(world_id, reporter, target, reason, created_at) VALUES(?,?,?,?,?)", params![world, me, target, b.reason, wall_s()])
+        .map_err(db)?;
+    let id = gw.db.last_insert_rowid();
+    gw.audit(&dev, "world.report", &world, &name, json!({ "report": id }));
+    s.hooks.emit("member.reported", &world, json!({ "report": id }));
+    Ok(Json(json!({ "id": id })))
+}
+
+async fn list_reports(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Query(q): Query<HashMap<String, String>>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_owner_or_admin(&s, &gw, &dev, &world)?;
+    let all = q.get("all").is_some_and(|v| v == "1");
+    let db = |e: rusqlite::Error| ApiErr::Domain(Error::Db(e));
+    let mut st = gw
+        .db
+        .prepare(
+            "SELECT r.id, rp.name, tp.name, r.reason, r.created_at, r.resolved_at, r.note FROM world_reports r \
+             JOIN players rp ON rp.uuid=r.reporter JOIN players tp ON tp.uuid=r.target \
+             WHERE r.world_id=? AND (?2 OR r.resolved_at IS NULL) ORDER BY r.id DESC LIMIT 200",
+        )
+        .map_err(db)?;
+    let rows = st
+        .query_map(params![world, all], |r| {
+            Ok(json!({ "id": r.get::<_, i64>(0)?, "reporter": r.get::<_, String>(1)?, "target": r.get::<_, String>(2)?, "reason": r.get::<_, String>(3)?,
+                       "created_at": r.get::<_, i64>(4)?, "resolved_at": r.get::<_, Option<i64>>(5)?, "note": r.get::<_, String>(6)? }))
+        })
+        .map_err(db)?;
+    Ok(Json(json!({ "reports": rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db)? })))
+}
+
+#[derive(Deserialize)]
+struct ResolveReq {
+    #[serde(default)]
+    note: String,
+}
+
+async fn resolve_report(State(s): State<Arc<AppState>>, h: HeaderMap, Path((world, id)): Path<(String, i64)>, Json(b): Json<ResolveReq>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_owner_or_admin(&s, &gw, &dev, &world)?;
+    if b.note.len() > 1000 {
+        return Err(ApiErr::BadRequest("BAD_NOTE"));
+    }
+    let n = gw
+        .db
+        .execute("UPDATE world_reports SET resolved_at=?, note=? WHERE id=? AND world_id=? AND resolved_at IS NULL", params![wall_s(), b.note, id, world])
+        .map_err(|e| ApiErr::Domain(Error::Db(e)))?;
+    if n == 0 {
+        return Err(ApiErr::NotFound("NO_SUCH_REPORT"));
+    }
+    gw.audit(&dev, "world.report.resolve", &world, &id.to_string(), json!({}));
+    Ok(Json(json!({ "ok": true })))
 }

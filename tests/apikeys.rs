@@ -293,3 +293,32 @@ async fn a_world_ban_removes_the_seat_and_blocks_invites_until_lifted() {
     let (c, _) = call(&app, "POST", "tok-b", "/v1/invites/redeem", json!({ "code": code })).await;
     assert_eq!(c, 200, "the unused invite works again after the ban is lifted");
 }
+
+#[tokio::test]
+async fn members_report_each_other_and_only_the_owner_reads_and_resolves() {
+    let app = app();
+    let path = "/v1/worlds/w1/reports";
+    let (c, v) = call(&app, "POST", "tok-b", path, json!({ "name": "bob", "reason": "x" })).await;
+    assert_eq!((c, v["error"].as_str()), (409, Some("CANNOT_TARGET_SELF")));
+    assert_eq!(call(&app, "POST", "tok-b", path, json!({ "name": "alice", "reason": "  " })).await.1["error"], "BAD_REASON");
+    assert_eq!(call(&app, "POST", "tok-b", path, json!({ "name": "nobody", "reason": "x" })).await.1["error"], "NO_SUCH_USER");
+    let (c, v) = call(&app, "POST", "tok-b", path, json!({ "name": "alice", "reason": "built over my base" })).await;
+    assert_eq!(c, 200, "{v}");
+    let id = v["id"].as_i64().unwrap();
+    assert_eq!(call(&app, "GET", "tok-b", path, Value::Null).await.0, 403, "reporters cannot read the queue");
+    let (_, v) = call(&app, "GET", "tok-a", path, Value::Null).await;
+    assert_eq!((v["reports"][0]["reporter"].as_str(), v["reports"][0]["target"].as_str()), (Some("bob"), Some("alice")));
+    for _ in 0..4 {
+        assert_eq!(call(&app, "POST", "tok-b", path, json!({ "name": "alice", "reason": "again" })).await.0, 200);
+    }
+    let (c, v) = call(&app, "POST", "tok-b", path, json!({ "name": "alice", "reason": "again" })).await;
+    assert_eq!((c, v["error"].as_str()), (409, Some("TOO_MANY_OPEN_REPORTS")));
+    assert_eq!(call(&app, "POST", "tok-b", &format!("{path}/{id}/resolve"), json!({})).await.0, 403);
+    assert_eq!(call(&app, "POST", "tok-a", &format!("{path}/{id}/resolve"), json!({ "note": "talked to them" })).await.0, 200);
+    assert_eq!(call(&app, "POST", "tok-a", &format!("{path}/{id}/resolve"), json!({})).await.0, 404, "resolving twice");
+    let (_, open) = call(&app, "GET", "tok-a", path, Value::Null).await;
+    assert_eq!(open["reports"].as_array().unwrap().len(), 4);
+    let (_, all) = call(&app, "GET", "tok-a", &format!("{path}?all=1"), Value::Null).await;
+    assert_eq!(all["reports"].as_array().unwrap().len(), 5);
+    assert!(all.to_string().contains("talked to them"));
+}
