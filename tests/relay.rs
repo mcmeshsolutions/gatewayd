@@ -23,6 +23,7 @@ struct Env {
     voice: SocketAddr,
     lease: String,
     base: String,
+    proxy: bool,
 }
 
 async fn http(app: &axum::Router, tok: &str, path: &str, body: Value) -> Value {
@@ -36,6 +37,10 @@ async fn env() -> Env {
 }
 
 async fn env_with(require_ticket: bool) -> Env {
+    env_full(require_ticket, false).await
+}
+
+async fn env_full(require_ticket: bool, proxy_protocol: bool) -> Env {
     let dir = std::env::temp_dir().join(format!("mcmesh-relay-{}-{}", std::process::id(), rand_id()));
     let mut g = Gateway::open(Connection::open_in_memory().unwrap(), Cas::open(dir).unwrap(), 0).unwrap();
     g.create_world("w1", "w", "1.21.1", "neoforge").unwrap();
@@ -51,7 +56,7 @@ async fn env_with(require_ticket: bool) -> Env {
     let j = http(&app, "tok-a", "/v1/worlds/w1/join", json!({"hw":{"tier":2,"score":5.0}})).await;
     let udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let voice = udp.local_addr().unwrap();
-    let relay = Relay::new(state, Some("w1"), Some(udp.clone()));
+    let relay = Relay::with_proxy_protocol(state, Some("w1"), Some(udp.clone()), proxy_protocol);
     let al = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gl = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (agents, guests) = (al.local_addr().unwrap(), gl.local_addr().unwrap());
@@ -65,6 +70,7 @@ async fn env_with(require_ticket: bool) -> Env {
         voice,
         lease: j["lease"]["id"].as_str().unwrap().into(),
         base: j["lease"]["base_rev"].as_str().unwrap().into(),
+        proxy: proxy_protocol,
     }
 }
 
@@ -103,7 +109,10 @@ async fn fake_server() -> (SocketAddr, SocketAddr) {
 }
 
 async fn run_agent(e: &Env, tok: &str, epoch: i64, mc: SocketAddr, voice: SocketAddr) -> Result<(), String> {
-    let s = TcpStream::connect(e.agents).await.unwrap();
+    let mut s = TcpStream::connect(e.agents).await.unwrap();
+    if e.proxy {
+        s.write_all(b"PROXY TCP4 192.0.2.10 10.0.0.1 41000 9000\r\n").await.unwrap();
+    }
     let (rd, mut wr) = s.into_split();
     let mut rd = BufReader::new(rd);
     let h = Hello { lease: e.lease.clone(), epoch, token: tok.into(), ts: None, proof: None };
@@ -176,7 +185,13 @@ async fn run_agent(e: &Env, tok: &str, epoch: i64, mc: SocketAddr, voice: Socket
 }
 
 async fn roundtrip(addr: SocketAddr, msg: &[u8]) -> Vec<u8> {
+    roundtrip_after(addr, &[], msg).await
+}
+
+/// Sends `prefix` then `msg`, and reads back only as many bytes as `msg` has (a prefix is consumed by the relay).
+async fn roundtrip_after(addr: SocketAddr, prefix: &[u8], msg: &[u8]) -> Vec<u8> {
     let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(prefix).await.unwrap();
     s.write_all(msg).await.unwrap();
     let mut out = vec![0; msg.len()];
     tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut out)).await.expect("timeout").unwrap();
@@ -345,4 +360,28 @@ async fn tunnel_hello_proof_accepts_valid_and_refuses_bad_or_stale() {
     tampered.epoch = 2;
     assert_eq!(hello_reply(&e, &tampered).await, ERR);
     assert_eq!(hello_reply(&e, &mk("tok-a", 1, now + 30)).await, HELLO_OK);
+}
+
+#[tokio::test]
+async fn a_proxy_header_is_consumed_and_the_payload_still_reaches_the_host() {
+    let e = env_full(false, true).await;
+    let (mc, vc) = fake_server().await;
+    run_agent(&e, "tok-a", 1, mc, vc).await.unwrap();
+    let v1 = b"PROXY TCP4 203.0.113.7 10.0.0.1 40000 25565\r\n";
+    assert_eq!(&roundtrip_after(e.guests, v1, b"hello via the vps").await[..], &b"HELLO VIA THE VPS"[..]);
+    let mut v2 = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+    v2.extend([0x21, 0x11, 0, 12, 198, 51, 100, 9, 10, 0, 0, 1, 0x9c, 0x40, 0x63, 0xdd]);
+    assert_eq!(&roundtrip_after(e.guests, &v2, b"v2 works too").await[..], &b"V2 WORKS TOO"[..]);
+}
+
+#[tokio::test]
+async fn without_a_proxy_header_the_connection_is_dropped_when_it_is_required() {
+    let e = env_full(false, true).await;
+    let (mc, vc) = fake_server().await;
+    run_agent(&e, "tok-a", 1, mc, vc).await.unwrap();
+    let mut s = TcpStream::connect(e.guests).await.unwrap();
+    s.write_all(b"direct connection, no header, long enough").await.unwrap();
+    let mut buf = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await.expect("closed in time").unwrap_or(0);
+    assert_eq!(n, 0, "nothing is relayed to a client that skipped the header");
 }

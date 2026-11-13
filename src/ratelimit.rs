@@ -61,6 +61,8 @@ pub struct Limiter {
     start: Instant,
     enabled: bool,
     scale: f64,
+    /// extra factor for the relay classes, for forwarders that hide the real address of UDP traffic
+    relay_scale: f64,
     trust_proxy: bool,
     map: Mutex<HashMap<(Class, String), Bucket>>,
 }
@@ -68,10 +70,12 @@ pub struct Limiter {
 impl Limiter {
     pub fn from_env() -> Self {
         let scale = std::env::var("MCMESH_RATE_SCALE").ok().and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0).unwrap_or(1.0);
+        let relay_scale = std::env::var("MCMESH_RELAY_RATE_SCALE").ok().and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0).unwrap_or(1.0);
         Limiter {
             start: Instant::now(),
             enabled: std::env::var("MCMESH_RATE").map_or(true, |v| v != "off"),
             scale,
+            relay_scale,
             trust_proxy: std::env::var("MCMESH_TRUST_PROXY").is_ok_and(|v| v == "1"),
             map: Mutex::new(HashMap::new()),
         }
@@ -87,7 +91,8 @@ impl Limiter {
     /// Err carries the seconds to wait.
     fn allow_at(&self, class: Class, key: &str, now: f64) -> Result<(), u64> {
         let (rate, burst) = spec(class);
-        let (rate, burst) = (rate * self.scale, burst * self.scale);
+        let factor = self.scale * if matches!(class, Class::Handshake | Class::Udp) { self.relay_scale } else { 1.0 };
+        let (rate, burst) = (rate * factor, burst * factor);
         let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
         let k = if map.len() >= MAX_KEYS && !map.contains_key(&(class, key.to_string())) { OVERFLOW_KEY } else { key };
         let b = map.entry((class, k.to_string())).or_insert(Bucket { tokens: burst, at: now });
@@ -175,7 +180,7 @@ mod tests {
     use super::*;
 
     fn lim() -> Limiter {
-        Limiter { start: Instant::now(), enabled: true, scale: 1.0, trust_proxy: false, map: Mutex::new(HashMap::new()) }
+        Limiter { start: Instant::now(), enabled: true, scale: 1.0, relay_scale: 1.0, trust_proxy: false, map: Mutex::new(HashMap::new()) }
     }
 
     #[test]
@@ -193,6 +198,19 @@ mod tests {
             slow.allow_at(Class::Auth, "x", 0.0).unwrap();
         }
         assert_eq!(slow.allow_at(Class::Auth, "x", 0.0), Err(10), "scale 0.1 means 0.1 per second");
+    }
+
+    #[test]
+    fn relay_scale_only_touches_the_relay_classes() {
+        let l = Limiter { relay_scale: 10.0, ..lim() };
+        for _ in 0..500 {
+            l.allow_at(Class::Handshake, "vps", 0.0).unwrap();
+        }
+        assert!(l.allow_at(Class::Handshake, "vps", 0.0).is_err());
+        for _ in 0..60 {
+            l.allow_at(Class::Auth, "vps", 0.0).unwrap();
+        }
+        assert!(l.allow_at(Class::Auth, "vps", 0.0).is_err(), "http classes keep their normal budget");
     }
 
     #[test]

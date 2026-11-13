@@ -47,16 +47,34 @@ pub struct Relay {
     /// Source addresses that recently passed the ticket gate; extra TCP channels only talk to them.
     known_ips: Mutex<HashMap<std::net::IpAddr, Instant>>,
     cur: Mutex<HashMap<String, Arc<Tunnel>>>,
+    /// MCMESH_PROXY_PROTOCOL=1: TCP listeners sit behind a forwarder that prepends a PROXY header with the real client address.
+    proxy_protocol: bool,
 }
 
 impl Relay {
     pub fn new(state: Arc<AppState>, default_world: Option<&str>, udp: Option<Arc<UdpSocket>>) -> Arc<Self> {
-        Arc::new(Relay { state, default_world: default_world.map(Into::into), udp, chan_udp: Mutex::new(HashMap::new()), known_ips: Mutex::new(HashMap::new()), cur: Mutex::new(HashMap::new()) })
+        Self::with_proxy_protocol(state, default_world, udp, std::env::var("MCMESH_PROXY_PROTOCOL").is_ok_and(|v| v == "1"))
+    }
+
+    pub fn with_proxy_protocol(state: Arc<AppState>, default_world: Option<&str>, udp: Option<Arc<UdpSocket>>, proxy_protocol: bool) -> Arc<Self> {
+        Arc::new(Relay { state, default_world: default_world.map(Into::into), udp, chan_udp: Mutex::new(HashMap::new()), known_ips: Mutex::new(HashMap::new()), cur: Mutex::new(HashMap::new()), proxy_protocol })
     }
 
     /// Per-source-address limit shared with the HTTP side, so a flood on any listener is cut at the same place.
     fn allow(&self, class: crate::ratelimit::Class, ip: std::net::IpAddr) -> bool {
         self.state.limiter.allow(class, &ip.to_string()).is_ok()
+    }
+
+    /// The client address of a fresh TCP connection: the socket peer, or the PROXY header's address when enabled.
+    /// None drops the connection (missing or invalid header, or too slow).
+    async fn peer(&self, sock: &mut TcpStream, from: SocketAddr) -> Option<SocketAddr> {
+        if !self.proxy_protocol {
+            return Some(from);
+        }
+        match tokio::time::timeout(Duration::from_secs(3), crate::proxyproto::read_header(sock)).await {
+            Ok(Ok(addr)) => Some(addr.unwrap_or(from)),
+            _ => None,
+        }
     }
 
     fn current(&self, world: &str) -> Option<Arc<Tunnel>> {
@@ -98,12 +116,14 @@ impl Relay {
 
 pub async fn serve_agents(relay: Arc<Relay>, l: TcpListener) {
     loop {
-        let Ok((sock, from)) = l.accept().await else { continue };
-        if !relay.allow(crate::ratelimit::Class::Handshake, from.ip()) {
-            continue;
-        }
+        let Ok((mut sock, from)) = l.accept().await else { continue };
         let r = relay.clone();
-        tokio::spawn(async move { agent_session(r, sock).await });
+        tokio::spawn(async move {
+            let Some(from) = r.peer(&mut sock, from).await else { return };
+            if r.allow(crate::ratelimit::Class::Handshake, from.ip()) {
+                agent_session(r, sock).await;
+            }
+        });
     }
 }
 
@@ -222,12 +242,14 @@ async fn agent_session(relay: Arc<Relay>, sock: TcpStream) {
 
 pub async fn serve_guests(relay: Arc<Relay>, l: TcpListener) {
     loop {
-        let Ok((sock, from)) = l.accept().await else { continue };
-        if !relay.allow(crate::ratelimit::Class::Handshake, from.ip()) {
-            continue;
-        }
+        let Ok((mut sock, from)) = l.accept().await else { continue };
         let r = relay.clone();
-        tokio::spawn(async move { guest_session(r, sock).await });
+        tokio::spawn(async move {
+            let Some(from) = r.peer(&mut sock, from).await else { return };
+            if r.allow(crate::ratelimit::Class::Handshake, from.ip()) {
+                guest_session(r, sock, from).await;
+            }
+        });
     }
 }
 
@@ -335,14 +357,14 @@ async fn status_reply(sock: &mut TcpStream, first: &[u8], motd: &str) {
     }
 }
 
-async fn guest_session(relay: Arc<Relay>, mut sock: TcpStream) {
+async fn guest_session(relay: Arc<Relay>, mut sock: TcpStream, peer: SocketAddr) {
     let (first, world) = if relay.state.auth.require_ticket {
         match gate(&relay, &mut sock).await {
             Some((b, w)) => {
-                if let Ok(a) = sock.peer_addr() {
+                {
                     let mut k = lock(&relay.known_ips);
                     k.retain(|_, t| t.elapsed() < KNOWN_IP_TTL);
-                    k.insert(a.ip(), Instant::now());
+                    k.insert(peer.ip(), Instant::now());
                 }
                 (Some(b), w)
             }
@@ -436,12 +458,13 @@ pub async fn serve_voice(relay: Arc<Relay>, sock: Arc<UdpSocket>) {
 /// Extra TCP channel (another mod's port): only addresses that already passed the ticket gate get through.
 pub async fn serve_channel_tcp(relay: Arc<Relay>, chan: u8, l: TcpListener) {
     loop {
-        let Ok((sock, from)) = l.accept().await else { continue };
-        if !relay.allow(crate::ratelimit::Class::Handshake, from.ip()) {
-            continue;
-        }
+        let Ok((mut sock, from)) = l.accept().await else { continue };
         let r = relay.clone();
         tokio::spawn(async move {
+            let Some(from) = r.peer(&mut sock, from).await else { return };
+            if !r.allow(crate::ratelimit::Class::Handshake, from.ip()) {
+                return;
+            }
             if r.state.auth.require_ticket {
                 let ok = lock(&r.known_ips).get(&from.ip()).is_some_and(|t| t.elapsed() < KNOWN_IP_TTL);
                 if !ok {
