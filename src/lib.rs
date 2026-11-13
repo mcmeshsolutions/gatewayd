@@ -3,6 +3,7 @@ pub mod cas;
 pub mod maintenance;
 pub mod manifest;
 pub mod mcproto;
+pub mod ops;
 pub mod chain;
 pub mod lease;
 #[cfg(test)]

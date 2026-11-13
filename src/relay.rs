@@ -149,8 +149,10 @@ async fn agent_session(relay: Arc<Relay>, sock: TcpStream) {
     let since = Instant::now();
     let host = relay.state.gw().lease_device(&t.lease).ok().flatten().unwrap_or_default();
     eprintln!("tunnel up: world={} host_device={host} epoch={}", t.world, t.epoch);
+    let meter = (relay.state.clone(), t.world.clone());
     let writer = tokio::spawn(async move {
         while let Some(f) = up_rx.recv().await {
+            meter.0.relay_meter(&meter.1, f.data.len() as u64, 0);
             if write_frame(&mut wr, &f).await.is_err() {
                 break;
             }
@@ -178,6 +180,9 @@ async fn agent_session(relay: Arc<Relay>, sock: TcpStream) {
             },
             _ = t.kill.notified() => { reason = "superseded or lease ended".to_string(); break }
         };
+        if matches!(f.ty, DATA | UDP | CUDP) {
+            relay.state.relay_meter(&t.world, 0, f.data.len() as u64);
+        }
         match f.ty {
             DATA => {
                 let tx = lock(&t.streams).get(&f.id).cloned();

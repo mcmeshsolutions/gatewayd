@@ -10,7 +10,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: gatewayd serve\n       gatewayd create-world <id> <name> <mc_version> <loader>\n       \
          gatewayd add-member <world> <mc_uuid> <name> <device> <ADMIN|HOST_ELIGIBLE|CLIENT_ONLY> <token>\n         gatewayd grant <world> <name> <ADMIN|HOST_ELIGIBLE|CLIENT_ONLY>\n         gatewayd drop-token <token>\n         gatewayd revisions <world>\n         gatewayd status\n         gatewayd scrub\n         gatewayd backup <dir>\n         gatewayd set-pack <world> <pack_id>\n         gatewayd revert <world> <revision>\n\
-         env: MCMESH_DB (default mcmesh.db), MCMESH_CAS (default ./cas),\n         relay (needs MCMESH_WORLD, or MCMESH_RELAY=all to serve every world; MCMESH_WORLD then only picks the UDP and ticketless default): MCMESH_RELAY_ADDR (127.0.0.1:9000), MCMESH_PUBLIC_ADDR (0.0.0.0:25565), MCMESH_VOICE_ADDR (0.0.0.0:24454)\n          MCMESH_ADDR (default 127.0.0.1:8080)\n          MCMESH_CREATE=open lets any logged-in player create worlds\n          MCMESH_ADVERTISE=host:port tells clients where guests connect (with MCMESH_WORLD)"
+         env: MCMESH_DB (default mcmesh.db), MCMESH_CAS (default ./cas),\n         relay (needs MCMESH_WORLD, or MCMESH_RELAY=all to serve every world; MCMESH_WORLD then only picks the UDP and ticketless default): MCMESH_RELAY_ADDR (127.0.0.1:9000), MCMESH_PUBLIC_ADDR (0.0.0.0:25565), MCMESH_VOICE_ADDR (0.0.0.0:24454)\n          MCMESH_ADDR (default 127.0.0.1:8080)\n          MCMESH_CREATE=open lets any logged-in player create worlds\n          MCMESH_ADVERTISE=host:port tells clients where guests connect (with MCMESH_WORLD)\n          MCMESH_METRICS_TOKEN=secret enables GET /metrics (Prometheus) behind that bearer token\n          MCMESH_WEBHOOKS=url,url posts gateway events as JSON; MCMESH_WEBHOOK_SECRET signs them"
     );
     std::process::exit(2)
 }
@@ -59,7 +59,8 @@ async fn main() {
             }
         }
         ["status"] => {
-            for l in gw.status().expect("status") {
+            gw.ops_init().expect("init ops tables");
+            for l in gw.status().expect("status").into_iter().chain(gw.ops_status().expect("status")) {
                 println!("{l}");
             }
         }
@@ -101,6 +102,9 @@ async fn main() {
                 require_ticket: std::env::var("MCMESH_GUESTS").map_or(true, |v| v != "open"),
                 allow_create: std::env::var("MCMESH_CREATE").is_ok_and(|v| v == "open"),
                 advertise: std::env::var("MCMESH_ADVERTISE").unwrap_or_default(),
+                metrics_token: std::env::var("MCMESH_METRICS_TOKEN").ok().filter(|t| !t.is_empty()),
+                webhooks: std::env::var("MCMESH_WEBHOOKS").unwrap_or_default().split(',').map(str::trim).filter(|u| !u.is_empty()).map(String::from).collect(),
+                webhook_secret: std::env::var("MCMESH_WEBHOOK_SECRET").ok().filter(|t| !t.is_empty()),
             };
             let state = AppState::with_auth(gw, auth);
             let default_world = std::env::var("MCMESH_WORLD").ok();
