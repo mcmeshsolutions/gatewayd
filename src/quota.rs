@@ -136,25 +136,33 @@ impl Gateway {
     }
 
     pub(crate) fn check_storage(&self, world: &str) -> Result<()> {
+        self.check_storage_with(world, |limit| limit)
+    }
+
+    /// Checked before a blob is written. A host that is over its limit must still be able to upload the blobs of its
+    /// final commit, which is never refused, so the line here sits at twice the limit plus 256 MiB: it stops a runaway
+    /// host from filling the disk without ever blocking a normal shutdown.
+    pub(crate) fn check_upload_headroom(&self, world: &str) -> Result<()> {
+        self.check_storage_with(world, |limit| limit.saturating_mul(2).saturating_add(256 << 20))
+    }
+
+    fn check_storage_with(&self, world: &str, line: impl Fn(u64) -> u64) -> Result<()> {
         if let Some(limit) = self.limits(Scope::World, world)?.storage_bytes {
             let used = self.world_usage(world)?;
-            if used > limit {
+            if used > line(limit) {
                 return Err(Error::Quota(QuotaHit { code: "QUOTA_STORAGE_WORLD", limit, used }));
             }
         }
         let Some(owner) = self.owner_of(world)? else { return Ok(()) };
         if let Some(limit) = self.limits(Scope::User, &owner)?.storage_bytes {
             let used = self.user_usage(&owner)?.0;
-            if used > limit {
+            if used > line(limit) {
                 return Err(Error::Quota(QuotaHit { code: "QUOTA_STORAGE_USER", limit, used }));
             }
         }
         Ok(())
     }
 
-    /// Marks revisions outside each world's retention as pruned, then deletes blobs nothing needs any more.
-    /// A blob survives when any unpruned revision of any world reaches it, a WAL frame names it, or it was written
-    /// less than `grace_s` ago. If one retained tree cannot be read, nothing is pruned or deleted.
     /// Drops usage rows of blobs no longer on disk.
     fn forget_missing_blobs(&mut self) -> Result<()> {
         let hashes: Vec<Vec<u8>> = {
@@ -177,6 +185,9 @@ impl Gateway {
         Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM quotas)", [], |r| r.get::<_, bool>(0))?)
     }
 
+    /// Marks revisions outside each world's retention as pruned, then deletes blobs nothing needs any more.
+    /// A blob survives when any unpruned revision of any world reaches it, a WAL frame names it, or it was written
+    /// less than `grace_s` ago. If one retained tree cannot be read, nothing is pruned or deleted.
     pub fn retention_sweep(&mut self, grace_s: u64) -> Result<SweepReport> {
         let mut rep = SweepReport::default();
         let now = wall_s();
@@ -382,6 +393,26 @@ mod tests {
         assert_ne!(head, gr.base_rev, "recovery made a revision");
         let key = Key { dim: "minecraft:overworld".into(), kind: Kind::Region, cx: 5, cz: 0 };
         assert_eq!(manifest::lookup(g.cas(), g.revision_root(&head).unwrap(), &key).unwrap(), Some(h));
+    }
+
+    #[test]
+    fn uploads_stop_at_twice_the_limit_plus_headroom_not_at_the_limit() {
+        let mut g = gw();
+        let (gr, mut w) = host(&mut g, 0);
+        save(&mut g, &gr, &mut w, 0, 1);
+        g.commit(&gr.lease_id, gr.epoch, &gr.base_rev, CommitKind::Autosave, false, 1).unwrap();
+        let used = g.world_usage("w").unwrap();
+        assert!(used > 0);
+        g.set_limits(Scope::World, "w", &Limits { storage_bytes: Some(used / 2), ..Default::default() }).unwrap();
+        assert!(matches!(g.check_storage("w"), Err(Error::Quota(_))), "over the limit: autosaves are refused");
+        g.check_upload_headroom("w").unwrap();
+        // a limit of zero and 300 MiB of usage is past the 256 MiB headroom
+        g.db().execute("UPDATE blob_world SET size=size+?", params![300i64 << 20]).unwrap();
+        g.set_limits(Scope::World, "w", &Limits { storage_bytes: Some(0), ..Default::default() }).unwrap();
+        match g.check_upload_headroom("w") {
+            Err(Error::Quota(h)) => assert_eq!(h.code, "QUOTA_STORAGE_WORLD"),
+            other => panic!("expected a quota refusal, got {other:?}"),
+        }
     }
 
     #[test]

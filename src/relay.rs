@@ -13,6 +13,8 @@ use tokio::sync::{mpsc, Notify};
 const MAX_PEERS: usize = 4096;
 const KEEPALIVE: Duration = Duration::from_secs(10);
 const KNOWN_IP_TTL: Duration = Duration::from_secs(12 * 3600);
+const MAX_PRE_AUTH: usize = 1024;
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(20);
 const PEER_IDLE: Duration = Duration::from_secs(60);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -49,6 +51,8 @@ pub struct Relay {
     cur: Mutex<HashMap<String, Arc<Tunnel>>>,
     /// MCMESH_PROXY_PROTOCOL=1: TCP listeners sit behind a forwarder that prepends a PROXY header with the real client address.
     proxy_protocol: bool,
+    /// Guests that have connected but not yet passed the ticket gate; bounded so slow or silent connections cannot pile up.
+    pre_auth: Arc<tokio::sync::Semaphore>,
 }
 
 impl Relay {
@@ -57,7 +61,7 @@ impl Relay {
     }
 
     pub fn with_proxy_protocol(state: Arc<AppState>, default_world: Option<&str>, udp: Option<Arc<UdpSocket>>, proxy_protocol: bool) -> Arc<Self> {
-        Arc::new(Relay { state, default_world: default_world.map(Into::into), udp, chan_udp: Mutex::new(HashMap::new()), known_ips: Mutex::new(HashMap::new()), cur: Mutex::new(HashMap::new()), proxy_protocol })
+        Arc::new(Relay { state, default_world: default_world.map(Into::into), udp, chan_udp: Mutex::new(HashMap::new()), known_ips: Mutex::new(HashMap::new()), cur: Mutex::new(HashMap::new()), proxy_protocol, pre_auth: Arc::new(tokio::sync::Semaphore::new(MAX_PRE_AUTH)) })
     }
 
     /// Per-source-address limit shared with the HTTP side, so a flood on any listener is cut at the same place.
@@ -358,8 +362,12 @@ async fn status_reply(sock: &mut TcpStream, first: &[u8], motd: &str) {
 }
 
 async fn guest_session(relay: Arc<Relay>, mut sock: TcpStream, peer: SocketAddr) {
+    let Ok(permit) = relay.pre_auth.clone().try_acquire_owned() else {
+        eprintln!("relay: guest turned away, too many unauthenticated handshakes in flight");
+        return;
+    };
     let (first, world) = if relay.state.auth.require_ticket {
-        match gate(&relay, &mut sock).await {
+        match tokio::time::timeout(HANDSHAKE_DEADLINE, gate(&relay, &mut sock)).await.ok().flatten() {
             Some((b, w)) => {
                 {
                     let mut k = lock(&relay.known_ips);
@@ -377,6 +385,7 @@ async fn guest_session(relay: Arc<Relay>, mut sock: TcpStream, peer: SocketAddr)
         let Some(w) = relay.default_world.clone() else { return };
         (None, w)
     };
+    drop(permit);
     let tunnel = relay.current(&world).filter(|t| relay.live(t));
     let Some(t) = tunnel else {
         eprintln!("relay: guest turned away, no live host tunnel for {world}");

@@ -554,16 +554,21 @@ async fn client_logs(State(s): State<Arc<AppState>>, h: HeaderMap, body: Bytes) 
     let text = String::from_utf8_lossy(&body);
     match std::env::var("MCMESH_LOGS") {
         Ok(dir) => {
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(std::path::Path::new(&dir).join(format!("{name}.log")))
-                .map_err(|_| ApiErr::BadRequest("LOG_IO"))?;
+            let path = std::path::Path::new(&dir).join(format!("{name}.log"));
+            rotate_log(&path, std::env::var("MCMESH_LOG_MAX_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(5 << 20));
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|_| ApiErr::BadRequest("LOG_IO"))?;
             let _ = f.write_all(text.as_bytes());
         }
         Err(_) => text.lines().for_each(|l| eprintln!("[{name}] {l}")),
     }
     Ok(Json(json!({ "ok": true })))
+}
+
+/// One previous file is kept, so a player never takes more than twice `max` on disk.
+pub(crate) fn rotate_log(path: &std::path::Path, max: u64) {
+    if std::fs::metadata(path).is_ok_and(|m| m.len() >= max) {
+        let _ = std::fs::rename(path, path.with_extension("log.1"));
+    }
 }
 
 async fn blob_put(State(s): State<Arc<AppState>>, h: HeaderMap, Path(hash): Path<String>, body: Bytes) -> R {
@@ -574,6 +579,7 @@ async fn blob_put(State(s): State<Arc<AppState>>, h: HeaderMap, Path(hash): Path
     if crate::cas::sha256(&body) != want {
         return Err(ApiErr::BadRequest("HASH_MISMATCH"));
     }
+    gw.check_upload_headroom(&world)?;
     gw.cas().put(&body).map_err(|e| ApiErr::Domain(e.into()))?;
     gw.tag_blob(&world, &want)?;
     gw.meter(&world, "blob_put_bytes", body.len() as u64);
@@ -762,5 +768,22 @@ mod core_wiring_tests {
         let (c, _) = post(format!("/v1/leases/{lease}/heartbeat"), json!({ "epoch": 1 })).await;
         assert_eq!(c, 200);
         assert_eq!(state.gw().lease_players("w1").unwrap(), Some(3));
+    }
+
+    #[test]
+    fn log_files_rotate_once_and_stay_bounded() {
+        let dir = std::env::temp_dir().join(format!("mcmesh-logrot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("alice.log");
+        std::fs::write(&f, vec![b'a'; 100]).unwrap();
+        rotate_log(&f, 1000);
+        assert_eq!(std::fs::metadata(&f).unwrap().len(), 100, "under the cap nothing moves");
+        std::fs::write(&f, vec![b'b'; 1000]).unwrap();
+        rotate_log(&f, 1000);
+        assert!(!f.exists());
+        assert_eq!(std::fs::metadata(dir.join("alice.log.1")).unwrap().len(), 1000);
+        std::fs::write(&f, vec![b'c'; 2000]).unwrap();
+        rotate_log(&f, 1000);
+        assert_eq!(std::fs::metadata(dir.join("alice.log.1")).unwrap().len(), 2000, "the older file is replaced, not kept");
     }
 }

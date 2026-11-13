@@ -385,3 +385,23 @@ async fn without_a_proxy_header_the_connection_is_dropped_when_it_is_required() 
     let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await.expect("closed in time").unwrap_or(0);
     assert_eq!(n, 0, "nothing is relayed to a client that skipped the header");
 }
+
+#[tokio::test]
+async fn a_guest_that_drips_bytes_is_cut_at_the_handshake_deadline() {
+    let e = env_with(true).await;
+    let (mc, vc) = fake_server().await;
+    run_agent(&e, "tok-a", 1, mc, vc).await.unwrap();
+    let mut s = TcpStream::connect(e.guests).await.unwrap();
+    let started = std::time::Instant::now();
+    // never completes a packet, but sends often enough to defeat the per-read timeout
+    let closed = async {
+        loop {
+            if s.write_all(&[0x80]).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(40), closed).await.expect("relay must cut the connection");
+    assert!(started.elapsed() < Duration::from_secs(30), "cut near the 20 s deadline, not later");
+}
