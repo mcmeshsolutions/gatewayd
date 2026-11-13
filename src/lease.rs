@@ -33,6 +33,9 @@ pub enum Error {
     Rejected(String),
     PackMismatch,
     Store(String),
+    Quota(crate::quota::QuotaHit),
+    /// the retention sweep dropped this revision's content
+    Pruned,
 }
 
 impl From<rusqlite::Error> for Error {
@@ -182,6 +185,7 @@ impl Gateway {
         let _ = db.execute("ALTER TABLE worlds ADD COLUMN mods_json TEXT", []);
         let _ = db.execute("ALTER TABLE revisions ADD COLUMN chain_hash BLOB", []);
         let _ = db.execute("ALTER TABLE worlds ADD COLUMN pack_id TEXT NOT NULL DEFAULT 'default'", []);
+        crate::quota::migrate(&db, &cas)?;
         db.execute("UPDATE sessions SET last_used=? WHERE last_used IS NULL", params![unix_s()])?;
         db.execute("DELETE FROM sessions WHERE last_used>0 AND last_used<?", params![unix_s() - session_ttl_s()])?;
         let mut g = Gateway {
@@ -246,7 +250,13 @@ impl Gateway {
         let mut seed = [0u8; 6];
         getrandom::getrandom(&mut seed).map_err(|_| Error::Rand)?;
         let id = format!("w-{}", seed.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        let owner: Option<String> =
+            self.db.query_row("SELECT player_uuid FROM devices WHERE id=?", params![device], |r| r.get(0)).optional()?;
+        if let Some(o) = &owner {
+            self.check_world_count(o)?;
+        }
         self.create_world(&id, name, mc, loader)?;
+        self.db.execute("UPDATE worlds SET owner_uuid=? WHERE id=?", params![owner, id])?;
         self.db.execute(
             "INSERT INTO members(world_id,player_uuid,role) SELECT ?, player_uuid, 'ADMIN' FROM devices WHERE id=?",
             params![id, device],
@@ -470,6 +480,7 @@ impl Gateway {
                 if !eligible {
                     return Ok(Join::Wait { phase: "NO_HOST".into() });
                 }
+                self.check_storage(world)?;
                 let g = self.grant(world, device, hw.tier, hw.score, now)?;
                 self.set_state(world, "LOCKED", None)?;
                 self.failed.remove(world);
@@ -524,7 +535,11 @@ impl Gateway {
     }
 
     pub fn revision_root(&self, rev: &str) -> Result<Hash> {
-        let b: Vec<u8> = self.db.query_row("SELECT root_hash FROM revisions WHERE id=?", params![rev], |r| r.get(0))?;
+        let (b, pruned): (Vec<u8>, bool) =
+            self.db.query_row("SELECT root_hash, pruned FROM revisions WHERE id=?", params![rev], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        if pruned {
+            return Err(Error::Pruned);
+        }
         b.try_into().map_err(|_| Error::Store("bad root hash length".into()))
     }
 
@@ -563,6 +578,10 @@ impl Gateway {
         let (world, device) = self.require_live(lease, epoch)?;
         if self.head(&world)? != base_rev {
             return Err(Error::HeadMoved);
+        }
+        // a final commit is never refused for quota: the host is leaving and this is the only copy of its last minutes
+        if !last {
+            self.check_storage(&world)?;
         }
         let (changes, barrier) = self.wal_pending(lease)?;
         let rev = self.new_revision(&world, lease, kind.as_str(), &changes)?;

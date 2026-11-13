@@ -43,7 +43,7 @@ const MAX_PENDING: i64 = 200_000;
 impl Gateway {
     /// Verifies the HMAC chain frame by frame and stores them. All or nothing; returns the next expected seq.
     pub fn wal_append(&mut self, lease: &str, epoch: i64, frames: &[Frame]) -> Result<u64> {
-        self.require_live(lease, epoch)?;
+        let (world, _) = self.require_live(lease, epoch)?;
         let key: Vec<u8> = self.db.query_row("SELECT hmac_key FROM leases WHERE id=?", params![lease], |r| r.get(0))?;
         let tx = self.db.transaction()?;
         let (mut next, prev): (i64, Vec<u8>) = tx
@@ -68,6 +68,10 @@ impl Gateway {
             let ch = change(&f.op, &f.dim, f.cx, f.cz, f.hash).ok_or(Error::BadFrame("unknown op"))?;
             if matches!(ch, Some(Change::Put(..) | Change::AuxPut(..))) && !self.cas.has(&f.hash) {
                 return Err(Error::MissingBlob);
+            }
+            // the host may have skipped the upload because another world already had the blob
+            if matches!(ch, Some(Change::Put(..) | Change::AuxPut(..))) {
+                tag(&tx, &self.cas, &world, &f.hash)?;
             }
             tx.execute(
                 "INSERT INTO chunk_wal(lease_id,seq,op,dim,cx,cz,hash) VALUES(?,?,?,?,?,?,?)",
@@ -143,8 +147,7 @@ impl Gateway {
     }
 
     pub fn tag_blob(&self, world: &str, hash: &[u8; 32]) -> Result<()> {
-        self.db.execute("INSERT OR IGNORE INTO blob_world(hash, world_id) VALUES(?,?)", params![&hash[..], world])?;
-        Ok(())
+        Ok(tag(&self.db, &self.cas, world, hash)?)
     }
 
     pub fn blob_visible(&self, device: &str, hash: &[u8; 32]) -> Result<bool> {
@@ -163,4 +166,12 @@ impl Gateway {
     pub fn cas(&self) -> &crate::cas::Cas {
         &self.cas
     }
+}
+
+fn tag(db: &rusqlite::Connection, cas: &crate::cas::Cas, world: &str, hash: &Hash) -> rusqlite::Result<()> {
+    db.execute(
+        "INSERT OR IGNORE INTO blob_world(hash, world_id, size) VALUES(?,?,?)",
+        params![&hash[..], world, cas.size(hash).unwrap_or(0) as i64],
+    )?;
+    Ok(())
 }
