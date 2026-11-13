@@ -26,11 +26,16 @@ pub struct AuthCfg {
     pub allow_create: bool,
     /// host:port guests should connect to; empty when the gateway has no relay.
     pub advertise: String,
+    /// Bearer token for /metrics; the route answers 404 while unset.
+    pub metrics_token: Option<String>,
+    pub webhooks: Vec<String>,
+    /// Signs webhook bodies (x-mesh-signature) when set.
+    pub webhook_secret: Option<String>,
 }
 
 impl Default for AuthCfg {
     fn default() -> Self {
-        AuthCfg { session_url: "https://sessionserver.mojang.com".into(), mojang: true, key: true, require_ticket: true, allow_create: false, advertise: String::new() }
+        AuthCfg { session_url: "https://sessionserver.mojang.com".into(), mojang: true, key: true, require_ticket: true, allow_create: false, advertise: String::new(), metrics_token: None, webhooks: Vec::new(), webhook_secret: None }
     }
 }
 
@@ -165,9 +170,12 @@ pub(crate) struct MojangReq {
     name: String,
 }
 
-fn finish(r: Result<Result<LoginOk, &'static str>, Error>) -> Result<Json<Value>, ApiErr> {
+fn finish(s: &AppState, r: Result<Result<LoginOk, &'static str>, Error>) -> Result<Json<Value>, ApiErr> {
     match r? {
-        Ok(ok) => Ok(Json(json!({ "token": ok.token, "uuid": ok.uuid, "name": ok.name }))),
+        Ok(ok) => {
+            s.gw().meter("", "logins", 1);
+            Ok(Json(json!({ "token": ok.token, "uuid": ok.uuid, "name": ok.name })))
+        }
         Err(code) => Err(ApiErr::Conflict(code)),
     }
 }
@@ -197,7 +205,7 @@ pub(crate) async fn mojang(State(s): State<Arc<AppState>>, Json(req): Json<Mojan
     let raw: Vec<u8> = (0..16).map(|i| u8::from_str_radix(&id[i * 2..i * 2 + 2], 16).unwrap_or(0)).collect();
     let uuid = fmt_uuid(&raw);
     let r = s.gw().login_identity(IdKind::Mojang, &uuid, real, None);
-    finish(r)
+    finish(&s, r)
 }
 
 #[derive(Deserialize)]
@@ -229,7 +237,7 @@ pub(crate) async fn key(State(s): State<Arc<AppState>>, Json(req): Json<KeyReq>)
     vk.verify_strict(&msg, &sig).map_err(|_| ApiErr::Unauthorized)?;
     let uuid = key_uuid(&pk);
     let r = s.gw().login_identity(IdKind::Key, &uuid, &req.name, Some(&pk));
-    finish(r)
+    finish(&s, r)
 }
 
 const TICKET_TTL: Duration = Duration::from_secs(60);
@@ -265,6 +273,7 @@ pub(crate) async fn ticket(
         let dev = crate::server::auth(&gw, &h)?;
         gw.require_member(&world, &dev)?;
         gw.require_pack(&world, &crate::server::req_pack(&h)?)?;
+        gw.meter(&world, "tickets", 1);
         gw.device_player(&dev)?.ok_or(ApiErr::Unauthorized)?
     };
     let t = rand_b64(24).map_err(ApiErr::from)?;

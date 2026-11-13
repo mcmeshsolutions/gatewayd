@@ -26,6 +26,9 @@ pub struct AppState {
     pub(crate) live_worlds: Mutex<std::collections::HashSet<String>>,
     /// Host's world download progress by lease id: (done, total, when reported).
     pub(crate) sync: Mutex<std::collections::HashMap<String, (u64, u64, Instant)>>,
+    pub(crate) hooks: crate::ops::Hooks,
+    /// Relayed bytes by world since the last tick: (to host, to guests).
+    relay_bytes: Mutex<std::collections::HashMap<String, (u64, u64)>>,
 }
 
 impl AppState {
@@ -34,7 +37,24 @@ impl AppState {
     }
 
     pub fn with_auth(gw: Gateway, auth: crate::auth::AuthCfg) -> Arc<Self> {
-        Arc::new(AppState { gw: Mutex::new(gw), start: Instant::now(), auth, challenges: Mutex::new(Default::default()), tickets: Mutex::new(Default::default()), panel_codes: Mutex::new(Default::default()), live_worlds: Mutex::new(Default::default()), sync: Mutex::new(Default::default()) })
+        if let Err(e) = gw.ops_init() {
+            eprintln!("ops init failed: {e:?}");
+        }
+        let hooks = crate::ops::Hooks::new(&auth.webhooks, auth.webhook_secret.clone());
+        Arc::new(AppState { gw: Mutex::new(gw), start: Instant::now(), auth, challenges: Mutex::new(Default::default()), tickets: Mutex::new(Default::default()), panel_codes: Mutex::new(Default::default()), live_worlds: Mutex::new(Default::default()), sync: Mutex::new(Default::default()), hooks, relay_bytes: Mutex::new(Default::default()) })
+    }
+    pub(crate) fn uptime_s(&self) -> u64 {
+        self.start.elapsed().as_secs()
+    }
+    /// Called per relayed frame, so it only touches memory; tick() writes the sums out.
+    pub fn relay_meter(&self, world: &str, to_host: u64, to_guests: u64) {
+        let mut m = self.relay_bytes.lock().unwrap_or_else(|e| e.into_inner());
+        match m.get_mut(world) {
+            Some(e) => *e = (e.0 + to_host, e.1 + to_guests),
+            None => {
+                m.insert(world.to_string(), (to_host, to_guests));
+            }
+        }
     }
     fn now(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
@@ -70,7 +90,13 @@ impl AppState {
 
     pub fn tick(&self) {
         let now = self.now();
-        if let Err(e) = self.gw().tick(now) {
+        let relayed = std::mem::take(&mut *self.relay_bytes.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut gw = self.gw();
+        for (world, (up, down)) in relayed {
+            gw.meter(&world, "relay_to_host_bytes", up);
+            gw.meter(&world, "relay_to_guest_bytes", down);
+        }
+        if let Err(e) = gw.tick(now) {
             eprintln!("tick failed: {e:?}");
         }
     }
@@ -80,6 +106,7 @@ pub(crate) enum ApiErr {
     Unauthorized,
     Forbidden(&'static str),
     Conflict(&'static str),
+    Gone(&'static str),
     BadRequest(&'static str),
     Domain(Error),
 }
@@ -96,6 +123,7 @@ impl IntoResponse for ApiErr {
             ApiErr::Unauthorized => (StatusCode::UNAUTHORIZED, "UNAUTHORIZED"),
             ApiErr::Forbidden(m) => (StatusCode::FORBIDDEN, m),
             ApiErr::Conflict(m) => (StatusCode::CONFLICT, m),
+            ApiErr::Gone(m) => (StatusCode::GONE, m),
             ApiErr::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApiErr::Domain(Error::NotMember) => (StatusCode::FORBIDDEN, "NOT_MEMBER"),
             ApiErr::Domain(Error::NoSuchWorld) => (StatusCode::NOT_FOUND, "NO_SUCH_WORLD"),
@@ -196,6 +224,7 @@ async fn create_world(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): Jso
     let pack = req_pack(&h)?;
     let id = gw.create_world_for(&dev, &b.name, &b.mc_version, &b.loader)?;
     gw.set_pack(&id, &pack)?;
+    s.hooks.emit("world.created", &id, json!({ "name": b.name }));
     Ok(Json(json!({ "id": id, "base_rev": format!("{id}:R_0000") })))
 }
 
@@ -232,6 +261,8 @@ async fn list_worlds(
 #[derive(Deserialize)]
 struct InviteReq {
     role: Option<String>,
+    /// Seconds until the code stops working. Omitted: 7 days. 0: never.
+    expires_in_s: Option<i64>,
 }
 
 async fn create_invite(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<InviteReq>) -> R {
@@ -242,8 +273,14 @@ async fn create_invite(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world)
         Some("HOST_ELIGIBLE") => crate::lease::Role::HostEligible,
         _ => return Err(ApiErr::BadRequest("BAD_ROLE")),
     };
+    let ttl = b.expires_in_s.unwrap_or(crate::ops::INVITE_TTL_S);
+    if !(0..=crate::ops::INVITE_MAX_TTL_S).contains(&ttl) {
+        return Err(ApiErr::BadRequest("BAD_EXPIRY"));
+    }
     let code = gw.create_invite(&dev, &world, role)?;
-    Ok(Json(json!({ "code": code })))
+    let expires_at = (ttl > 0).then(|| crate::lease::wall_s() + ttl);
+    gw.set_invite_expiry(&code, expires_at)?;
+    Ok(Json(json!({ "code": code, "expires_at": expires_at, "link": format!("/invite/{code}") })))
 }
 
 #[derive(Deserialize)]
@@ -254,7 +291,13 @@ struct RedeemReq {
 async fn redeem_invite(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): Json<RedeemReq>) -> R {
     let mut gw = s.gw();
     let dev = auth(&gw, &h)?;
+    if let Some(Err(())) = gw.invite_info(b.code.trim())? {
+        return Err(ApiErr::Gone("INVITE_EXPIRED"));
+    }
     let world = gw.redeem_invite(&dev, b.code.trim())?;
+    gw.meter(&world, "invites_redeemed", 1);
+    let player = gw.device_player(&dev)?.map(|p| p.1);
+    s.hooks.emit("member.joined", &world, json!({ "player": player }));
     Ok(Json(json!({ "world_id": world })))
 }
 
@@ -268,8 +311,14 @@ async fn join(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<St
     if let Some(b) = b.hw.bench.as_ref().filter(|v| v.is_object() && v.to_string().len() <= 2048) {
         gw.record_bench(&dev, b)?;
     }
+    gw.meter(&world, "joins", 1);
     Ok(Json(match gw.join(&world, &dev, hw, now)? {
-        Join::Host(g) => json!({ "decision": "HOST", "lease": lease_json(&g) }),
+        Join::Host(g) => {
+            gw.meter(&world, "host_grants", 1);
+            let player = gw.device_player(&dev)?.map(|p| p.1);
+            s.hooks.emit("host.started", &world, json!({ "player": player, "epoch": g.epoch }));
+            json!({ "decision": "HOST", "lease": lease_json(&g) })
+        }
         Join::Guest { epoch, host_device } => json!({ "decision": "GUEST", "epoch": epoch, "host": { "device": host_device } }),
         Join::Wait { phase } => json!({ "decision": "WAIT", "phase": phase, "retry_ms": 1500 }),
     }))
@@ -327,7 +376,22 @@ async fn commit(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Path<
     let mut gw = s.gw();
     let dev = auth(&gw, &h)?;
     own_lease(&gw, &dev, &lease)?;
-    let r = gw.commit(&lease, b.epoch, &b.base_rev, kind, b.last, now)?;
+    let world = gw.lease_world(&lease).unwrap_or_default();
+    let r = match gw.commit(&lease, b.epoch, &b.base_rev, kind, b.last, now) {
+        Ok(r) => r,
+        Err(e) => {
+            if matches!(e, Error::Rejected(_)) {
+                gw.meter(&world, "commits_rejected", 1);
+                let player = gw.device_player(&dev)?.map(|p| p.1);
+                s.hooks.emit("commit.rejected", &world, json!({ "player": player }));
+            }
+            return Err(e.into());
+        }
+    };
+    gw.meter(&world, "commits", 1);
+    if b.kind != "AUTOSAVE" {
+        s.hooks.emit("revision.committed", &world, json!({ "rev": r.id, "seq": r.seq, "kind": b.kind }));
+    }
     Ok(Json(json!({ "rev_id": r.id, "parent": r.parent, "seq": r.seq })))
 }
 
@@ -343,6 +407,8 @@ async fn release(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Path
     let dev = auth(&gw, &h)?;
     own_lease(&gw, &dev, &lease)?;
     gw.release(&lease, b.epoch, b.guests_present)?;
+    let player = gw.device_player(&dev)?.map(|p| p.1);
+    s.hooks.emit("host.released", &gw.lease_world(&lease).unwrap_or_default(), json!({ "player": player }));
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -432,6 +498,7 @@ async fn blob_put(State(s): State<Arc<AppState>>, h: HeaderMap, Path(hash): Path
     }
     gw.cas().put(&body).map_err(|e| ApiErr::Domain(e.into()))?;
     gw.tag_blob(&world, &want)?;
+    gw.meter(&world, "blob_put_bytes", body.len() as u64);
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -442,7 +509,9 @@ async fn blob_get(State(s): State<Arc<AppState>>, h: HeaderMap, Path(hash): Path
     if !gw.blob_visible(&dev, &want)? || !gw.cas().has(&want) {
         return Err(ApiErr::BadRequest("NO_SUCH_BLOB"));
     }
-    gw.cas().get(&want).map_err(|e| ApiErr::Domain(e.into()))
+    let data = gw.cas().get(&want).map_err(|e| ApiErr::Domain(e.into()))?;
+    gw.meter(&gw.blob_world_for(&dev, &want).unwrap_or_default(), "blob_get_bytes", data.len() as u64);
+    Ok(data)
 }
 
 async fn blob_head(State(s): State<Arc<AppState>>, h: HeaderMap, Path(hash): Path<String>) -> R {
@@ -496,6 +565,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/blobs/:hash", put(blob_put).get(blob_get))
         .route("/v1/blobs/:hash/exists", get(blob_head))
         .merge(crate::panel::routes())
+        .merge(crate::ops::routes())
         .layer(DefaultBodyLimit::max(MAX_BLOB))
         .with_state(state)
 }
