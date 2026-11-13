@@ -164,6 +164,14 @@ pub(crate) fn req_pack(h: &HeaderMap) -> Result<String, ApiErr> {
     Ok(p.to_string())
 }
 
+/// Pack version the caller runs. Anything malformed counts as absent so odd clients keep working.
+pub(crate) fn req_pack_version(h: &HeaderMap) -> Option<String> {
+    let v = h.get("x-mesh-pack-version")?.to_str().ok()?;
+    let parts: Vec<&str> = v.split('.').collect();
+    let ok = v.len() <= 32 && parts.len() <= 4 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    ok.then(|| v.to_string())
+}
+
 pub(crate) fn auth(gw: &Gateway, h: &HeaderMap) -> Result<String, ApiErr> {
     let tok = h
         .get("authorization")
@@ -260,6 +268,7 @@ async fn list_worlds(
         .into_iter()
         .filter(|w| gw.pack_of(&w.0).map(|p| p == pack).unwrap_or(false))
         .map(|(id, name, mc, role, state, host)| {
+            let pack_version = gw.pack_version_of(&id);
             let ready = host.is_none() || s.live_worlds.lock().unwrap_or_else(|e| e.into_inner()).contains(&id);
             let takeover = hw.filter(|_| ready && gw.may_host(&id, &dev)).and_then(|(tier, score)| gw.takeover_in(&id, &dev, tier, score, now));
             let sync = if ready {
@@ -269,7 +278,7 @@ async fn list_worlds(
                     .filter(|(_, t, at)| *t > 0 && at.elapsed().as_secs() < 30)
                     .map(|(d, t, _)| json!({ "done": d, "total": t }))
             };
-            json!({ "id": id, "name": name, "mc_version": mc, "role": role, "state": state, "host": host, "takeover_in_s": takeover, "host_ready": ready, "sync": sync })
+            json!({ "id": id, "name": name, "mc_version": mc, "role": role, "state": state, "host": host, "takeover_in_s": takeover, "host_ready": ready, "sync": sync, "pack_version": pack_version })
         })
         .collect();
     Ok(Json(json!({ "worlds": worlds, "relay": s.auth.advertise, "tunnel_proof": true })))
@@ -339,6 +348,9 @@ async fn join(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<St
                 gw.audit(&dev, "host.grant", &world, &g.lease_id, json!({ "epoch": g.epoch }));
             }
             gw.meter(&world, "host_grants", 1);
+            if let Some(v) = req_pack_version(&h) {
+                gw.set_pack_version(&world, &v);
+            }
             let player = gw.device_player(&dev)?.map(|p| p.1);
             s.hooks.emit("host.started", &world, json!({ "player": player, "epoch": g.epoch }));
             json!({ "decision": "HOST", "lease": lease_json(&g) })
