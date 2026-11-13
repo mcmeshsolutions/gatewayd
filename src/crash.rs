@@ -89,5 +89,5 @@ async fn list(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<St
 }
 
 pub fn routes() -> Router<Arc<AppState>> {
-    Router::new().route("/v1/worlds/:id/crash-report", post(upload)).route("/v1/worlds/:id/crash-reports", get(list))
+    Router::new().route("/v1/worlds/:id/crash-report", post(upload).layer(axum::extract::DefaultBodyLimit::max(MAX_TEXT + 64 * 1024))).route("/v1/worlds/:id/crash-reports", get(list))
 }

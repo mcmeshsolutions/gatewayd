@@ -533,6 +533,10 @@ async fn wal_append(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): P
 }
 
 const MAX_BLOB: usize = 16 << 20;
+/// Everything that is not a blob, a WAL batch or a log chunk is a small JSON document.
+const MAX_JSON: usize = 64 << 10;
+const MAX_WAL: usize = 4 << 20;
+const MAX_LOG_CHUNK: usize = 1 << 20;
 
 /// Client log lines: appended to MCMESH_LOGS/<player>.log, or stderr when unset.
 async fn client_logs(State(s): State<Arc<AppState>>, h: HeaderMap, body: Bytes) -> R {
@@ -685,16 +689,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/leases/:id/commit", post(commit))
         .route("/v1/leases/:id/release", post(release))
         .route("/v1/leases/:id/host-ready", post(host_ready))
-        .route("/v1/leases/:id/wal", post(wal_append))
-        .route("/v1/logs", post(client_logs))
-        .route("/v1/blobs/:hash", put(blob_put).get(blob_get))
+        .route("/v1/leases/:id/wal", post(wal_append).layer(DefaultBodyLimit::max(MAX_WAL)))
+        .route("/v1/logs", post(client_logs).layer(DefaultBodyLimit::max(MAX_LOG_CHUNK)))
+        .route("/v1/blobs/:hash", put(blob_put).layer(DefaultBodyLimit::max(MAX_BLOB)).get(blob_get))
         .route("/v1/blobs/:hash/exists", get(blob_head))
         .merge(crate::panel::routes())
         .merge(crate::ops::routes())
         .merge(crate::admin::routes())
         .merge(crate::crash::routes())
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::admin::gate))
-        .layer(DefaultBodyLimit::max(MAX_BLOB))
+        .layer(DefaultBodyLimit::max(MAX_JSON))
         .with_state(state)
 }
 
