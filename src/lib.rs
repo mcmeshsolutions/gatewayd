@@ -12,6 +12,7 @@ mod chaos_tests;
 #[cfg(test)]
 mod lease_tests;
 pub mod panel;
+pub mod quota;
 pub mod relay;
 pub mod sanity;
 pub mod server;

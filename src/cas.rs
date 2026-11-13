@@ -41,6 +41,10 @@ impl Cas {
         Ok(Cas { root })
     }
 
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
     fn path(&self, h: &Hash) -> PathBuf {
         let x = hex(h);
         self.root.join(&x[0..2]).join(&x[2..4]).join(x)
@@ -59,6 +63,10 @@ impl Cas {
         let h = sha256(raw);
         let p = self.path(&h);
         if p.is_file() {
+            // a re-upload counts as fresh, so the retention sweep's grace period covers it
+            if let Ok(f) = fs::File::options().write(true).open(&p) {
+                let _ = f.set_modified(std::time::SystemTime::now());
+            }
             return Ok(h);
         }
         fs::create_dir_all(p.parent().expect("cas path has a parent"))?;
@@ -78,22 +86,46 @@ impl Cas {
         Ok(raw)
     }
 
-    /// Deletes every blob not in `keep`; returns how many were removed.
-    pub fn sweep(&self, keep: &HashSet<Hash>) -> io::Result<u64> {
-        let mut removed = 0;
-        for a in fs::read_dir(&self.root)? {
-            for b in fs::read_dir(a?.path())? {
-                for f in fs::read_dir(b?.path())? {
+    /// Stored (compressed) size of a blob.
+    pub fn size(&self, h: &Hash) -> Option<u64> {
+        fs::metadata(self.path(h)).ok().map(|m| m.len())
+    }
+
+    /// Deletes every blob not in `keep` and last written more than `grace` ago; returns the removed hashes and their bytes.
+    /// The grace period protects blobs a host uploaded but has not put into its WAL yet.
+    pub fn sweep(&self, keep: &HashSet<Hash>, grace: std::time::Duration) -> io::Result<(Vec<Hash>, u64)> {
+        let subdirs = |p: &std::path::Path| -> io::Result<Vec<PathBuf>> {
+            let mut v = Vec::new();
+            for e in fs::read_dir(p)? {
+                let e = e?.path();
+                if e.is_dir() {
+                    v.push(e);
+                }
+            }
+            Ok(v)
+        };
+        let now = std::time::SystemTime::now();
+        let (mut removed, mut bytes) = (Vec::new(), 0);
+        for a in subdirs(&self.root)? {
+            for b in subdirs(&a)? {
+                for f in fs::read_dir(b)? {
                     let f = f?;
                     let name = f.file_name();
                     let Some(h) = name.to_str().and_then(parse_hex) else { continue };
-                    if !keep.contains(&h) {
-                        fs::remove_file(f.path())?;
-                        removed += 1;
+                    if keep.contains(&h) {
+                        continue;
                     }
+                    let meta = f.metadata()?;
+                    // an mtime in the future reads as age zero, which keeps the blob
+                    if now.duration_since(meta.modified()?).unwrap_or_default() < grace {
+                        continue;
+                    }
+                    fs::remove_file(f.path())?;
+                    bytes += meta.len();
+                    removed.push(h);
                 }
             }
         }
-        Ok(removed)
+        Ok((removed, bytes))
     }
 }

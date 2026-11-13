@@ -148,7 +148,7 @@ fn gc_keeps_retained_revisions_and_drops_the_rest() {
     let mut keep = HashSet::new();
     reachable(&cas, r2, &mut keep).unwrap();
     assert!(keep.contains(&a) && keep.contains(&c) && !keep.contains(&b));
-    let removed = cas.sweep(&keep).unwrap();
+    let removed = cas.sweep(&keep, std::time::Duration::ZERO).unwrap().0.len();
     assert!(removed >= 1);
     assert!(!cas.has(&b));
     assert!(lookup(&cas, r2, &key(0, 0)).unwrap().is_some());

@@ -53,3 +53,8 @@ CREATE TABLE IF NOT EXISTS mod_requests(
   world_id TEXT NOT NULL REFERENCES worlds(id), mod_id TEXT NOT NULL, hash TEXT NOT NULL,
   player_uuid TEXT NOT NULL REFERENCES players(uuid), created_at INTEGER NOT NULL,
   PRIMARY KEY(world_id, mod_id, hash, player_uuid));
+CREATE TABLE IF NOT EXISTS quotas(
+  scope TEXT NOT NULL CHECK(scope IN('user','world')), id TEXT NOT NULL,
+  storage_bytes INTEGER, world_count INTEGER, keep_revisions INTEGER, keep_days INTEGER,
+  PRIMARY KEY(scope, id)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS blob_world_by_world ON blob_world(world_id);
