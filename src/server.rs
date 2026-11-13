@@ -470,6 +470,15 @@ async fn device_key(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): Json<
     Ok(Json(json!({ "ok": true })))
 }
 
+/// Swallows a probe body so the host can time its own upload speed. Authenticated, small, rate limited like any other route.
+async fn bandwidth_sink(State(s): State<Arc<AppState>>, h: HeaderMap, body: Bytes) -> R {
+    {
+        let gw = s.gw();
+        auth(&gw, &h)?;
+    }
+    Ok(Json(json!({ "bytes": body.len() })))
+}
+
 async fn commit(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Path<String>, Json(b): Json<CommitReq>) -> R {
     let now = s.now();
     let kind = match b.kind.as_str() {
@@ -578,6 +587,7 @@ const MAX_BLOB: usize = 16 << 20;
 /// Everything that is not a blob, a WAL batch or a log chunk is a small JSON document.
 const MAX_JSON: usize = 64 << 10;
 const MAX_WAL: usize = 4 << 20;
+const MAX_BANDWIDTH_PROBE: usize = 1 << 20;
 const MAX_LOG_CHUNK: usize = 1 << 20;
 
 /// Client log lines: appended to MCMESH_LOGS/<player>.log, or stderr when unset.
@@ -730,6 +740,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/worlds/:id/ticket", post(crate::auth::ticket))
         .route("/v1/devices/me", get(device_me))
         .route("/v1/devices/key", post(device_key))
+        .route("/v1/bandwidth", post(bandwidth_sink).layer(DefaultBodyLimit::max(MAX_BANDWIDTH_PROBE)))
         .route("/v1/worlds", post(create_world).get(list_worlds))
         .route("/v1/worlds/:id/invite", post(create_invite))
         .route("/v1/invites/redeem", post(redeem_invite))

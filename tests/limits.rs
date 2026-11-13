@@ -53,3 +53,11 @@ async fn crash_reports_take_up_to_256_kib_of_text() {
     let body = format!("{{\"text\":\"{text}\"}}").into_bytes();
     assert_ne!(status(&app, "POST", "/v1/worlds/w1/crash-report", "application/json", body).await, 413);
 }
+
+#[tokio::test]
+async fn the_bandwidth_probe_takes_a_megabyte_and_refuses_more() {
+    let app = app();
+    let ok = status(&app, "POST", "/v1/bandwidth", "application/octet-stream", vec![1u8; 1 << 20]).await;
+    assert_eq!(ok, 200);
+    assert_eq!(status(&app, "POST", "/v1/bandwidth", "application/octet-stream", vec![1u8; (1 << 20) + 1]).await, 413);
+}
