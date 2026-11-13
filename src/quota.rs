@@ -155,6 +155,28 @@ impl Gateway {
     /// Marks revisions outside each world's retention as pruned, then deletes blobs nothing needs any more.
     /// A blob survives when any unpruned revision of any world reaches it, a WAL frame names it, or it was written
     /// less than `grace_s` ago. If one retained tree cannot be read, nothing is pruned or deleted.
+    /// Drops usage rows of blobs no longer on disk.
+    fn forget_missing_blobs(&mut self) -> Result<()> {
+        let hashes: Vec<Vec<u8>> = {
+            let mut st = self.db.prepare("SELECT DISTINCT hash FROM blob_world")?;
+            let rows = st.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let tx = self.db.transaction()?;
+        for h in hashes {
+            if Hash::try_from(h.as_slice()).map(|k| !self.cas.has(&k)).unwrap_or(false) {
+                tx.execute("DELETE FROM blob_world WHERE hash=?", params![h])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// True once an operator has set any limit row; the periodic sweep stays off until then.
+    pub fn quotas_configured(&self) -> Result<bool> {
+        Ok(self.db.query_row("SELECT EXISTS(SELECT 1 FROM quotas)", [], |r| r.get::<_, bool>(0))?)
+    }
+
     pub fn retention_sweep(&mut self, grace_s: u64) -> Result<SweepReport> {
         let mut rep = SweepReport::default();
         let now = wall_s();
@@ -215,12 +237,10 @@ impl Gateway {
         tx.commit()?;
         rep.pruned = plan;
 
-        let (removed, bytes) = self.cas.sweep(&keep, std::time::Duration::from_secs(grace_s))?;
-        let tx = self.db.transaction()?;
-        for h in &removed {
-            tx.execute("DELETE FROM blob_world WHERE hash=?", params![h.as_slice()])?;
-        }
-        tx.commit()?;
+        let swept = self.cas.sweep(&keep, std::time::Duration::from_secs(grace_s));
+        // heal even when the sweep failed midway, so usage never stays counted for blobs that are gone
+        self.forget_missing_blobs()?;
+        let (removed, bytes) = swept?;
         rep.blobs_removed = removed.len() as u64;
         rep.bytes_freed = bytes;
         Ok(rep)
@@ -362,6 +382,24 @@ mod tests {
         assert_ne!(head, gr.base_rev, "recovery made a revision");
         let key = Key { dim: "minecraft:overworld".into(), kind: Kind::Region, cx: 5, cz: 0 };
         assert_eq!(manifest::lookup(g.cas(), g.revision_root(&head).unwrap(), &key).unwrap(), Some(h));
+    }
+
+    #[test]
+    fn usage_rows_of_vanished_blobs_are_dropped_on_the_next_sweep() {
+        let mut g = gw();
+        let (gr, mut w) = host(&mut g, 0);
+        let b = save(&mut g, &gr, &mut w, 0, 1);
+        g.commit(&gr.lease_id, gr.epoch, &gr.base_rev, CommitKind::Autosave, false, 1).unwrap();
+        let used = g.world_usage("w").unwrap();
+        assert!(used > 0);
+        let x = crate::cas::hex(&b);
+        std::fs::remove_file(g.cas().root().join(&x[0..2]).join(&x[2..4]).join(&x)).unwrap();
+        assert_eq!(g.world_usage("w").unwrap(), used, "rows still count the vanished blob");
+        g.retention_sweep(0).unwrap();
+        assert!(g.world_usage("w").unwrap() < used);
+        assert!(!g.quotas_configured().unwrap());
+        g.set_limits(Scope::World, "*", &Limits { keep_revisions: Some(5), ..Default::default() }).unwrap();
+        assert!(g.quotas_configured().unwrap());
     }
 
     #[test]

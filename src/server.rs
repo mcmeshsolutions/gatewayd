@@ -99,6 +99,31 @@ impl AppState {
         if let Err(e) = gw.tick(now) {
             eprintln!("tick failed: {e:?}");
         }
+        sweep_if_due(&mut gw);
+    }
+}
+
+static LAST_SWEEP_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Runs in the serving process under the gateway mutex only: a sweep from a second process could race a revert.
+fn sweep_if_due(gw: &mut Gateway) {
+    let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let every = env("MCMESH_SWEEP_INTERVAL_S", 3600);
+    let now = crate::lease::wall_s() as u64;
+    let last = LAST_SWEEP_S.load(std::sync::atomic::Ordering::Relaxed);
+    if every == 0 || now < last + every {
+        return;
+    }
+    LAST_SWEEP_S.store(now, std::sync::atomic::Ordering::Relaxed);
+    if !gw.quotas_configured().unwrap_or(false) {
+        return;
+    }
+    match gw.retention_sweep(env("MCMESH_SWEEP_GRACE_S", 3600)) {
+        Ok(r) if !r.pruned.is_empty() || r.blobs_removed > 0 => {
+            eprintln!("retention sweep: pruned {} revisions, removed {} blobs, freed {} bytes", r.pruned.len(), r.blobs_removed, r.bytes_freed)
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("retention sweep failed: {e:?}"),
     }
 }
 
