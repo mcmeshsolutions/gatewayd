@@ -433,3 +433,24 @@ async fn a_world_without_caps_still_relays() {
     run_agent(&e, "tok-a", 1, mc, vc).await.unwrap();
     assert_eq!(&roundtrip(e.guests, b"under the cap").await[..], &b"UNDER THE CAP"[..]);
 }
+
+#[tokio::test]
+async fn voice_udp_is_dropped_until_the_sender_passed_the_ticket_gate() {
+    let e = env_with(true).await;
+    let (mc, vc) = fake_server().await;
+    run_agent(&e, "tok-a", 1, mc, vc).await.unwrap();
+    let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    s.connect(e.voice).await.unwrap();
+    let mut b = [0u8; 16];
+
+    s.send(&[1, 2, 3]).await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(700), s.recv(&mut b)).await.is_err(), "unknown address must get nothing");
+
+    let t = ticket(&e, "tok-b").await;
+    let (hs, login) = login_bytes(&format!("h\0mesh={t}"), "Bob", 2);
+    assert!(!send_and_read(e.guests, &[hs, login].concat(), 1).await.is_empty());
+
+    s.send(&[4, 5, 6]).await.unwrap();
+    let n = tokio::time::timeout(Duration::from_secs(5), s.recv(&mut b)).await.expect("udp timeout").unwrap();
+    assert_eq!(&b[..n], &[4, 5, 6]);
+}

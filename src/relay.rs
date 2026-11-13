@@ -85,6 +85,11 @@ impl Relay {
         lock(&self.cur).get(world).cloned()
     }
 
+    /// With tickets required, only addresses that recently passed the TCP ticket gate may use side channels.
+    fn known(&self, ip: std::net::IpAddr) -> bool {
+        !self.state.auth.require_ticket || lock(&self.known_ips).get(&ip).is_some_and(|t| t.elapsed() < KNOWN_IP_TTL)
+    }
+
     fn all(&self) -> Vec<Arc<Tunnel>> {
         lock(&self.cur).values().cloned().collect()
     }
@@ -458,6 +463,9 @@ pub async fn serve_voice(relay: Arc<Relay>, sock: Arc<UdpSocket>) {
         if !relay.allow(crate::ratelimit::Class::Udp, from.ip()) {
             continue;
         }
+        if !relay.known(from.ip()) {
+            continue;
+        }
         let Some(t) = relay.udp_tunnel() else { continue };
         let id = {
             let mut p = lock(&t.peers);
@@ -488,11 +496,8 @@ pub async fn serve_channel_tcp(relay: Arc<Relay>, chan: u8, l: TcpListener) {
             if !r.allow(crate::ratelimit::Class::Handshake, from.ip()) {
                 return;
             }
-            if r.state.auth.require_ticket {
-                let ok = lock(&r.known_ips).get(&from.ip()).is_some_and(|t| t.elapsed() < KNOWN_IP_TTL);
-                if !ok {
-                    return;
-                }
+            if !r.known(from.ip()) {
+                return;
             }
             let Some(t) = r.udp_tunnel() else { return };
             if !r.live(&t) {
@@ -517,6 +522,9 @@ pub async fn serve_channel_udp(relay: Arc<Relay>, chan: u8, sock: Arc<UdpSocket>
     loop {
         let Ok((n, from)) = sock.recv_from(&mut buf).await else { continue };
         if !relay.allow(crate::ratelimit::Class::Udp, from.ip()) {
+            continue;
+        }
+        if !relay.known(from.ip()) {
             continue;
         }
         let Some(t) = relay.udp_tunnel() else { continue };
