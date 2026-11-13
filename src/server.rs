@@ -407,6 +407,8 @@ struct EpochReq {
     sync_total: u64,
     #[serde(default)]
     players: Option<u32>,
+    #[serde(default)]
+    load: Option<u32>,
 }
 
 async fn heartbeat(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Path<String>, Json(b): Json<EpochReq>) -> R {
@@ -414,7 +416,7 @@ async fn heartbeat(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Pa
     let mut gw = s.gw();
     let dev = auth(&gw, &h)?;
     own_lease(&gw, &dev, &lease)?;
-    let pending = gw.heartbeat_players(&lease, b.epoch, b.players, now)?;
+    let pending = gw.heartbeat_status(&lease, b.epoch, b.players, b.load, now)?;
     if b.sync_total > 0 {
         s.sync.lock().unwrap_or_else(|e| e.into_inner()).insert(lease.clone(), (b.sync_done, b.sync_total, Instant::now()));
     }

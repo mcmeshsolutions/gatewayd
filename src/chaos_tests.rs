@@ -140,7 +140,9 @@ fn run(seed: u64, steps: usize, n: usize, anchors: bool) {
                 if let Some(gr) = d.grant.clone() {
                     d.players = prng.below(5) as u32;
                     let reported = (prng.below(3) != 0).then_some(d.players);
-                    match g.heartbeat_players(&gr.lease_id, gr.epoch, reported, now) {
+                    // load levels cycle deterministically so existing seeds keep their trajectories; struggling hosts must never break the invariants
+                    let load = reported.map(|_| ((now / 3_000 + step as u64) % 4) as u32);
+                    match g.heartbeat_status(&gr.lease_id, gr.epoch, reported, load, now) {
                         Ok(dirs) => {
                             assert_eq!(g.lease_of_world(W).as_deref(), Some(gr.lease_id.as_str()), "fenced host heartbeat accepted, seed {seed} step {step}");
                             if !dirs.is_empty() && !d.crashed {

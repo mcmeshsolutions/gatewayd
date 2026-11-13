@@ -581,3 +581,49 @@ fn recover_head_without_an_intact_revision_reports_it_and_changes_nothing() {
     assert!(out.applied.is_none(), "applied: {out:?}");
     assert_eq!(g.head(W).unwrap(), r.id);
 }
+
+#[test]
+fn a_struggling_host_is_replaced_sooner_and_by_a_smaller_margin() {
+    let mut g = setup();
+    let a = locked_host(&mut g, 2, 10.0);
+    // healthy host: 5% better is not enough and 40 s is inside the hold
+    g.join(W, "dev-b", hw(2, 10.6), 40_000).unwrap();
+    assert!(!migrating(&g));
+    // the host reports a heavy shed level
+    g.heartbeat_status(&a.lease_id, a.epoch, Some(3), Some(2), 41_000).unwrap();
+    assert!(g.takeover_in(W, "dev-b", 2, 10.6, 41_000).is_some(), "the margin is now 1.05");
+    g.join(W, "dev-b", hw(2, 10.4), 41_000).unwrap();
+    assert!(!migrating(&g), "4% better is still not enough");
+    g.join(W, "dev-b", hw(2, 10.0), 41_000).unwrap();
+    assert!(!migrating(&g), "an equal machine never takes over, no ping-pong");
+    g.join(W, "dev-b", hw(2, 10.6), 29_000).unwrap();
+    assert!(!migrating(&g), "the short hold of 30 s still applies");
+    g.join(W, "dev-b", hw(2, 10.6), 41_000).unwrap();
+    assert!(migrating(&g));
+}
+
+#[test]
+fn a_host_that_recovers_gets_the_normal_terms_back() {
+    let mut g = setup();
+    let a = locked_host(&mut g, 2, 10.0);
+    g.heartbeat_status(&a.lease_id, a.epoch, None, Some(3), 1_000).unwrap();
+    g.heartbeat_status(&a.lease_id, a.epoch, None, Some(0), 2_000).unwrap();
+    g.join(W, "dev-b", hw(2, 10.6), 41_000).unwrap();
+    assert!(!migrating(&g));
+    g.heartbeat_status(&a.lease_id, a.epoch, None, None, 3_000).unwrap();
+    g.join(W, "dev-b", hw(2, 12.99), HOLD).unwrap();
+    assert!(!migrating(&g), "no load field keeps the last value, which is 0");
+}
+
+#[test]
+fn a_struggling_host_does_not_lift_the_anchor_rule() {
+    let mut g = setup();
+    let a = locked_host(&mut g, 2, 10.0);
+    g.set_anchor("dev-b", true).unwrap();
+    g.heartbeat_status(&a.lease_id, a.epoch, Some(1), Some(3), 1_000).unwrap();
+    g.join(W, "dev-b", hw(2, 50.0), 41_000).unwrap();
+    assert!(!migrating(&g), "an anchor still never displaces a host with fewer than 2 players");
+    g.heartbeat_status(&a.lease_id, a.epoch, Some(2), Some(3), 42_000).unwrap();
+    g.join(W, "dev-b", hw(2, 50.0), 43_000).unwrap();
+    assert!(migrating(&g));
+}

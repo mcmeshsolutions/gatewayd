@@ -18,6 +18,10 @@ fn min_hold_ms() -> u64 {
     })
 }
 const SCORE_MARGIN: f64 = 1.3;
+/// A host that reports shed level 2 or more is struggling: a clearly stronger machine may take over after a short hold.
+const STRUGGLE_LEVEL: u32 = 2;
+const STRUGGLE_MARGIN: f64 = 1.05;
+const STRUGGLE_MIN_HOLD_MS: u64 = 30_000;
 
 #[derive(Debug)]
 pub enum Error {
@@ -195,6 +199,7 @@ impl Gateway {
         let _ = db.execute("ALTER TABLE revisions ADD COLUMN sig BLOB", []);
         let _ = db.execute("ALTER TABLE revisions ADD COLUMN signer BLOB", []);
         let _ = db.execute("ALTER TABLE leases ADD COLUMN players INTEGER", []);
+        let _ = db.execute("ALTER TABLE leases ADD COLUMN load INTEGER", []);
         let _ = db.execute("ALTER TABLE devices ADD COLUMN anchor INTEGER NOT NULL DEFAULT 0", []);
         db.execute("UPDATE sessions SET last_used=? WHERE last_used IS NULL", params![unix_s()])?;
         db.execute("DELETE FROM sessions WHERE last_used>0 AND last_used<?", params![unix_s() - session_ttl_s()])?;
@@ -302,10 +307,11 @@ impl Gateway {
         let (lid, dev, _, cur_tier) = self.active_lease(world).ok()??;
         let t = self.timers.get(&lid)?;
         let c = Cand { tier, score, seen: now };
-        if dev == device || !Self::better(&c, cur_tier, t.score) || self.anchor_blocked(device, &lid) {
+        let (margin, hold) = self.takeover_terms(&lid);
+        if dev == device || !Self::better_with(&c, cur_tier, t.score, margin) || self.anchor_blocked(device, &lid) {
             return None;
         }
-        Some(min_hold_ms().saturating_sub(now.saturating_sub(t.granted)).div_ceil(1000))
+        Some(hold.saturating_sub(now.saturating_sub(t.granted)).div_ceil(1000))
     }
 
     /// Operator-set flag; an anchor never displaces a live host that has fewer than 2 real players (or an unknown count).
@@ -458,8 +464,18 @@ impl Gateway {
         )?)
     }
 
-    fn better(c: &Cand, cur_tier: i64, cur_score: f64) -> bool {
-        (c.tier as i64) < cur_tier || c.score >= cur_score * SCORE_MARGIN
+    /// Margin and hold time that apply to a bid against this lease: relaxed while its host reports a heavy shed level.
+    fn takeover_terms(&self, lease: &str) -> (f64, u64) {
+        let load: Option<u32> = self.db.query_row("SELECT load FROM leases WHERE id=?", params![lease], |r| r.get(0)).unwrap_or(None);
+        if load.is_some_and(|l| l >= STRUGGLE_LEVEL) {
+            (STRUGGLE_MARGIN, STRUGGLE_MIN_HOLD_MS)
+        } else {
+            (SCORE_MARGIN, min_hold_ms())
+        }
+    }
+
+    fn better_with(c: &Cand, cur_tier: i64, cur_score: f64, margin: f64) -> bool {
+        (c.tier as i64) < cur_tier || c.score >= cur_score * margin
     }
 
     /// Picks the best fresh candidate and grants it a lease in MIGRATING/BOOTING, else IDLE.
@@ -520,7 +536,8 @@ impl Gateway {
                 let held = now.saturating_sub(t.granted);
                 let cand = &self.cands.get(&key);
                 if let Some(c) = cand {
-                    if hw.takeover && held >= min_hold_ms() && Self::better(c, tier, t.score) && !self.anchor_blocked(device, &lid) {
+                    let (margin, hold) = self.takeover_terms(&lid);
+                    if hw.takeover && held >= hold && Self::better_with(c, tier, t.score, margin) && !self.anchor_blocked(device, &lid) {
                         self.set_state(world, "MIGRATING", Some("PREPARING"))?;
                         self.db.execute("UPDATE leases SET status='HANDOFF' WHERE id=?", params![lid])?;
                         self.directives.entry(lid).or_default().push(Directive::MigratePrepare {
@@ -545,12 +562,20 @@ impl Gateway {
 
     /// `players` is the real player count on the host; None leaves the stored value untouched.
     pub fn heartbeat_players(&mut self, lease: &str, epoch: i64, players: Option<u32>, now: u64) -> Result<Vec<Directive>> {
+        self.heartbeat_status(lease, epoch, players, None, now)
+    }
+
+    /// `load` is the host's load-shedding level, 0 to 3; None keeps the stored value (old mods never send it).
+    pub fn heartbeat_status(&mut self, lease: &str, epoch: i64, players: Option<u32>, load: Option<u32>, now: u64) -> Result<Vec<Directive>> {
         self.require_live(lease, epoch)?;
         if let Some(t) = self.timers.get_mut(lease) {
             t.last_hb = now;
         }
         if let Some(n) = players {
             self.db.execute("UPDATE leases SET players=? WHERE id=?", params![n, lease])?;
+        }
+        if let Some(l) = load {
+            self.db.execute("UPDATE leases SET load=? WHERE id=?", params![l.min(3), lease])?;
         }
         Ok(self.directives.remove(lease).unwrap_or_default())
     }
