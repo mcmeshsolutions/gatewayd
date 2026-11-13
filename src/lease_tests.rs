@@ -369,3 +369,110 @@ fn players_survive_restart() {
     assert_eq!(g.lease_players(W).unwrap(), Some(2));
     let _ = std::fs::remove_file(&dir);
 }
+
+const HOLD: u64 = 180_000;
+
+fn locked_host(g: &mut Gateway, tier: u8, score: f64) -> Grant {
+    let a = host(g.join(W, "dev-a", hw(tier, score), 0).unwrap());
+    g.host_ready(&a.lease_id, a.epoch).unwrap();
+    a
+}
+
+fn migrating(g: &Gateway) -> bool {
+    g.state(W).unwrap().0 == "MIGRATING"
+}
+
+#[test]
+fn anchor_never_displaces_host_below_two_players() {
+    for players in [None, Some(0), Some(1)] {
+        let mut g = setup();
+        g.set_anchor("dev-b", true).unwrap();
+        let a = locked_host(&mut g, 3, 1.0);
+        g.heartbeat_players(&a.lease_id, a.epoch, players, 10_000).unwrap();
+        g.join(W, "dev-b", hw(1, 50.0), HOLD + 1_000).unwrap();
+        assert!(!migrating(&g), "players {players:?}");
+        assert!(g.takeover_in(W, "dev-b", 1, 50.0, HOLD + 1_000).is_none());
+    }
+}
+
+#[test]
+fn anchor_displaces_host_at_exactly_two_players() {
+    let mut g = setup();
+    g.set_anchor("dev-b", true).unwrap();
+    let a = locked_host(&mut g, 3, 1.0);
+    g.heartbeat_players(&a.lease_id, a.epoch, Some(2), 10_000).unwrap();
+    g.join(W, "dev-b", hw(1, 50.0), HOLD + 1_000).unwrap();
+    assert!(migrating(&g));
+}
+
+#[test]
+fn non_anchor_displaces_host_with_few_players() {
+    let mut g = setup();
+    let a = locked_host(&mut g, 3, 1.0);
+    g.heartbeat_players(&a.lease_id, a.epoch, Some(1), 10_000).unwrap();
+    g.join(W, "dev-b", hw(1, 50.0), HOLD + 1_000).unwrap();
+    assert!(migrating(&g));
+}
+
+#[test]
+fn anchor_host_is_displaced_by_players_under_rule_one_only() {
+    let mut g = setup();
+    g.set_anchor("dev-a", true).unwrap();
+    let a = locked_host(&mut g, 3, 1.0);
+    g.heartbeat_players(&a.lease_id, a.epoch, Some(0), 10_000).unwrap();
+    g.join(W, "dev-b", hw(1, 50.0), HOLD + 1_000).unwrap();
+    assert!(migrating(&g));
+}
+
+#[test]
+fn margin_is_exactly_one_point_three() {
+    let mut g = setup();
+    locked_host(&mut g, 2, 10.0);
+    g.join(W, "dev-b", hw(2, 12.99), HOLD).unwrap();
+    assert!(!migrating(&g));
+    g.join(W, "dev-b", hw(2, 13.0), HOLD).unwrap();
+    assert!(migrating(&g));
+}
+
+#[test]
+fn lower_tier_wins_without_margin() {
+    let mut g = setup();
+    locked_host(&mut g, 2, 10.0);
+    g.join(W, "dev-b", hw(1, 1.0), HOLD).unwrap();
+    assert!(migrating(&g));
+}
+
+#[test]
+fn min_hold_boundary() {
+    let mut g = setup();
+    locked_host(&mut g, 3, 1.0);
+    g.join(W, "dev-b", hw(1, 50.0), HOLD - 1).unwrap();
+    assert!(!migrating(&g));
+    g.join(W, "dev-b", hw(1, 50.0), HOLD).unwrap();
+    assert!(migrating(&g));
+}
+
+#[test]
+fn takeover_flag_is_required() {
+    let mut g = setup();
+    locked_host(&mut g, 3, 1.0);
+    g.join(W, "dev-b", Hw { tier: 1, score: 50.0, wants_host: true, takeover: false }, HOLD * 2).unwrap();
+    assert!(!migrating(&g));
+}
+
+#[test]
+fn anchor_gets_no_special_rank_in_a_fresh_election() {
+    let mut g = setup();
+    g.add_member(W, "u-d", "dave", "dev-d", Role::HostEligible).unwrap();
+    g.set_anchor("dev-b", true).unwrap();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    g.join(W, "dev-b", hw(2, 9.0), 1_000).unwrap();
+    g.join(W, "dev-d", hw(1, 2.0), 1_000).unwrap();
+    g.release(&a.lease_id, a.epoch, true).unwrap();
+    g.commit(&a.lease_id, a.epoch, &a.base_rev, CommitKind::Shutdown, true, 2_000).unwrap();
+    let elected: String = g
+        .db()
+        .query_row("SELECT device_id FROM leases WHERE world_id=? AND status='ACTIVE'", [W], |r| r.get(0))
+        .unwrap();
+    assert_eq!(elected, "dev-d");
+}
