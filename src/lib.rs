@@ -14,6 +14,7 @@ mod chaos_tests;
 mod lease_tests;
 pub mod panel;
 pub mod quota;
+pub mod ratelimit;
 pub mod relay;
 pub mod sanity;
 pub mod server;

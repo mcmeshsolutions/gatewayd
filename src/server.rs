@@ -29,6 +29,7 @@ pub struct AppState {
     pub(crate) hooks: crate::ops::Hooks,
     /// Relayed bytes by world since the last tick: (to host, to guests).
     relay_bytes: Mutex<std::collections::HashMap<String, (u64, u64)>>,
+    pub(crate) limiter: crate::ratelimit::Limiter,
 }
 
 impl AppState {
@@ -41,7 +42,7 @@ impl AppState {
             eprintln!("ops init failed: {e:?}");
         }
         let hooks = crate::ops::Hooks::new(&auth.webhooks, auth.webhook_secret.clone());
-        Arc::new(AppState { gw: Mutex::new(gw), start: Instant::now(), auth, challenges: Mutex::new(Default::default()), tickets: Mutex::new(Default::default()), panel_codes: Mutex::new(Default::default()), live_worlds: Mutex::new(Default::default()), sync: Mutex::new(Default::default()), hooks, relay_bytes: Mutex::new(Default::default()) })
+        Arc::new(AppState { gw: Mutex::new(gw), start: Instant::now(), auth, challenges: Mutex::new(Default::default()), tickets: Mutex::new(Default::default()), panel_codes: Mutex::new(Default::default()), live_worlds: Mutex::new(Default::default()), sync: Mutex::new(Default::default()), hooks, relay_bytes: Mutex::new(Default::default()), limiter: crate::ratelimit::Limiter::from_env() })
     }
     pub(crate) fn uptime_s(&self) -> u64 {
         self.start.elapsed().as_secs()
@@ -100,6 +101,7 @@ impl AppState {
             eprintln!("tick failed: {e:?}");
         }
         sweep_if_due(&mut gw);
+        self.limiter.sweep();
     }
 }
 
@@ -699,6 +701,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(crate::crash::routes())
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::admin::gate))
         .layer(DefaultBodyLimit::max(MAX_JSON))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), crate::ratelimit::layer))
         .with_state(state)
 }
 

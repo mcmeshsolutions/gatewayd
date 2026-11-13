@@ -10,7 +10,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: gatewayd serve\n       gatewayd create-world <id> <name> <mc_version> <loader>\n       \
          gatewayd add-member <world> <mc_uuid> <name> <device> <ADMIN|HOST_ELIGIBLE|CLIENT_ONLY> <token>\n         gatewayd grant <world> <name> <ADMIN|HOST_ELIGIBLE|CLIENT_ONLY>\n         gatewayd drop-token <token>\n         gatewayd revisions <world>\n         gatewayd status\n         gatewayd scrub\n         gatewayd backup <dir>\n         gatewayd set-pack <world> <pack_id>\n         gatewayd set-admin <name> <admin|user>\n         gatewayd set-limit <user|world> <id|*> <storage_bytes> <world_count> <keep_revisions> <keep_days>   (- = unlimited, replaces the row)\n         gatewayd set-anchor <device> <on|off>\n         gatewayd revert <world> <revision>\n\
-         env: MCMESH_DB (default mcmesh.db), MCMESH_CAS (default ./cas),\n         relay (needs MCMESH_WORLD, or MCMESH_RELAY=all to serve every world; MCMESH_WORLD then only picks the UDP and ticketless default): MCMESH_RELAY_ADDR (127.0.0.1:9000), MCMESH_PUBLIC_ADDR (0.0.0.0:25565), MCMESH_VOICE_ADDR (0.0.0.0:24454)\n          MCMESH_ADDR (default 127.0.0.1:8080)\n          MCMESH_CREATE=open lets any logged-in player create worlds\n          MCMESH_ADVERTISE=host:port tells clients where guests connect (with MCMESH_WORLD)\n          MCMESH_METRICS_TOKEN=secret enables GET /metrics (Prometheus) behind that bearer token\n          MCMESH_ADMINS=uuid,uuid are gateway admins on top of `set-admin`; MCMESH_BAN_GRACE_S (120) is how long a banned host may wind down\n          MCMESH_WEBHOOKS=url,url posts gateway events as JSON; MCMESH_WEBHOOK_SECRET signs them"
+         env: MCMESH_DB (default mcmesh.db), MCMESH_CAS (default ./cas),\n         relay (needs MCMESH_WORLD, or MCMESH_RELAY=all to serve every world; MCMESH_WORLD then only picks the UDP and ticketless default): MCMESH_RELAY_ADDR (127.0.0.1:9000), MCMESH_PUBLIC_ADDR (0.0.0.0:25565), MCMESH_VOICE_ADDR (0.0.0.0:24454)\n          MCMESH_ADDR (default 127.0.0.1:8080)\n          MCMESH_CREATE=open lets any logged-in player create worlds\n          MCMESH_ADVERTISE=host:port tells clients where guests connect (with MCMESH_WORLD)\n          MCMESH_METRICS_TOKEN=secret enables GET /metrics (Prometheus) behind that bearer token\n          MCMESH_ADMINS=uuid,uuid are gateway admins on top of `set-admin`; MCMESH_BAN_GRACE_S (120) is how long a banned host may wind down\n          MCMESH_WEBHOOKS=url,url posts gateway events as JSON; MCMESH_WEBHOOK_SECRET signs them\n          MCMESH_RATE=off disables rate limits; MCMESH_RATE_SCALE=2 doubles every limit; MCMESH_TRUST_PROXY=1 reads the client address from the last X-Forwarded-For entry (only behind a proxy you control)"
     );
     std::process::exit(2)
 }
@@ -157,7 +157,7 @@ async fn main() {
             });
             let l = tokio::net::TcpListener::bind(&addr).await.expect("bind");
             eprintln!("gatewayd listening on {addr}");
-            axum::serve(l, router(state))
+            axum::serve(l, router(state).into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; })
                 .await
                 .expect("serve");

@@ -54,6 +54,11 @@ impl Relay {
         Arc::new(Relay { state, default_world: default_world.map(Into::into), udp, chan_udp: Mutex::new(HashMap::new()), known_ips: Mutex::new(HashMap::new()), cur: Mutex::new(HashMap::new()) })
     }
 
+    /// Per-source-address limit shared with the HTTP side, so a flood on any listener is cut at the same place.
+    fn allow(&self, class: crate::ratelimit::Class, ip: std::net::IpAddr) -> bool {
+        self.state.limiter.allow(class, &ip.to_string()).is_ok()
+    }
+
     fn current(&self, world: &str) -> Option<Arc<Tunnel>> {
         lock(&self.cur).get(world).cloned()
     }
@@ -93,7 +98,10 @@ impl Relay {
 
 pub async fn serve_agents(relay: Arc<Relay>, l: TcpListener) {
     loop {
-        let Ok((sock, _)) = l.accept().await else { continue };
+        let Ok((sock, from)) = l.accept().await else { continue };
+        if !relay.allow(crate::ratelimit::Class::Handshake, from.ip()) {
+            continue;
+        }
         let r = relay.clone();
         tokio::spawn(async move { agent_session(r, sock).await });
     }
@@ -214,7 +222,10 @@ async fn agent_session(relay: Arc<Relay>, sock: TcpStream) {
 
 pub async fn serve_guests(relay: Arc<Relay>, l: TcpListener) {
     loop {
-        let Ok((sock, _)) = l.accept().await else { continue };
+        let Ok((sock, from)) = l.accept().await else { continue };
+        if !relay.allow(crate::ratelimit::Class::Handshake, from.ip()) {
+            continue;
+        }
         let r = relay.clone();
         tokio::spawn(async move { guest_session(r, sock).await });
     }
@@ -399,6 +410,9 @@ pub async fn serve_voice(relay: Arc<Relay>, sock: Arc<UdpSocket>) {
     let mut buf = vec![0u8; 2048];
     loop {
         let Ok((n, from)) = sock.recv_from(&mut buf).await else { continue };
+        if !relay.allow(crate::ratelimit::Class::Udp, from.ip()) {
+            continue;
+        }
         let Some(t) = relay.udp_tunnel() else { continue };
         let id = {
             let mut p = lock(&t.peers);
@@ -423,6 +437,9 @@ pub async fn serve_voice(relay: Arc<Relay>, sock: Arc<UdpSocket>) {
 pub async fn serve_channel_tcp(relay: Arc<Relay>, chan: u8, l: TcpListener) {
     loop {
         let Ok((sock, from)) = l.accept().await else { continue };
+        if !relay.allow(crate::ratelimit::Class::Handshake, from.ip()) {
+            continue;
+        }
         let r = relay.clone();
         tokio::spawn(async move {
             if r.state.auth.require_ticket {
@@ -453,6 +470,9 @@ pub async fn serve_channel_udp(relay: Arc<Relay>, chan: u8, sock: Arc<UdpSocket>
     let mut buf = vec![0u8; 2048];
     loop {
         let Ok((n, from)) = sock.recv_from(&mut buf).await else { continue };
+        if !relay.allow(crate::ratelimit::Class::Udp, from.ip()) {
+            continue;
+        }
         let Some(t) = relay.udp_tunnel() else { continue };
         let id = {
             let mut p = lock(&t.peers);
