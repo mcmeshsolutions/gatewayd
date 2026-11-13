@@ -800,6 +800,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/worlds/:id/template", put(put_template))
         .route("/v1/templates", get(list_templates))
         .route("/v1/templates/:id/fork", post(fork_template))
+        .route("/v1/admin/blobs/batch", post(cas_blob_batch))
         .route("/v1/admin/blobs/:hash", get(cas_blob))
         .route("/v1/admin/worlds/:id/revisions", get(cas_revisions))
         .route("/v1/admin/worlds/:id/revisions/:rev/manifest", get(cas_manifest))
@@ -1037,4 +1038,38 @@ async fn fork_template(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world)
         Err("REVISION_PRUNED") => Err(ApiErr::Gone("REVISION_PRUNED")),
         Err(code) => Err(ApiErr::Conflict(code)),
     }
+}
+
+#[derive(Deserialize)]
+struct BatchReq {
+    hashes: Vec<String>,
+}
+
+const BATCH_MAX_HASHES: usize = 256;
+const BATCH_MAX_BYTES: usize = 16 << 20;
+
+/// Frames per requested hash, in order: 32 raw hash bytes, a status byte (0 missing, 1 present, 2 deferred
+/// because the response is full, ask again), and for 1 a u32 big-endian length plus the decompressed bytes.
+async fn cas_blob_batch(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): Json<BatchReq>) -> Result<Vec<u8>, ApiErr> {
+    let gw = s.gw();
+    admin_or_key(&s, &gw, &h, "read:cas")?;
+    if b.hashes.len() > BATCH_MAX_HASHES {
+        return Err(ApiErr::BadRequest("TOO_MANY_HASHES"));
+    }
+    let mut out = Vec::new();
+    for hex in &b.hashes {
+        let want = crate::cas::parse_hex(hex).ok_or(ApiErr::BadRequest("BAD_HASH"))?;
+        out.extend_from_slice(&want);
+        if !gw.cas().has(&want) {
+            out.push(0);
+        } else if out.len() >= BATCH_MAX_BYTES {
+            out.push(2);
+        } else {
+            let data = gw.cas().get(&want).map_err(|e| ApiErr::Domain(Error::Store(e.to_string())))?;
+            out.push(1);
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            out.extend_from_slice(&data);
+        }
+    }
+    Ok(out)
 }

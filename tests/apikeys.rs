@@ -220,3 +220,30 @@ async fn a_listed_template_can_be_forked_by_anyone_logged_in_and_only_then() {
     assert_eq!(c, 200);
     assert_eq!(call(&app, "POST", "tok-b", "/v1/templates/w1/fork", json!({ "name": "again" })).await.0, 404);
 }
+
+#[tokio::test]
+async fn a_cas_key_fetches_several_blobs_in_one_framed_response() {
+    let (app, rev) = app_with_chunks();
+    let (_, key) = make_key(&app, "renderer", json!(["read:cas"])).await;
+    let (_, v) = call(&app, "GET", &key, &format!("/v1/admin/worlds/w1/revisions/{rev}/manifest"), Value::Null).await;
+    let hash = v["leaves"].as_array().unwrap().iter().find(|l| l["type"] == "chunk").unwrap()["hash"].as_str().unwrap().to_string();
+    let post = |tok: &str, hashes: Vec<String>| {
+        let r = Request::builder().method("POST").uri("/v1/admin/blobs/batch").header("content-type", "application/json").header("authorization", format!("Bearer {tok}"));
+        let req = r.body(Body::from(json!({ "hashes": hashes }).to_string())).unwrap();
+        let app = app.clone();
+        async move {
+            let resp = app.oneshot(req).await.unwrap();
+            (resp.status().as_u16(), resp.into_body().collect().await.unwrap().to_bytes())
+        }
+    };
+    let (c, body) = post(&key, vec![hash.clone(), "0".repeat(64)]).await;
+    assert_eq!(c, 200);
+    assert_eq!(body[32], 1);
+    assert_eq!(&body[33..37], &6u32.to_be_bytes());
+    assert_eq!(&body[37..43], b"chunk1");
+    assert_eq!(&body[43 + 32..], &[0u8][..], "the unknown hash is reported missing");
+    assert_eq!(post(&key, vec!["zz".into()]).await.0, 400);
+    assert_eq!(post(&key, vec![hash.clone(); 257]).await.0, 400);
+    let (_, status_key) = make_key(&app, "grafana", json!(["read:status"])).await;
+    assert_eq!(post(&status_key, vec![hash]).await.0, 403);
+}
