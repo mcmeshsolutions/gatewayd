@@ -120,6 +120,11 @@ impl Gateway {
         if self.role(world, device)? != Role::Admin {
             return Err(Error::NotMember);
         }
+        self.set_member_unchecked(world, name, role)
+    }
+
+    /// Caller has already been authorised (world owner or gateway admin).
+    pub fn set_member_unchecked(&mut self, world: &str, name: &str, role: Option<Role>) -> Result<bool, Error> {
         let uuid: Option<String> = self
             .db
             .query_row("SELECT uuid FROM players WHERE name=? COLLATE NOCASE", params![name], |r| r.get(0))
@@ -237,7 +242,16 @@ async fn put_member(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): P
     };
     let mut gw = s.gw();
     let dev = auth(&gw, &h)?;
-    if gw.set_member(&dev, &world, &b.name, role)? {
+    crate::admin::require_owner_or_admin(&s, &gw, &dev, &world)?;
+    let target = gw.player_by_name(&b.name)?;
+    if target.as_ref().is_some_and(|(u, _)| gw.world_owner(&world).ok().flatten().as_deref() == Some(u.as_str()))
+        && role != Some(Role::Admin)
+    {
+        return Err(ApiErr::Conflict("OWNER_IMMUTABLE"));
+    }
+    if gw.set_member_unchecked(&world, &b.name, role)? {
+        let name = target.map_or(b.name.clone(), |t| t.1);
+        gw.audit(&dev, "role.world", &world, &name, json!({ "role": b.role }));
         Ok(Json(json!({ "ok": true })))
     } else {
         Err(ApiErr::Conflict("NO_SUCH_PLAYER_OR_LAST_ADMIN"))

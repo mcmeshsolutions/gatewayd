@@ -107,6 +107,8 @@ pub(crate) enum ApiErr {
     Forbidden(&'static str),
     Conflict(&'static str),
     Gone(&'static str),
+    NotFound(&'static str),
+    Maintenance(u64, String),
     BadRequest(&'static str),
     Domain(Error),
 }
@@ -124,6 +126,11 @@ impl IntoResponse for ApiErr {
             ApiErr::Forbidden(m) => (StatusCode::FORBIDDEN, m),
             ApiErr::Conflict(m) => (StatusCode::CONFLICT, m),
             ApiErr::Gone(m) => (StatusCode::GONE, m),
+            ApiErr::NotFound(m) => (StatusCode::NOT_FOUND, m),
+            ApiErr::Maintenance(retry, message) => {
+                let body = Json(json!({ "error": "MAINTENANCE", "retry_after_s": retry, "message": message }));
+                return (StatusCode::SERVICE_UNAVAILABLE, [(axum::http::header::RETRY_AFTER, retry.to_string())], body).into_response();
+            }
             ApiErr::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApiErr::Domain(Error::NotMember) => (StatusCode::FORBIDDEN, "NOT_MEMBER"),
             ApiErr::Domain(Error::NoSuchWorld) => (StatusCode::NOT_FOUND, "NO_SUCH_WORLD"),
@@ -224,8 +231,18 @@ async fn create_world(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): Jso
     let pack = req_pack(&h)?;
     let id = gw.create_world_for(&dev, &b.name, &b.mc_version, &b.loader)?;
     gw.set_pack(&id, &pack)?;
+    if let Some((uuid, _)) = gw.device_player(&dev)? {
+        gw.set_world_owner(&id, &uuid)?;
+    }
+    gw.audit(&dev, "world.create", &id, &id, json!({ "name": b.name }));
     s.hooks.emit("world.created", &id, json!({ "name": b.name }));
     Ok(Json(json!({ "id": id, "base_rev": format!("{id}:R_0000") })))
+}
+
+async fn device_me(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    Ok(Json(json!({ "device": dev })))
 }
 
 async fn list_worlds(
@@ -244,7 +261,7 @@ async fn list_worlds(
         .filter(|w| gw.pack_of(&w.0).map(|p| p == pack).unwrap_or(false))
         .map(|(id, name, mc, role, state, host)| {
             let ready = host.is_none() || s.live_worlds.lock().unwrap_or_else(|e| e.into_inner()).contains(&id);
-            let takeover = hw.filter(|_| ready).and_then(|(tier, score)| gw.takeover_in(&id, &dev, tier, score, now));
+            let takeover = hw.filter(|_| ready && gw.may_host(&id, &dev)).and_then(|(tier, score)| gw.takeover_in(&id, &dev, tier, score, now));
             let sync = if ready {
                 None
             } else {
@@ -280,6 +297,7 @@ async fn create_invite(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world)
     let code = gw.create_invite(&dev, &world, role)?;
     let expires_at = (ttl > 0).then(|| crate::lease::wall_s() + ttl);
     gw.set_invite_expiry(&code, expires_at)?;
+    gw.audit(&dev, "invite.create", &world, &code, json!({ "expires_at": expires_at }));
     Ok(Json(json!({ "code": code, "expires_at": expires_at, "link": format!("/invite/{code}") })))
 }
 
@@ -296,6 +314,7 @@ async fn redeem_invite(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): Js
     }
     let world = gw.redeem_invite(&dev, b.code.trim())?;
     gw.meter(&world, "invites_redeemed", 1);
+    gw.audit(&dev, "invite.redeem", &world, &b.code.trim().to_uppercase(), json!({}));
     let player = gw.device_player(&dev)?.map(|p| p.1);
     s.hooks.emit("member.joined", &world, json!({ "player": player }));
     Ok(Json(json!({ "world_id": world })))
@@ -307,13 +326,18 @@ async fn join(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<St
     let dev = auth(&gw, &h)?;
     gw.require_member(&world, &dev)?;
     gw.require_pack(&world, &req_pack(&h)?)?;
-    let hw = Hw { tier: b.hw.tier, score: b.hw.score, wants_host: b.hw.wants_host, takeover: b.hw.takeover };
+    let host_allowed = gw.may_host(&world, &dev);
+    let hw = Hw { tier: b.hw.tier, score: b.hw.score, wants_host: b.hw.wants_host && host_allowed, takeover: b.hw.takeover };
     if let Some(b) = b.hw.bench.as_ref().filter(|v| v.is_object() && v.to_string().len() <= 2048) {
         gw.record_bench(&dev, b)?;
     }
     gw.meter(&world, "joins", 1);
-    Ok(Json(match gw.join(&world, &dev, hw, now)? {
+    let before = gw.lease_of_world(&world);
+    let mut out = match gw.join(&world, &dev, hw, now)? {
         Join::Host(g) => {
+            if before.as_deref() != Some(g.lease_id.as_str()) {
+                gw.audit(&dev, "host.grant", &world, &g.lease_id, json!({ "epoch": g.epoch }));
+            }
             gw.meter(&world, "host_grants", 1);
             let player = gw.device_player(&dev)?.map(|p| p.1);
             s.hooks.emit("host.started", &world, json!({ "player": player, "epoch": g.epoch }));
@@ -321,7 +345,9 @@ async fn join(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<St
         }
         Join::Guest { epoch, host_device } => json!({ "decision": "GUEST", "epoch": epoch, "host": { "device": host_device } }),
         Join::Wait { phase } => json!({ "decision": "WAIT", "phase": phase, "retry_ms": 1500 }),
-    }))
+    };
+    out["host_allowed"] = json!(host_allowed);
+    Ok(Json(out))
 }
 
 #[derive(Deserialize)]
@@ -376,6 +402,7 @@ async fn commit(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Path<
     let mut gw = s.gw();
     let dev = auth(&gw, &h)?;
     own_lease(&gw, &dev, &lease)?;
+    s.check_commit(&gw, &dev, b.last)?;
     let world = gw.lease_world(&lease).unwrap_or_default();
     let r = match gw.commit(&lease, b.epoch, &b.base_rev, kind, b.last, now) {
         Ok(r) => r,
@@ -407,6 +434,7 @@ async fn release(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Path
     let dev = auth(&gw, &h)?;
     own_lease(&gw, &dev, &lease)?;
     gw.release(&lease, b.epoch, b.guests_present)?;
+    gw.audit(&dev, "host.release", &gw.lease_world(&lease).unwrap_or_default(), &lease, json!({}));
     let player = gw.device_player(&dev)?.map(|p| p.1);
     s.hooks.emit("host.released", &gw.lease_world(&lease).unwrap_or_default(), json!({ "player": player }));
     Ok(Json(json!({ "ok": true })))
@@ -552,6 +580,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/auth/key", post(crate::auth::key))
         .route("/v1/revisions/:rev/files", get(revision_files))
         .route("/v1/worlds/:id/ticket", post(crate::auth::ticket))
+        .route("/v1/devices/me", get(device_me))
         .route("/v1/worlds", post(create_world).get(list_worlds))
         .route("/v1/worlds/:id/invite", post(create_invite))
         .route("/v1/invites/redeem", post(redeem_invite))
@@ -566,6 +595,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/blobs/:hash/exists", get(blob_head))
         .merge(crate::panel::routes())
         .merge(crate::ops::routes())
+        .merge(crate::admin::routes())
+        .layer(axum::middleware::from_fn_with_state(state.clone(), crate::admin::gate))
         .layer(DefaultBodyLimit::max(MAX_BLOB))
         .with_state(state)
 }
