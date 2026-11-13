@@ -17,6 +17,7 @@ pub mod proxyproto;
 pub mod quota;
 pub mod ratelimit;
 pub mod relay;
+pub mod schedule;
 pub mod sanity;
 pub mod server;
 pub mod tunnel;
