@@ -74,7 +74,7 @@ impl Role {
             _ => Role::ClientOnly,
         }
     }
-    fn can_host(self) -> bool {
+    pub(crate) fn can_host(self) -> bool {
         self != Role::ClientOnly
     }
 }

@@ -52,7 +52,7 @@ async fn non_owner_member_is_refused() {
     let app = app();
     let (c, _, _, body) = get_export(&app, Some("tok-b"), "/v1/worlds/w1/export.zip", None).await;
     assert_eq!(c, 403);
-    assert!(String::from_utf8_lossy(&body).contains("NOT_MEMBER"));
+    assert!(String::from_utf8_lossy(&body).contains("OWNER_ONLY"));
 }
 
 #[tokio::test]

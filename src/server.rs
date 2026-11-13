@@ -630,9 +630,7 @@ async fn world_export(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world):
         let gw = s.gw();
         let dev = auth(&gw, &h)?;
         gw.pack_of(&world)?;
-        if gw.role(&world, &dev)? != crate::lease::Role::Admin {
-            return Err(ApiErr::Domain(Error::NotMember));
-        }
+        crate::admin::require_owner_or_admin(&s, &gw, &dev, &world)?;
         gw.require_pack(&world, &req_pack(&h)?)?;
         let root = gw.revision_root(&gw.head(&world)?)?;
         (root, gw.cas().clone())
@@ -694,6 +692,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(crate::panel::routes())
         .merge(crate::ops::routes())
         .merge(crate::admin::routes())
+        .merge(crate::crash::routes())
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::admin::gate))
         .layer(DefaultBodyLimit::max(MAX_BLOB))
         .with_state(state)

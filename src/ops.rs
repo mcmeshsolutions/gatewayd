@@ -38,6 +38,7 @@ impl Gateway {
         )?;
         let _ = self.db.execute("ALTER TABLE invites ADD COLUMN expires_at INTEGER", []);
         self.admin_init()?;
+        self.crash_init()?;
         Ok(())
     }
 
