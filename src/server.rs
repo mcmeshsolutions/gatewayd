@@ -102,7 +102,27 @@ impl AppState {
             eprintln!("tick failed: {e:?}");
         }
         sweep_if_due(&mut gw);
+        meter_anchor_time(&gw);
         self.limiter.sweep();
+    }
+}
+
+static LAST_ANCHOR_METER_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Adds a minute to `anchor_seconds` of every world an anchor device is hosting, once a minute. Feeds per-minute anchor billing later.
+fn meter_anchor_time(gw: &Gateway) {
+    let now = crate::lease::wall_s() as u64;
+    let last = LAST_ANCHOR_METER_S.load(std::sync::atomic::Ordering::Relaxed);
+    if last == 0 {
+        LAST_ANCHOR_METER_S.store(now, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    if now < last + 60 {
+        return;
+    }
+    LAST_ANCHOR_METER_S.store(now, std::sync::atomic::Ordering::Relaxed);
+    for w in gw.anchor_hosted_worlds().unwrap_or_default() {
+        gw.meter(&w, "anchor_seconds", now - last);
     }
 }
 

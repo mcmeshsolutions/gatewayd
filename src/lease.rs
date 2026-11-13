@@ -327,6 +327,15 @@ impl Gateway {
         Some(hold.saturating_sub(now.saturating_sub(t.granted)).div_ceil(1000))
     }
 
+    /// Worlds whose live lease belongs to a device an operator flagged as an anchor.
+    pub fn anchor_hosted_worlds(&self) -> Result<Vec<String>> {
+        let mut st = self.db.prepare(
+            "SELECT l.world_id FROM leases l JOIN devices d ON d.id=l.device_id WHERE l.status IN('ACTIVE','HANDOFF') AND d.anchor=1",
+        )?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     /// Operator-set flag; an anchor never displaces a live host that has fewer than 2 real players (or an unknown count).
     pub fn set_anchor(&mut self, device: &str, anchor: bool) -> Result<()> {
         self.db.execute("UPDATE devices SET anchor=? WHERE id=?", params![anchor, device])?;
@@ -951,4 +960,24 @@ pub(crate) fn seal(db: &rusqlite::Connection, id: &str) -> rusqlite::Result<()> 
     let h = chain_hash_of(db, id)?;
     db.execute("UPDATE revisions SET chain_hash=? WHERE id=?", params![h.as_slice(), id])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod anchor_meter_tests {
+    use super::*;
+
+    #[test]
+    fn only_worlds_hosted_by_an_anchor_device_are_listed() {
+        let mut g = Gateway::open(Connection::open_in_memory().unwrap(), crate::cas::Cas::open(std::env::temp_dir().join(format!("mcmesh-anchor-{}", std::process::id()))).unwrap(), 0).unwrap();
+        g.create_world("w1", "x", "1.21.1", "neoforge").unwrap();
+        g.create_world("w2", "y", "1.21.1", "neoforge").unwrap();
+        g.add_member("w1", "u-a", "alice", "dev-a", Role::HostEligible).unwrap();
+        g.add_member("w2", "u-b", "bob", "dev-b", Role::HostEligible).unwrap();
+        let hw = Hw { tier: 2, score: 5.0, wants_host: true, takeover: true };
+        g.join("w1", "dev-a", hw, 0).unwrap();
+        g.join("w2", "dev-b", hw, 0).unwrap();
+        assert!(g.anchor_hosted_worlds().unwrap().is_empty());
+        g.set_anchor("dev-b", true).unwrap();
+        assert_eq!(g.anchor_hosted_worlds().unwrap(), vec!["w2".to_string()]);
+    }
 }
