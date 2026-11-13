@@ -58,6 +58,7 @@ impl Gateway {
     }
 
     /// Checks a commit signature against the lease device's registered key and the gateway's own view of the WAL.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn verify_commit(&self, world: &str, lease: &str, device: &str, epoch: i64, base_rev: &str, kind: &str, last: bool, sig: &[u8; 64]) -> Result<[u8; 32]> {
         let key = self.device_key(device)?.ok_or(Error::NoDeviceKey)?;
         let msg = commit_message(world, lease, epoch, base_rev, kind, last, self.last_barrier(lease)?);

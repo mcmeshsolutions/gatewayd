@@ -125,7 +125,7 @@ fn classify(method: &Method, path: &str) -> Class {
     if path.starts_with("/v1/blobs/") || path.starts_with("/v1/leases/") {
         return Class::Bulk;
     }
-    if method == Method::POST && (path == "/v1/worlds" || path == "/v1/logs" || path.ends_with("/invite") || path.ends_with("/crash-report")) {
+    if method == Method::POST && (path == "/v1/worlds" || path == "/v1/logs" || path == "/v1/bandwidth" || path.ends_with("/invite") || path.ends_with("/crash-report")) {
         return Class::Create;
     }
     Class::Default
@@ -274,6 +274,7 @@ mod tests {
         assert_eq!(classify(&post, "/v1/leases/l1/heartbeat"), Class::Bulk);
         assert_eq!(classify(&post, "/v1/worlds"), Class::Create);
         assert_eq!(classify(&post, "/v1/logs"), Class::Create);
+        assert_eq!(classify(&post, "/v1/bandwidth"), Class::Create, "a megabyte per call is not a heartbeat");
         assert_eq!(classify(&post, "/v1/worlds/w1/invite"), Class::Create);
         assert_eq!(classify(&Method::GET, "/v1/worlds"), Class::Default);
         assert_eq!(classify(&Method::GET, "/metrics"), Class::Default);

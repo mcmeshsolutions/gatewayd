@@ -405,6 +405,7 @@ impl Gateway {
     /// Puts the chunks inside the rectangle (chunk coordinates, inclusive, one dimension; region, entity and poi data alike)
     /// back to how they were in `rev`, and leaves everything else as it is now. A new ROLLBACK revision records it, so it can
     /// be undone like any other. Only while the world is idle. Err carries a short code for the API.
+    #[allow(clippy::too_many_arguments)]
     pub fn rollback_region(&mut self, world: &str, rev: &str, dim: &str, min_cx: i32, min_cz: i32, max_cx: i32, max_cz: i32) -> Result<Result<RegionRollback, &'static str>, Error> {
         use crate::manifest::{self, Change, Item};
         if min_cx > max_cx || min_cz > max_cz {
