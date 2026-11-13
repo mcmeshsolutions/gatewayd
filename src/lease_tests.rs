@@ -294,3 +294,31 @@ fn revision_chain_detects_tampering() {
     let rep = g.scrub(&root.join("cas")).unwrap();
     assert_eq!(rep.chain_breaks, vec!["w1:R_0002".to_string()]);
 }
+
+#[test]
+fn scan_revision_names_the_corrupt_and_missing_blobs() {
+    let mut g = setup();
+    let root = std::env::temp_dir().join(format!("mcmesh-scan-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let cas_dir = root.join("cas");
+    g.cas = crate::cas::Cas::open(&cas_dir).unwrap();
+    g.create_world("w7", "m", "1.21.1", "neoforge").unwrap();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    let (h1, h2) = (g.cas.put(b"chunk-one").unwrap(), g.cas.put(b"chunk-two").unwrap());
+    wal_row(&g, &a.lease_id, 1, "put:region", 1, 1, h1);
+    wal_row(&g, &a.lease_id, 2, "put:region", 2, 1, h2);
+    wal_row(&g, &a.lease_id, 3, "barrier", 0, 0, [0; 32]);
+    let r = g.commit(&a.lease_id, a.epoch, &a.base_rev, CommitKind::Autosave, false, 1_000).unwrap();
+    let clean = g.scan_revision(&r.id).unwrap();
+    assert!(clean.ok() && clean.blobs >= 2, "{clean:?}");
+    let path = |h: &[u8; 32]| {
+        let x = crate::cas::hex(h);
+        cas_dir.join(&x[0..2]).join(&x[2..4]).join(x)
+    };
+    std::fs::write(path(&h1), b"garbage").unwrap();
+    std::fs::remove_file(path(&h2)).unwrap();
+    let bad = g.scan_revision(&r.id).unwrap();
+    assert_eq!(bad.corrupt, vec![crate::cas::hex(&h1)]);
+    assert_eq!(bad.missing, vec![crate::cas::hex(&h2)]);
+    assert!(!bad.ok());
+}
