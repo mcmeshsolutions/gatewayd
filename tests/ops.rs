@@ -65,6 +65,9 @@ async fn metrics_need_the_operator_token_and_count_per_world() {
     let r = Request::put(&path).header("authorization", "Bearer tok-a").body(Body::from(data.clone())).unwrap();
     assert_eq!(app.clone().oneshot(r).await.unwrap().status().as_u16(), 200);
     assert_eq!(send(&app, "GET", Some("tok-b"), &path, None).await.0, 200);
+    let missing = format!("/v1/blobs/{}/exists", "0".repeat(64));
+    assert_eq!(send(&app, "GET", Some("tok-b"), &missing, None).await.0, 200);
+    assert_eq!(send(&app, "GET", Some("tok-b"), &format!("{path}/exists"), None).await.0, 200);
 
     let (c, text) = send(&app, "GET", Some("scrape"), "/metrics", None).await;
     assert_eq!(c, 200);
@@ -79,6 +82,8 @@ async fn metrics_need_the_operator_token_and_count_per_world() {
         "mcmesh_commits_total{world=\"w1\"} 1",
         "mcmesh_blob_put_bytes_total{world=\"w1\"} 11",
         "mcmesh_blob_get_bytes_total{world=\"w1\"} 11",
+        "mcmesh_blob_checks_total 2",
+        "mcmesh_blob_check_hits_total 1",
     ] {
         assert!(text.lines().any(|l| l == line), "missing {line:?} in\n{text}");
     }

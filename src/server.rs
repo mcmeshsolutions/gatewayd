@@ -699,6 +699,10 @@ async fn blob_head(State(s): State<Arc<AppState>>, h: HeaderMap, Path(hash): Pat
     let gw = s.gw();
     let dev = auth(&gw, &h)?;
     let present = gw.blob_visible(&dev, &want)? && gw.cas().has(&want);
+    gw.meter("", "blob_checks", 1);
+    if present {
+        gw.meter("", "blob_check_hits", 1);
+    }
     Ok(Json(json!({ "hash": hex(&want), "present": present })))
 }
 
