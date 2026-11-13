@@ -49,6 +49,9 @@ impl Gateway {
              CREATE TABLE IF NOT EXISTS world_aux(
                world_id TEXT NOT NULL, ns TEXT NOT NULL, key TEXT NOT NULL, value BLOB NOT NULL, updated_by TEXT NOT NULL, updated_at INTEGER NOT NULL,
                PRIMARY KEY(world_id, ns, key)) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS world_bans(
+               world_id TEXT NOT NULL, player_uuid TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', banned_by TEXT NOT NULL, banned_at INTEGER NOT NULL,
+               PRIMARY KEY(world_id, player_uuid)) WITHOUT ROWID;
              CREATE TABLE IF NOT EXISTS world_templates(
                world_id TEXT PRIMARY KEY, description TEXT NOT NULL DEFAULT '', set_by TEXT NOT NULL, set_at INTEGER NOT NULL) WITHOUT ROWID;
              CREATE TABLE IF NOT EXISTS world_host_allow(
@@ -802,6 +805,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/worlds/:id/fork", post(post_fork))
         .route("/v1/worlds/:id/template", put(put_template))
         .route("/v1/worlds/:id/aux/:ns/:key", get(aux_get).put(aux_put))
+        .route("/v1/worlds/:id/bans", get(world_bans).post(world_ban))
+        .route("/v1/worlds/:id/bans/:name", axum::routing::delete(world_unban))
         .route("/v1/templates", get(list_templates))
         .route("/v1/templates/:id/fork", post(fork_template))
         .route("/v1/admin/blobs/batch", post(cas_blob_batch))
@@ -1127,4 +1132,74 @@ async fn aux_put(State(s): State<Arc<AppState>>, h: HeaderMap, Path((world, ns, 
         )
         .map_err(db)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+impl Gateway {
+    pub(crate) fn is_world_banned(&self, world: &str, uuid: &str) -> bool {
+        self.db.query_row("SELECT 1 FROM world_bans WHERE world_id=? AND player_uuid=?", params![world, uuid], |_| Ok(())).is_ok()
+    }
+
+    pub(crate) fn invite_world(&self, code: &str) -> Option<String> {
+        self.db.query_row("SELECT world_id FROM invites WHERE code=?", params![code.to_uppercase()], |r| r.get(0)).ok()
+    }
+}
+
+#[derive(Deserialize)]
+struct BanReq {
+    name: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// Owner or admin bans a player from one world: they lose their seat and cannot redeem an invite for it again.
+async fn world_ban(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<BanReq>) -> R {
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    let (actor, _) = require_owner_or_admin(&s, &gw, &dev, &world)?;
+    if b.reason.len() > 256 {
+        return Err(ApiErr::BadRequest("BAD_REASON"));
+    }
+    let (uuid, name) = gw.player_by_name(&b.name)?.ok_or(ApiErr::NotFound("NO_SUCH_USER"))?;
+    if uuid == actor {
+        return Err(ApiErr::Conflict("CANNOT_TARGET_SELF"));
+    }
+    if gw.world_owner(&world)?.as_deref() == Some(uuid.as_str()) {
+        return Err(ApiErr::Conflict("CANNOT_BAN_OWNER"));
+    }
+    gw.db
+        .execute(
+            "INSERT OR REPLACE INTO world_bans(world_id, player_uuid, reason, banned_by, banned_at) VALUES(?,?,?,?,?)",
+            params![world, uuid, b.reason, actor, wall_s()],
+        )
+        .map_err(|e| ApiErr::Domain(Error::Db(e)))?;
+    gw.set_member_unchecked(&world, &name, None)?;
+    gw.audit(&dev, "world.ban", &world, &name, json!({ "reason": b.reason }));
+    s.hooks.emit("member.banned", &world, json!({ "player": name }));
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn world_unban(State(s): State<Arc<AppState>>, h: HeaderMap, Path((world, name)): Path<(String, String)>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_owner_or_admin(&s, &gw, &dev, &world)?;
+    let (uuid, name) = gw.player_by_name(&name)?.ok_or(ApiErr::NotFound("NO_SUCH_USER"))?;
+    let n = gw.db.execute("DELETE FROM world_bans WHERE world_id=? AND player_uuid=?", params![world, uuid]).map_err(|e| ApiErr::Domain(Error::Db(e)))?;
+    if n == 0 {
+        return Err(ApiErr::NotFound("NOT_BANNED"));
+    }
+    gw.audit(&dev, "world.unban", &world, &name, json!({}));
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn world_bans(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_owner_or_admin(&s, &gw, &dev, &world)?;
+    let db = |e: rusqlite::Error| ApiErr::Domain(Error::Db(e));
+    let mut st = gw
+        .db
+        .prepare("SELECT p.name, b.reason, b.banned_at FROM world_bans b JOIN players p ON p.uuid=b.player_uuid WHERE b.world_id=? ORDER BY b.banned_at DESC")
+        .map_err(db)?;
+    let rows = st.query_map(params![world], |r| Ok(json!({ "name": r.get::<_, String>(0)?, "reason": r.get::<_, String>(1)?, "banned_at": r.get::<_, i64>(2)? }))).map_err(db)?;
+    Ok(Json(json!({ "bans": rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db)? })))
 }

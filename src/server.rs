@@ -403,6 +403,11 @@ async fn redeem_invite(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): Js
     if let Some(Err(())) = gw.invite_info(b.code.trim())? {
         return Err(ApiErr::Gone("INVITE_EXPIRED"));
     }
+    if let (Some(w), Some((uuid, _))) = (gw.invite_world(b.code.trim()), gw.device_player(&dev)?) {
+        if gw.is_world_banned(&w, &uuid) {
+            return Err(ApiErr::Forbidden("BANNED_FROM_WORLD"));
+        }
+    }
     let world = gw.redeem_invite(&dev, b.code.trim())?;
     gw.meter(&world, "invites_redeemed", 1);
     gw.audit(&dev, "invite.redeem", &world, &b.code.trim().to_uppercase(), json!({}));

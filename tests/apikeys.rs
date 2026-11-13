@@ -269,3 +269,27 @@ async fn aux_values_are_written_by_the_owner_and_read_by_members() {
     assert_eq!(run(req("PUT", "tok-a", "/v1/worlds/w1/aux/Map/home", b"x".to_vec())).await.0, 400, "names are lowercase");
     assert_eq!(run(req("PUT", "tok-a", "/v1/worlds/w1/aux/map/big", vec![0; 65537])).await.0, 413, "the router body limit answers first");
 }
+
+#[tokio::test]
+async fn a_world_ban_removes_the_seat_and_blocks_invites_until_lifted() {
+    let app = app();
+    let (c, v) = call(&app, "POST", "tok-b", "/v1/worlds/w1/bans", json!({ "name": "alice" })).await;
+    assert_eq!((c, v["error"].as_str()), (403, Some("OWNER_ONLY")), "members cannot ban");
+    let (c, v) = call(&app, "POST", "tok-a", "/v1/worlds/w1/bans", json!({ "name": "alice" })).await;
+    assert_eq!((c, v["error"].as_str()), (409, Some("CANNOT_TARGET_SELF")));
+    let (c, v) = call(&app, "POST", "tok-a", "/v1/worlds/w1/bans", json!({ "name": "nobody" })).await;
+    assert_eq!((c, v["error"].as_str()), (404, Some("NO_SUCH_USER")));
+    let (_, inv) = call(&app, "POST", "tok-a", "/v1/worlds/w1/invite", json!({})).await;
+    let code = inv["code"].as_str().unwrap().to_string();
+    let (c, _) = call(&app, "POST", "tok-a", "/v1/worlds/w1/bans", json!({ "name": "bob", "reason": "griefing" })).await;
+    assert_eq!(c, 200);
+    assert_eq!(call(&app, "GET", "tok-b", "/v1/worlds/w1/policy", Value::Null).await.0, 403, "the seat is gone");
+    let (c, v) = call(&app, "POST", "tok-b", "/v1/invites/redeem", json!({ "code": code })).await;
+    assert_eq!((c, v["error"].as_str()), (403, Some("BANNED_FROM_WORLD")));
+    let (_, v) = call(&app, "GET", "tok-a", "/v1/worlds/w1/bans", Value::Null).await;
+    assert_eq!((v["bans"][0]["name"].as_str(), v["bans"][0]["reason"].as_str()), (Some("bob"), Some("griefing")));
+    assert_eq!(call(&app, "DELETE", "tok-a", "/v1/worlds/w1/bans/bob", Value::Null).await.0, 200);
+    assert_eq!(call(&app, "DELETE", "tok-a", "/v1/worlds/w1/bans/bob", Value::Null).await.0, 404);
+    let (c, _) = call(&app, "POST", "tok-b", "/v1/invites/redeem", json!({ "code": code })).await;
+    assert_eq!(c, 200, "the unused invite works again after the ban is lifted");
+}
