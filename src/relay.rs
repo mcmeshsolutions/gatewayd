@@ -398,6 +398,20 @@ async fn guest_session(relay: Arc<Relay>, mut sock: TcpStream, peer: SocketAddr)
         }
         return;
     };
+    // server list pings always get through, so players can see why a world turns them away
+    if !first.as_deref().is_some_and(is_status) {
+        let guests = lock(&t.streams).len() as u64;
+        let verdict = relay.state.gw().guest_admission(&world, guests, crate::lease::wall_s());
+        if let Err(crate::lease::Error::Quota(hit)) = verdict {
+            eprintln!("relay: guest turned away from {world}: {} ({} of {})", hit.code, hit.used, hit.limit);
+            if first.is_some() {
+                use tokio::io::AsyncWriteExt;
+                let msg = if hit.code == "QUOTA_GUESTS" { "This world is full right now. Try again later." } else { "This world has used up its relay bandwidth for this month." };
+                let _ = sock.write_all(&crate::mcproto::login_disconnect(msg)).await;
+            }
+            return;
+        }
+    }
     let _ = sock.set_nodelay(true);
     let id = t.next.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::channel(32);

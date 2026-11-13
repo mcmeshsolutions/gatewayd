@@ -27,6 +27,10 @@ pub struct Limits {
     pub world_count: Option<u64>,
     pub keep_revisions: Option<u64>,
     pub keep_days: Option<u64>,
+    /// world scope: guests connected at once
+    pub max_guests: Option<u64>,
+    /// world scope: relayed bytes (both directions) per calendar month, UTC
+    pub relay_bytes_month: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +50,8 @@ pub struct SweepReport {
 pub(crate) fn migrate(db: &Connection, cas: &Cas) -> rusqlite::Result<()> {
     let _ = db.execute("ALTER TABLE worlds ADD COLUMN owner_uuid TEXT", []);
     let _ = db.execute("ALTER TABLE blob_world ADD COLUMN size INTEGER", []);
+    let _ = db.execute("ALTER TABLE quotas ADD COLUMN max_guests INTEGER", []);
+    let _ = db.execute("ALTER TABLE quotas ADD COLUMN relay_bytes_month INTEGER", []);
     let _ = db.execute("ALTER TABLE revisions ADD COLUMN pruned INTEGER NOT NULL DEFAULT 0", []);
     db.execute(
         "UPDATE worlds SET owner_uuid=(SELECT player_uuid FROM members m WHERE m.world_id=worlds.id AND m.role='ADMIN' ORDER BY m.rowid LIMIT 1) \
@@ -64,16 +70,30 @@ pub(crate) fn migrate(db: &Connection, cas: &Cas) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Name of the meter that counts relayed bytes for the calendar month (UTC) containing `secs`.
+pub(crate) fn month_meter(secs: i64) -> String {
+    // days since 1970-01-01 to a civil date, Howard Hinnant's algorithm
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("relay_month_{y:04}{m:02}")
+}
+
 impl Gateway {
     fn limit_row(&self, scope: Scope, id: &str) -> Result<Limits> {
         let row = self
             .db
             .query_row(
-                "SELECT storage_bytes, world_count, keep_revisions, keep_days FROM quotas WHERE scope=? AND id=?",
+                "SELECT storage_bytes, world_count, keep_revisions, keep_days, max_guests, relay_bytes_month FROM quotas WHERE scope=? AND id=?",
                 params![scope.as_str(), id],
                 |r| {
                     let f = |i| r.get::<_, Option<i64>>(i).map(|v| v.map(|n| n.max(0) as u64));
-                    Ok(Limits { storage_bytes: f(0)?, world_count: f(1)?, keep_revisions: f(2)?, keep_days: f(3)? })
+                    Ok(Limits { storage_bytes: f(0)?, world_count: f(1)?, keep_revisions: f(2)?, keep_days: f(3)?, max_guests: f(4)?, relay_bytes_month: f(5)? })
                 },
             )
             .optional()?;
@@ -84,8 +104,8 @@ impl Gateway {
     pub fn set_limits(&mut self, scope: Scope, id: &str, l: &Limits) -> Result<()> {
         let n = |v: Option<u64>| v.map(|x| x.min(i64::MAX as u64) as i64);
         self.db.execute(
-            "INSERT OR REPLACE INTO quotas(scope,id,storage_bytes,world_count,keep_revisions,keep_days) VALUES(?,?,?,?,?,?)",
-            params![scope.as_str(), id, n(l.storage_bytes), n(l.world_count), n(l.keep_revisions), n(l.keep_days)],
+            "INSERT OR REPLACE INTO quotas(scope,id,storage_bytes,world_count,keep_revisions,keep_days,max_guests,relay_bytes_month) VALUES(?,?,?,?,?,?,?,?)",
+            params![scope.as_str(), id, n(l.storage_bytes), n(l.world_count), n(l.keep_revisions), n(l.keep_days), n(l.max_guests), n(l.relay_bytes_month)],
         )?;
         Ok(())
     }
@@ -98,6 +118,8 @@ impl Gateway {
             world_count: own.world_count.or(def.world_count),
             keep_revisions: own.keep_revisions.or(def.keep_revisions),
             keep_days: own.keep_days.or(def.keep_days),
+            max_guests: own.max_guests.or(def.max_guests),
+            relay_bytes_month: own.relay_bytes_month.or(def.relay_bytes_month),
         })
     }
 
@@ -124,6 +146,29 @@ impl Gateway {
         )?;
         let worlds: i64 = self.db.query_row("SELECT COUNT(*) FROM worlds WHERE owner_uuid=?", params![uuid], |r| r.get(0))?;
         Ok((bytes as u64, worlds as u64))
+    }
+
+    fn meter_value(&self, world: &str, name: &str) -> u64 {
+        let v: Option<i64> = self.db.query_row("SELECT value FROM meters WHERE world_id=? AND name=?", params![world, name], |r| r.get(0)).optional().ok().flatten();
+        v.unwrap_or(0).max(0) as u64
+    }
+
+    /// Whether one more guest may connect: `guests_now` is the number already connected, `now_s` unix seconds.
+    /// Over a cap the guest is turned away; nothing already connected is touched and no data is deleted.
+    pub(crate) fn guest_admission(&self, world: &str, guests_now: u64, now_s: i64) -> Result<()> {
+        let l = self.limits(Scope::World, world)?;
+        if let Some(limit) = l.max_guests {
+            if guests_now >= limit {
+                return Err(Error::Quota(QuotaHit { code: "QUOTA_GUESTS", limit, used: guests_now }));
+            }
+        }
+        if let Some(limit) = l.relay_bytes_month {
+            let used = self.meter_value(world, &month_meter(now_s));
+            if used >= limit {
+                return Err(Error::Quota(QuotaHit { code: "QUOTA_RELAY_MONTH", limit, used }));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn check_world_count(&self, uuid: &str) -> Result<()> {
@@ -413,6 +458,43 @@ mod tests {
             Err(Error::Quota(h)) => assert_eq!(h.code, "QUOTA_STORAGE_WORLD"),
             other => panic!("expected a quota refusal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn month_meter_names_follow_the_utc_calendar() {
+        assert_eq!(month_meter(0), "relay_month_197001");
+        assert_eq!(month_meter(951_782_400), "relay_month_200002");
+        assert_eq!(month_meter(1_709_164_800), "relay_month_202402", "2024-02-29 00:00 UTC");
+        assert_eq!(month_meter(1_709_251_199), "relay_month_202402");
+        assert_eq!(month_meter(1_709_251_200), "relay_month_202403", "2024-03-01 00:00 UTC");
+        assert_eq!(month_meter(1_700_000_000), "relay_month_202311");
+        assert_eq!(month_meter(1_735_689_599), "relay_month_202412");
+        assert_eq!(month_meter(1_735_689_600), "relay_month_202501");
+    }
+
+    #[test]
+    fn guests_are_turned_away_at_the_cap_and_when_the_month_budget_is_spent() {
+        let mut g = gw();
+        g.ops_init().unwrap();
+        g.guest_admission("w", 1_000, 0).unwrap();
+        g.set_limits(Scope::World, "w", &Limits { max_guests: Some(2), relay_bytes_month: Some(1_000), ..Default::default() }).unwrap();
+        g.guest_admission("w", 1, 0).unwrap();
+        match g.guest_admission("w", 2, 0) {
+            Err(Error::Quota(h)) => assert_eq!((h.code, h.limit, h.used), ("QUOTA_GUESTS", 2, 2)),
+            other => panic!("expected the guest cap, got {other:?}"),
+        }
+        let now = 1_700_000_000;
+        g.meter("w", &month_meter(now), 999);
+        g.guest_admission("w", 0, now).unwrap();
+        g.meter("w", &month_meter(now), 1);
+        match g.guest_admission("w", 0, now) {
+            Err(Error::Quota(h)) => assert_eq!((h.code, h.limit, h.used), ("QUOTA_RELAY_MONTH", 1_000, 1_000)),
+            other => panic!("expected the bandwidth cap, got {other:?}"),
+        }
+        g.guest_admission("w", 0, now + 40 * 86_400).unwrap();
+        g.set_limits(Scope::World, "*", &Limits { max_guests: Some(0), ..Default::default() }).unwrap();
+        g.set_limits(Scope::World, "w", &Limits::default()).unwrap();
+        assert!(g.guest_admission("w", 0, now).is_err(), "unset fields inherit the default row");
     }
 
     #[test]

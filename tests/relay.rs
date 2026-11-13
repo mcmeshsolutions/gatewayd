@@ -41,6 +41,10 @@ async fn env_with(require_ticket: bool) -> Env {
 }
 
 async fn env_full(require_ticket: bool, proxy_protocol: bool) -> Env {
+    env_limited(require_ticket, proxy_protocol, None).await
+}
+
+async fn env_limited(require_ticket: bool, proxy_protocol: bool, limits: Option<gatewayd::quota::Limits>) -> Env {
     let dir = std::env::temp_dir().join(format!("mcmesh-relay-{}-{}", std::process::id(), rand_id()));
     let mut g = Gateway::open(Connection::open_in_memory().unwrap(), Cas::open(dir).unwrap(), 0).unwrap();
     g.create_world("w1", "w", "1.21.1", "neoforge").unwrap();
@@ -50,6 +54,9 @@ async fn env_full(require_ticket: bool, proxy_protocol: bool) -> Env {
     g.add_token("dev-b", "tok-b").unwrap();
     g.add_member("w1", "u-c", "carol", "dev-c", Role::ClientOnly).unwrap();
     g.add_token("dev-c", "tok-c").unwrap();
+    if let Some(l) = limits {
+        g.set_limits(gatewayd::quota::Scope::World, "w1", &l).unwrap();
+    }
     let cfg = gatewayd::auth::AuthCfg { require_ticket, ..Default::default() };
     let state = AppState::with_auth(g, cfg);
     let app = router(state.clone());
@@ -404,4 +411,25 @@ async fn a_guest_that_drips_bytes_is_cut_at_the_handshake_deadline() {
     };
     tokio::time::timeout(Duration::from_secs(40), closed).await.expect("relay must cut the connection");
     assert!(started.elapsed() < Duration::from_secs(30), "cut near the 20 s deadline, not later");
+}
+
+#[tokio::test]
+async fn a_world_at_its_guest_cap_turns_new_guests_away_without_relaying() {
+    let limits = gatewayd::quota::Limits { max_guests: Some(0), ..Default::default() };
+    let e = env_limited(false, false, Some(limits)).await;
+    let (mc, vc) = fake_server().await;
+    run_agent(&e, "tok-a", 1, mc, vc).await.unwrap();
+    let mut s = TcpStream::connect(e.guests).await.unwrap();
+    let _ = s.write_all(b"let me in").await;
+    let mut buf = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await.expect("closed in time").unwrap_or(0);
+    assert_eq!(n, 0, "nothing is echoed back by the host");
+}
+
+#[tokio::test]
+async fn a_world_without_caps_still_relays() {
+    let e = env_limited(false, false, Some(gatewayd::quota::Limits { max_guests: Some(5), relay_bytes_month: Some(1 << 30), ..Default::default() })).await;
+    let (mc, vc) = fake_server().await;
+    run_agent(&e, "tok-a", 1, mc, vc).await.unwrap();
+    assert_eq!(&roundtrip(e.guests, b"under the cap").await[..], &b"UNDER THE CAP"[..]);
 }

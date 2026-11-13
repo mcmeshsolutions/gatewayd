@@ -96,6 +96,7 @@ impl AppState {
         for (world, (up, down)) in relayed {
             gw.meter(&world, "relay_to_host_bytes", up);
             gw.meter(&world, "relay_to_guest_bytes", down);
+            gw.meter(&world, &crate::quota::month_meter(crate::lease::wall_s()), up + down);
         }
         if let Err(e) = gw.tick(now) {
             eprintln!("tick failed: {e:?}");
