@@ -130,3 +130,26 @@ async fn a_cas_key_lists_revisions_and_manifests_and_nothing_else() {
     let (c, v) = call(&app, "GET", &status_key, "/v1/admin/worlds/w1/revisions", Value::Null).await;
     assert_eq!((c, v["error"].as_str()), (403, Some("SCOPE_DENIED")));
 }
+
+#[tokio::test]
+async fn a_cas_key_downloads_a_blob_by_hash_from_a_manifest_leaf() {
+    let (app, rev) = app_with_chunks();
+    let (_, key) = make_key(&app, "renderer", json!(["read:cas"])).await;
+    let (_, v) = call(&app, "GET", &key, &format!("/v1/admin/worlds/w1/revisions/{rev}/manifest"), Value::Null).await;
+    let hash = v["leaves"].as_array().unwrap().iter().find(|l| l["type"] == "chunk").unwrap()["hash"].as_str().unwrap().to_string();
+    let get = |tok: &str, h: &str| {
+        let r = Request::builder().uri(format!("/v1/admin/blobs/{h}")).header("authorization", format!("Bearer {tok}"));
+        let app = app.clone();
+        let req = r.body(Body::empty()).unwrap();
+        async move {
+            let resp = app.oneshot(req).await.unwrap();
+            (resp.status().as_u16(), resp.into_body().collect().await.unwrap().to_bytes())
+        }
+    };
+    let (c, body) = get(&key, &hash).await;
+    assert_eq!((c, &body[..]), (200, &b"chunk1"[..]));
+    assert_eq!(get(&key, "zz").await.0, 400);
+    assert_eq!(get(&key, &"0".repeat(64)).await.0, 404);
+    let (_, status_key) = make_key(&app, "grafana", json!(["read:status"])).await;
+    assert_eq!(get(&status_key, &hash).await.0, 403);
+}

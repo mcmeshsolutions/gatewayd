@@ -793,6 +793,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/worlds/:id/handover-vote", get(get_handover_vote).post(cast_handover_vote))
         .route("/v1/worlds/:id/handover-vote/propose", post(propose_handover))
         .route("/v1/admin/usage", get(admin_usage))
+        .route("/v1/admin/blobs/:hash", get(cas_blob))
         .route("/v1/admin/worlds/:id/revisions", get(cas_revisions))
         .route("/v1/admin/worlds/:id/revisions/:rev/manifest", get(cas_manifest))
         .route("/v1/worlds/:id/signing", put(put_signing))
@@ -849,4 +850,15 @@ async fn cas_manifest(State(s): State<Arc<AppState>>, h: HeaderMap, Path((world,
     })
     .map_err(|e| ApiErr::Domain(Error::Store(format!("{e:?}"))))?;
     Ok(Json(json!({ "revision": rev, "total": total, "offset": offset, "leaves": leaves })))
+}
+
+/// Raw bytes of one stored blob for external tools. Needs `read:cas` or an admin login; the hash comes from a manifest leaf.
+async fn cas_blob(State(s): State<Arc<AppState>>, h: HeaderMap, Path(hash): Path<String>) -> Result<Vec<u8>, ApiErr> {
+    let gw = s.gw();
+    admin_or_key(&s, &gw, &h, "read:cas")?;
+    let want = crate::cas::parse_hex(&hash).ok_or(ApiErr::BadRequest("BAD_HASH"))?;
+    if !gw.cas().has(&want) {
+        return Err(ApiErr::NotFound("NO_SUCH_BLOB"));
+    }
+    gw.cas().get(&want).map_err(|e| ApiErr::Domain(Error::Store(e.to_string())))
 }
