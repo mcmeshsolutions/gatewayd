@@ -108,3 +108,19 @@ async fn the_world_list_shows_the_hosts_reported_load_and_players() {
     let (_, v) = call(&app, "GET", Some("tok-c"), "/v1/worlds", Value::Null).await;
     assert_eq!((find(&v)["host_load"].as_u64(), find(&v)["host_players"].as_u64()), (Some(2), Some(3)));
 }
+
+#[tokio::test]
+async fn the_discovery_document_is_public_and_lists_features_without_secrets() {
+    let app = app();
+    let resp = app.clone().oneshot(Request::get("/.well-known/mcmesh-gateway.json").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["gateway"], "mcmesh");
+    assert_eq!(v["api"], "/v1");
+    assert!(v["auth"].as_array().unwrap().iter().any(|a| a == "key"));
+    assert!(v["features"].as_array().unwrap().iter().any(|f| f == "handover_vote"));
+    assert_eq!(v["relay"], Value::Null, "no relay address is advertised in this test setup");
+    let text = String::from_utf8_lossy(&bytes).to_lowercase();
+    assert!(!text.contains("token") && !text.contains("secret"), "nothing sensitive: {text}");
+}

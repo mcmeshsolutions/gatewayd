@@ -343,6 +343,28 @@ fn public_status(s: &AppState) -> Result<Value, Error> {
     }))
 }
 
+/// Public discovery document for launchers, bots and the client's trust prompt. Nothing secret, nothing per player.
+async fn well_known(State(s): State<Arc<AppState>>) -> Json<Value> {
+    let mut auth = Vec::new();
+    if s.auth.mojang {
+        auth.push("mojang");
+    }
+    if s.auth.key {
+        auth.push("key");
+    }
+    Json(json!({
+        "gateway": "mcmesh",
+        "version": env!("CARGO_PKG_VERSION"),
+        "api": "/v1",
+        "auth": auth,
+        "relay": (!s.auth.advertise.is_empty()).then(|| s.auth.advertise.clone()),
+        "guest_tickets": s.auth.require_ticket,
+        "world_creation": if s.auth.allow_create { "open" } else { "admins" },
+        "require_signed_commits": s.auth.require_signed,
+        "features": ["quotas", "audit", "events", "api_keys", "handover_vote", "region_rollback", "crash_reports", "pack_versions", "metrics", "webhooks"],
+    }))
+}
+
 async fn status_json(State(s): State<Arc<AppState>>) -> Result<Json<Value>, ApiErr> {
     Ok(Json(public_status(&s)?))
 }
@@ -390,6 +412,7 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/status", get(status_page))
         .route("/v1/status", get(status_json))
+        .route("/.well-known/mcmesh-gateway.json", get(well_known))
         .route("/metrics", get(metrics))
         .route("/invite/:code", get(invite_page))
         .route("/v1/worlds/:id/events", get(world_events))
