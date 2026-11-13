@@ -543,8 +543,69 @@ async fn put_signing(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): 
     Ok(Json(json!({ "ok": true, "require_signed": b.require_signed })))
 }
 
+fn limit_json(l: &crate::quota::Limits) -> Value {
+    json!({
+        "storage_bytes": l.storage_bytes, "world_count": l.world_count, "keep_revisions": l.keep_revisions,
+        "keep_days": l.keep_days, "max_guests": l.max_guests, "relay_bytes_month": l.relay_bytes_month,
+    })
+}
+
+const USAGE_MAX_WORLDS: usize = 500;
+
+/// Usage against limits for every world and every world owner, biggest storage first. Admin only.
+async fn admin_usage(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
+    use crate::quota::{month_meter, Scope};
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_admin(&s, &gw, &dev)?;
+    let db = |e: rusqlite::Error| ApiErr::Domain(Error::Db(e));
+    let month = month_meter(wall_s());
+    let ids: Vec<(String, String)> = {
+        let mut st = gw.db.prepare("SELECT id, name FROM worlds").map_err(db)?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(db)?;
+        rows.collect::<rusqlite::Result<_>>().map_err(db)?
+    };
+    let mut worlds = Vec::with_capacity(ids.len());
+    let mut owner_set = std::collections::BTreeSet::new();
+    for (id, name) in ids {
+        let revisions: i64 = gw.db.query_row("SELECT COUNT(*) FROM revisions WHERE world_id=? AND pruned=0", params![id], |r| r.get(0)).map_err(db)?;
+        let owner_uuid = gw.world_owner(&id)?;
+        let owner = owner_uuid.as_ref().and_then(|u| gw.db.query_row("SELECT name FROM players WHERE uuid=?", params![u], |r| r.get::<_, String>(0)).ok());
+        if let Some(u) = owner_uuid {
+            owner_set.insert(u);
+        }
+        worlds.push(json!({
+            "id": id, "name": name, "owner": owner,
+            "storage_bytes": gw.world_usage(&id)?, "revisions": revisions,
+            "relay_bytes_month": gw.meter_value(&id, &month),
+            "commits": gw.meter_value(&id, "commits"),
+            "limits": limit_json(&gw.limits(Scope::World, &id)?),
+        }));
+    }
+    worlds.sort_by_key(|w| std::cmp::Reverse(w["storage_bytes"].as_u64().unwrap_or(0)));
+    let total_worlds = worlds.len();
+    worlds.truncate(USAGE_MAX_WORLDS);
+    let mut owners: Vec<(String, String)> = Vec::new();
+    for uuid in owner_set {
+        if let Ok(name) = gw.db.query_row("SELECT name FROM players WHERE uuid=?", params![uuid], |r| r.get::<_, String>(0)) {
+            owners.push((uuid, name));
+        }
+    }
+    let mut users = Vec::with_capacity(owners.len());
+    for (uuid, name) in owners {
+        let (bytes, worlds_owned) = gw.user_usage(&uuid)?;
+        users.push(json!({ "uuid": uuid, "name": name, "storage_bytes": bytes, "worlds": worlds_owned, "limits": limit_json(&gw.limits(Scope::User, &uuid)?) }));
+    }
+    users.sort_by_key(|u| std::cmp::Reverse(u["storage_bytes"].as_u64().unwrap_or(0)));
+    Ok(Json(json!({
+        "month": month.trim_start_matches("relay_month_"),
+        "total_worlds": total_worlds, "worlds": worlds, "users": users,
+    })))
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/v1/admin/usage", get(admin_usage))
         .route("/v1/worlds/:id/signing", put(put_signing))
         .route("/v1/admin/audit", get(admin_audit))
         .route("/v1/admin/maintenance", get(get_maintenance).put(put_maintenance))
