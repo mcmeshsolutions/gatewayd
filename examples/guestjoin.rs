@@ -1,6 +1,6 @@
 //! Logs in to a mesh world as a guest the way the mod does (ticket in the handshake address) and reports what the server
 //! answers up to Login Success. Used by scripts/headless-e2e.sh.
-//! usage: guestjoin <api-url> <world> <token|-> <relay host:port> <name>     (a token of "-" sends no ticket)
+//! usage: guestjoin <api-url> <world> <token|-> <relay host:port> <name> [forge-before|forge-after]   (a token of "-" sends no ticket; forge-* adds a modded client marker to the address)
 use gatewayd::mcproto::{read_varint, write_varint};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -42,12 +42,16 @@ fn read_packet(s: &mut TcpStream, compressed: bool) -> std::io::Result<Vec<u8>> 
 
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
-    if a.len() != 5 {
-        eprintln!("usage: guestjoin <api-url> <world> <token|-> <relay host:port> <name>");
+    if a.len() != 5 && a.len() != 6 {
+        eprintln!("usage: guestjoin <api-url> <world> <token|-> <relay host:port> <name> [forge-before|forge-after]");
         std::process::exit(2);
     }
     let (api, world, token, relay, name) = (&a[0], &a[1], &a[2], &a[3], &a[4]);
+    let forge = a.get(5).map(String::as_str);
     let mut address = "127.0.0.1".to_string();
+    if forge == Some("forge-before") {
+        address.push_str("\0FML3\0");
+    }
     if token != "-" {
         let r: serde_json::Value = ureq::post(&format!("{api}/v1/worlds/{world}/ticket"))
             .set("Authorization", &format!("Bearer {token}"))
@@ -59,6 +63,9 @@ fn main() {
             .into_json()
             .expect("ticket json");
         address = format!("{address}\0mesh={}", r["ticket"].as_str().expect("ticket"));
+    }
+    if forge == Some("forge-after") {
+        address.push_str("\0FML3\0");
     }
     let mut s = TcpStream::connect(relay).expect("connect to the relay");
     s.set_read_timeout(Some(Duration::from_secs(10))).ok();
