@@ -77,6 +77,11 @@ fn invariants(g: &Gateway, seed: u64, step: usize, last_epoch: &mut i64, last_se
 }
 
 fn run(seed: u64, steps: usize, n: usize, anchors: bool) {
+    run_with(seed, steps, n, anchors, false);
+}
+
+/// `restarts` adds a host process that starts again and asks with a fresh join; off, the trajectories of the older seeds do not change.
+fn run_with(seed: u64, steps: usize, n: usize, anchors: bool, restarts: bool) {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let mut prng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1);
     let mut g = gateway(n);
@@ -107,6 +112,35 @@ fn run(seed: u64, steps: usize, n: usize, anchors: bool) {
         }
         g.tick(now).unwrap();
         let i = rng.below(n as u64) as usize;
+        if restarts && !devs[i].crashed && prng.below(8) == 0 {
+            let d = &mut devs[i];
+            let before_epoch: i64 = g.db().query_row("SELECT COALESCE(MAX(epoch),0) FROM leases WHERE world_id=?", params![W], |r| r.get(0)).unwrap();
+            d.grant = None;
+            let dropped = match g.drop_own_lease(W, d.name) {
+                Ok(b) => b,
+                Err(Error::Quota(_)) => {
+                    assert!(over);
+                    false
+                }
+                Err(e) => panic!("drop_own_lease {e:?}, seed {seed} step {step}"),
+            };
+            let hw = Hw { tier: d.tier, score: d.score, wants_host: true, takeover: false };
+            match g.join(W, d.name, hw, now) {
+                Ok(Join::Host(gr)) => {
+                    if dropped {
+                        assert!(gr.epoch > before_epoch, "a restarted host must get a newer epoch, seed {seed} step {step}");
+                        assert_eq!(gr.base_rev, g.head(W).unwrap(), "a restarted host starts from the head, seed {seed} step {step}");
+                    }
+                    d.base = gr.base_rev.clone();
+                    d.grant = Some(gr);
+                }
+                Ok(_) => {}
+                Err(Error::Quota(_)) => assert!(over),
+                Err(e) => assert!(benign(&e), "restart join failed {e:?}, seed {seed} step {step}"),
+            }
+            invariants(&g, seed, step, &mut last_epoch, &mut last_seq);
+            continue;
+        }
         let action = rng.below(10);
         let d = &mut devs[i];
         match action {
@@ -228,5 +262,12 @@ fn chaos_two_to_four_devices() {
 fn chaos_with_anchors_never_displaces_a_small_host() {
     for seed in 1..=300u64 {
         run(seed, 400, 2 + (seed % 3) as usize, true);
+    }
+}
+
+#[test]
+fn chaos_with_restarting_hosts() {
+    for seed in 1..=300u64 {
+        run_with(seed, 400, 2 + (seed % 3) as usize, seed % 2 == 0, true);
     }
 }
