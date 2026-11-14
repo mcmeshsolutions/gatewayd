@@ -96,6 +96,23 @@ fn main() {
             0x03 => compressed = true,
             0x02 => {
                 println!("login success");
+                // GUESTJOIN_HOLD=<seconds> keeps the connection open and drains it, to have a guest present during a handover
+                let hold = std::env::var("GUESTJOIN_HOLD").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                if hold > 0 {
+                    let until = std::time::Instant::now() + Duration::from_secs(hold);
+                    let mut sink = [0u8; 512];
+                    while std::time::Instant::now() < until {
+                        match s.read(&mut sink) {
+                            Ok(0) => {
+                                println!("connection closed by the other side");
+                                return;
+                            }
+                            Ok(_) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {}
+                            Err(_) => return,
+                        }
+                    }
+                }
                 return;
             }
             0x01 => {
