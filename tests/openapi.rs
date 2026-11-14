@@ -38,3 +38,41 @@ fn the_openapi_file_lists_exactly_the_registered_api_routes() {
     assert!(missing.is_empty(), "routes missing from or different in docs/openapi.json: {missing:?}");
     assert!(stale.is_empty(), "docs/openapi.json lists routes that are not registered: {stale:?}");
 }
+
+fn refs(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m {
+                if k == "$ref" {
+                    out.push(x.as_str().unwrap().to_string());
+                } else {
+                    refs(x, out);
+                }
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|x| refs(x, out)),
+        _ => {}
+    }
+}
+
+#[test]
+fn every_schema_reference_resolves_and_required_fields_are_declared() {
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(format!("{}/../docs/openapi.json", env!("CARGO_MANIFEST_DIR"))).unwrap()).unwrap();
+    let schemas = doc["components"]["schemas"].as_object().unwrap();
+    let mut all = Vec::new();
+    refs(&doc, &mut all);
+    assert!(!all.is_empty());
+    for r in all {
+        let name = r.strip_prefix("#/components/schemas/").unwrap_or_else(|| panic!("unexpected reference {r}"));
+        assert!(schemas.contains_key(name), "{r} points at nothing");
+    }
+    for (name, s) in schemas {
+        if let Some(req) = s["required"].as_array() {
+            for f in req {
+                assert!(s["properties"].get(f.as_str().unwrap()).is_some(), "{name}: required field {f} is not declared");
+            }
+        }
+    }
+    let with_body = doc["paths"].as_object().unwrap().values().flat_map(|m| m.as_object().unwrap().values()).filter(|op| op.get("requestBody").is_some()).count();
+    assert!(with_body >= 25, "request bodies documented: {with_body}");
+}
