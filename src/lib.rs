@@ -10,6 +10,7 @@ pub mod ops;
 pub mod chain;
 pub mod devsig;
 pub mod lease;
+pub mod locks;
 #[cfg(test)]
 mod chaos_tests;
 #[cfg(test)]

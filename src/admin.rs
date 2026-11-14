@@ -25,6 +25,7 @@ const PAGE_MAX: i64 = 200;
 
 impl Gateway {
     pub fn admin_init(&self) -> Result<(), Error> {
+        self.locks_init()?;
         self.db.execute_batch(
             "CREATE TABLE IF NOT EXISTS audit_log(
                id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,

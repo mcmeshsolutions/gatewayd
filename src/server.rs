@@ -503,6 +503,51 @@ async fn heartbeat(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Pa
     Ok(Json(json!({ "ok": true, "expires_in": EXPIRY_MS / 1000, "directives": dirs })))
 }
 
+
+#[derive(Deserialize)]
+struct LockReq {
+    epoch: i64,
+    name: String,
+    owner: String,
+    #[serde(default)]
+    ttl_s: Option<i64>,
+}
+
+fn lock_name_ok(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'_' || b == b'-')
+}
+
+/// Mods take named locks through the host's lease. A lock from an older epoch is void, the token only grows (see locks.rs).
+async fn lock_take(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Path<String>, Json(b): Json<LockReq>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    own_lease(&gw, &dev, &lease)?;
+    if !lock_name_ok(&b.name) || !lock_name_ok(&b.owner) {
+        return Err(ApiErr::BadRequest("BAD_LOCK_NAME"));
+    }
+    let (world, _) = gw.require_live(&lease, b.epoch)?;
+    match gw.lock_take(&world, &b.name, &b.owner, b.epoch, b.ttl_s.unwrap_or(60), crate::lease::wall_s())? {
+        crate::locks::Taken::Granted { token } => Ok(Json(json!({ "granted": true, "token": token }))),
+        crate::locks::Taken::HeldBy { owner, until } => Ok(Json(json!({ "granted": false, "held_by": owner, "until": until }))),
+    }
+}
+
+async fn lock_release(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Path<String>, Json(b): Json<LockReq>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    own_lease(&gw, &dev, &lease)?;
+    let (world, _) = gw.require_live(&lease, b.epoch)?;
+    Ok(Json(json!({ "released": gw.lock_release(&world, &b.name, &b.owner, b.epoch)? })))
+}
+
+async fn locks_list(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    gw.require_member(&world, &dev)?;
+    let rows = gw.locks_list(&world, crate::lease::wall_s())?;
+    let locks: Vec<Value> = rows.into_iter().map(|(name, owner, epoch, token, until)| json!({ "name": name, "owner": owner, "epoch": epoch, "token": token, "until": until })).collect();
+    Ok(Json(json!({ "locks": locks })))
+}
 #[derive(Deserialize)]
 struct CommitReq {
     epoch: i64,
@@ -824,6 +869,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/worlds/:id/join", post(join))
         .route("/v1/leases/:id/heartbeat", post(heartbeat))
         .route("/v1/leases/:id/commit", post(commit))
+        .route("/v1/leases/:id/lock", post(lock_take))
+        .route("/v1/leases/:id/unlock", post(lock_release))
+        .route("/v1/worlds/:id/locks", get(locks_list))
         .route("/v1/leases/:id/release", post(release))
         .route("/v1/leases/:id/host-ready", post(host_ready))
         .route("/v1/leases/:id/wal", post(wal_append).layer(DefaultBodyLimit::max(MAX_WAL)))
@@ -898,6 +946,45 @@ mod core_wiring_tests {
         let (c, _) = post(format!("/v1/leases/{lease}/heartbeat"), json!({ "epoch": 1 })).await;
         assert_eq!(c, 200);
         assert_eq!(state.gw().lease_players("w1").unwrap(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn locks_go_through_the_live_lease_and_a_stale_epoch_cannot_take_one() {
+        let cas = crate::cas::Cas::open(std::env::temp_dir().join(format!("mcmesh-lockhttp-{}", std::process::id()))).unwrap();
+        let mut g = Gateway::open(rusqlite::Connection::open_in_memory().unwrap(), cas, 0).unwrap();
+        g.create_world("w1", "x", "1.21.1", "neoforge").unwrap();
+        g.add_member("w1", "u-a", "alice", "dev-a", Role::HostEligible).unwrap();
+        g.add_token("dev-a", "tok-a").unwrap();
+        g.add_member("w1", "u-b", "bob", "dev-b", Role::HostEligible).unwrap();
+        g.add_token("dev-b", "tok-b").unwrap();
+        g.ops_init().unwrap();
+        let app = router(AppState::new(g));
+        let call = |tok: &'static str, method: &'static str, path: String, body: Value| {
+            let app = app.clone();
+            async move {
+                let r = Request::builder().method(method).uri(path).header("content-type", "application/json").header("authorization", format!("Bearer {tok}")).body(Body::from(body.to_string())).unwrap();
+                let resp = app.oneshot(r).await.unwrap();
+                let code = resp.status().as_u16();
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                (code, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+            }
+        };
+        let (_, v) = call("tok-a", "POST", "/v1/worlds/w1/join".into(), json!({ "hw": { "tier": 2, "score": 5.0 } })).await;
+        let lease = v["lease"]["id"].as_str().unwrap().to_string();
+        let path = format!("/v1/leases/{lease}/lock");
+        let (c, v) = call("tok-a", "POST", path.clone(), json!({ "epoch": 1, "name": "quarry", "owner": "moda", "ttl_s": 30 })).await;
+        assert_eq!((c, v["granted"].as_bool(), v["token"].as_i64()), (200, Some(true), Some(1)));
+        let (_, v) = call("tok-a", "POST", path.clone(), json!({ "epoch": 1, "name": "quarry", "owner": "modb" })).await;
+        assert_eq!((v["granted"].as_bool(), v["held_by"].as_str()), (Some(false), Some("moda")));
+        assert_eq!(call("tok-a", "POST", path.clone(), json!({ "epoch": 1, "name": "Bad Name", "owner": "moda" })).await.0, 400);
+        assert_eq!(call("tok-a", "POST", path.clone(), json!({ "epoch": 9, "name": "quarry", "owner": "moda" })).await.0, 409, "a wrong epoch is refused");
+        assert_eq!(call("tok-b", "POST", path.clone(), json!({ "epoch": 1, "name": "x", "owner": "moda" })).await.0, 403, "only the lease holder");
+        let (_, v) = call("tok-b", "GET", "/v1/worlds/w1/locks".into(), Value::Null).await;
+        assert_eq!(v["locks"][0]["name"], "quarry", "members can see the locks");
+        let (_, v) = call("tok-a", "POST", format!("/v1/leases/{lease}/unlock"), json!({ "epoch": 1, "name": "quarry", "owner": "moda" })).await;
+        assert_eq!(v["released"], true);
+        let (_, v) = call("tok-a", "POST", path, json!({ "epoch": 1, "name": "quarry", "owner": "modb" })).await;
+        assert_eq!((v["granted"].as_bool(), v["token"].as_i64()), (Some(true), Some(2)));
     }
 
     #[test]
