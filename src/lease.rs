@@ -170,6 +170,7 @@ pub struct Gateway {
     guests_seen: HashMap<(String, String), u64>,
     rounds: HashMap<String, vote::Round>,
     vote_cool: HashMap<(String, String), u64>,
+    sizes: crate::sanity::SizeCache,
 }
 
 fn unix_s() -> i64 {
@@ -220,6 +221,7 @@ impl Gateway {
             guests_seen: HashMap::new(),
             rounds: HashMap::new(),
             vote_cool: HashMap::new(),
+            sizes: Default::default(),
         };
         // restart: give every live lease a full TTL before judging it dead
         let live: Vec<(String, i64)> = {
@@ -663,7 +665,7 @@ impl Gateway {
         let head = self.head(world)?;
         let base = self.revision_root(&head)?;
         let root = manifest::apply(&self.cas, Some(base), changes)?;
-        if let Err(why) = crate::sanity::check(&self.cas, base, root) {
+        if let Err(why) = crate::sanity::check(&self.cas, base, root, &mut self.sizes) {
             return Err(Error::Rejected(why));
         }
         let tx = self.db.transaction()?;

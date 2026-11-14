@@ -11,9 +11,13 @@ fn enabled() -> bool {
     std::env::var("MCMESH_SANITY").map(|v| v != "off").unwrap_or(true)
 }
 
+/// Stored size of recently seen revision roots. A commit knows the size of its new root from the delta, so only the first check after a restart walks every blob.
+#[derive(Default)]
+pub struct SizeCache(std::collections::HashMap<Hash, u64>);
+
 /// Compares the head root with the root a commit would produce. `Err` carries the reason.
-pub fn check(cas: &Cas, base: Hash, next: Hash) -> Result<(), String> {
-    check_with(enabled(), cas, base, next)
+pub fn check(cas: &Cas, base: Hash, next: Hash, cache: &mut SizeCache) -> Result<(), String> {
+    check_cached(enabled(), cas, base, next, cache)
 }
 
 /// Stored bytes of every leaf under `root`; unreadable leaves count as zero so one lost blob cannot freeze commits.
@@ -39,7 +43,12 @@ fn size_verdict(before: u64, after: u64) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn check_with(on: bool, cas: &Cas, base: Hash, next: Hash) -> Result<(), String> {
+    check_cached(on, cas, base, next, &mut SizeCache::default())
+}
+
+fn check_cached(on: bool, cas: &Cas, base: Hash, next: Hash, cache: &mut SizeCache) -> Result<(), String> {
     if !on || base == next {
         return Ok(());
     }
@@ -54,12 +63,20 @@ fn check_with(on: bool, cas: &Cas, base: Hash, next: Hash) -> Result<(), String>
     if had && !has {
         return Err("level.dat disappeared".into());
     }
-    let before = total_bytes(cas, base).map_err(io)?;
+    let before = match cache.0.get(&base) {
+        Some(b) => *b,
+        None => total_bytes(cas, base).map_err(io)?,
+    };
     let delta = manifest::diff(cas, Some(base), Some(next)).map_err(io)?;
     let size_of = |h: Option<Hash>| h.map(|h| cas.stored_len(&h).unwrap_or(0)).unwrap_or(0);
     let added: u64 = delta.iter().map(|d| size_of(d.new)).sum();
     let removed: u64 = delta.iter().map(|d| size_of(d.old)).sum();
-    size_verdict(before, (before + added).saturating_sub(removed))
+    let after = (before + added).saturating_sub(removed);
+    if cache.0.len() >= 16 {
+        cache.0.clear();
+    }
+    cache.0.insert(next, after);
+    size_verdict(before, after)
 }
 
 #[cfg(test)]
@@ -105,6 +122,27 @@ mod tests {
         check_with(true, &c, base, slim).unwrap();
         let bigger = world(&c, &[400_000; 6]);
         check_with(true, &c, base, bigger).unwrap();
+    }
+
+    #[test]
+    fn the_size_of_a_new_root_comes_from_the_delta_and_equals_a_full_walk() {
+        let c = cas();
+        let base = world(&c, &[400_000; 4]);
+        let next = world(&c, &[400_000, 400_000, 400_000, 300_000]);
+        let mut cache = SizeCache::default();
+        check_cached(true, &c, base, next, &mut cache).unwrap();
+        assert_eq!(cache.0.get(&next).copied(), Some(total_bytes(&c, next).unwrap()), "the cached size must be the real size");
+    }
+
+    #[test]
+    fn a_cached_size_is_used_instead_of_walking_the_base() {
+        let c = cas();
+        let base = world(&c, &[400_000; 4]);
+        let tiny = world(&c, &[400_000, 10, 10, 10]);
+        assert!(check_cached(true, &c, base, tiny, &mut SizeCache::default()).is_err(), "a real walk sees the collapse");
+        let mut cache = SizeCache::default();
+        cache.0.insert(base, 100 << 20);
+        assert!(check_cached(true, &c, base, tiny, &mut cache).is_ok(), "with a cached (wrong) size of 100 MiB the same delta looks small, so the cache was used");
     }
 
     #[test]
