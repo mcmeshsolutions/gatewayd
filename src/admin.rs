@@ -64,6 +64,7 @@ impl Gateway {
              CREATE TABLE IF NOT EXISTS world_host_allow(
                world_id TEXT NOT NULL, player_uuid TEXT NOT NULL, PRIMARY KEY(world_id, player_uuid)) WITHOUT ROWID;",
         )?;
+        let _ = self.db.execute("ALTER TABLE world_reports ADD COLUMN evidence TEXT NOT NULL DEFAULT ''", []);
         let _ = self.db.execute("ALTER TABLE devices ADD COLUMN anchor_ram_mb INTEGER", []);
         let _ = self.db.execute("ALTER TABLE devices ADD COLUMN anchor_cores INTEGER", []);
         let _ = self.db.execute("ALTER TABLE world_policy ADD COLUMN require_signed INTEGER NOT NULL DEFAULT 0", []);
@@ -1433,15 +1434,53 @@ async fn world_report(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world):
     let gw = s.gw();
     let dev = auth(&gw, &h)?;
     gw.require_member(&world, &dev)?;
-    if b.reason.trim().is_empty() || b.reason.len() > 1000 {
+    let (me, _) = gw.device_player(&dev)?.ok_or(ApiErr::Unauthorized)?;
+    file_report(&s, &gw, &dev, &world, &me, &b.name, &b.reason, "", false)
+}
+
+const EVIDENCE_MAX: usize = 4000;
+
+#[derive(Deserialize)]
+pub(crate) struct HostReportReq {
+    pub epoch: i64,
+    pub reporter: String,
+    pub name: String,
+    pub reason: String,
+    #[serde(default)]
+    pub evidence: String,
+}
+
+/// The live host files a report for a player who typed `/meshreport chat ...` in game, attaching the chat lines that player agreed to share.
+/// The host is trusted for who typed the command the same way it is trusted for everything else in its own server.
+pub(crate) async fn host_report(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Path<String>, Json(b): Json<HostReportReq>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    match gw.lease_device(&lease)? {
+        Some(d) if d == dev => {}
+        Some(_) => return Err(ApiErr::Forbidden("NOT_LEASE_HOLDER")),
+        None => return Err(ApiErr::Domain(Error::StaleEpoch)),
+    }
+    let (world, _) = gw.require_live(&lease, b.epoch)?;
+    let (reporter, _) = gw.player_by_name(&b.reporter)?.ok_or(ApiErr::NotFound("NO_SUCH_USER"))?;
+    if !gw.is_member_uuid(&world, &reporter) {
+        return Err(ApiErr::NotFound("NOT_A_MEMBER"));
+    }
+    file_report(&s, &gw, &dev, &world, &reporter, &b.name, &b.reason, &b.evidence, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn file_report(s: &AppState, gw: &Gateway, dev: &str, world: &str, me: &str, target_name: &str, reason: &str, evidence: &str, via_host: bool) -> R {
+    if reason.trim().is_empty() || reason.len() > 1000 {
         return Err(ApiErr::BadRequest("BAD_REASON"));
     }
-    let (me, _) = gw.device_player(&dev)?.ok_or(ApiErr::Unauthorized)?;
-    let (target, name) = gw.player_by_name(&b.name)?.ok_or(ApiErr::NotFound("NO_SUCH_USER"))?;
+    if evidence.len() > EVIDENCE_MAX {
+        return Err(ApiErr::BadRequest("EVIDENCE_TOO_LONG"));
+    }
+    let (target, name) = gw.player_by_name(target_name)?.ok_or(ApiErr::NotFound("NO_SUCH_USER"))?;
     if target == me {
         return Err(ApiErr::Conflict("CANNOT_TARGET_SELF"));
     }
-    if !gw.is_member_uuid(&world, &target) {
+    if !gw.is_member_uuid(world, &target) {
         return Err(ApiErr::NotFound("NOT_A_MEMBER"));
     }
     let db = |e: rusqlite::Error| ApiErr::Domain(Error::Db(e));
@@ -1450,11 +1489,11 @@ async fn world_report(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world):
         return Err(ApiErr::Conflict("TOO_MANY_OPEN_REPORTS"));
     }
     gw.db
-        .execute("INSERT INTO world_reports(world_id, reporter, target, reason, created_at) VALUES(?,?,?,?,?)", params![world, me, target, b.reason, wall_s()])
+        .execute("INSERT INTO world_reports(world_id, reporter, target, reason, created_at, evidence) VALUES(?,?,?,?,?,?)", params![world, me, target, reason, wall_s(), evidence])
         .map_err(db)?;
     let id = gw.db.last_insert_rowid();
-    gw.audit(&dev, "world.report", &world, &name, json!({ "report": id }));
-    s.hooks.emit("member.reported", &world, json!({ "report": id }));
+    gw.audit(dev, "world.report", world, &name, json!({ "report": id, "via_host": via_host, "evidence_bytes": evidence.len() }));
+    s.hooks.emit("member.reported", world, json!({ "report": id }));
     Ok(Json(json!({ "id": id })))
 }
 
@@ -1467,7 +1506,7 @@ async fn list_reports(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world):
     let mut st = gw
         .db
         .prepare(
-            "SELECT r.id, rp.name, tp.name, r.reason, r.created_at, r.resolved_at, r.note FROM world_reports r \
+            "SELECT r.id, rp.name, tp.name, r.reason, r.created_at, r.resolved_at, r.note, r.evidence FROM world_reports r \
              JOIN players rp ON rp.uuid=r.reporter JOIN players tp ON tp.uuid=r.target \
              WHERE r.world_id=? AND (?2 OR r.resolved_at IS NULL) ORDER BY r.id DESC LIMIT 200",
         )
@@ -1475,7 +1514,7 @@ async fn list_reports(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world):
     let rows = st
         .query_map(params![world, all], |r| {
             Ok(json!({ "id": r.get::<_, i64>(0)?, "reporter": r.get::<_, String>(1)?, "target": r.get::<_, String>(2)?, "reason": r.get::<_, String>(3)?,
-                       "created_at": r.get::<_, i64>(4)?, "resolved_at": r.get::<_, Option<i64>>(5)?, "note": r.get::<_, String>(6)? }))
+                       "created_at": r.get::<_, i64>(4)?, "resolved_at": r.get::<_, Option<i64>>(5)?, "note": r.get::<_, String>(6)?, "evidence": r.get::<_, String>(7)? }))
         })
         .map_err(db)?;
     Ok(Json(json!({ "reports": rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db)? })))

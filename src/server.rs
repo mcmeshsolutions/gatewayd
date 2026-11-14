@@ -871,6 +871,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/leases/:id/heartbeat", post(heartbeat))
         .route("/v1/leases/:id/commit", post(commit))
         .route("/v1/leases/:id/lock", post(lock_take))
+        .route("/v1/leases/:id/report", post(crate::admin::host_report))
         .route("/v1/leases/:id/unlock", post(lock_release))
         .route("/v1/worlds/:id/locks", get(locks_list))
         .route("/v1/leases/:id/release", post(release))
@@ -986,6 +987,44 @@ mod core_wiring_tests {
         assert_eq!(v["released"], true);
         let (_, v) = call("tok-a", "POST", path, json!({ "epoch": 1, "name": "quarry", "owner": "modb" })).await;
         assert_eq!((v["granted"].as_bool(), v["token"].as_i64()), (Some(true), Some(2)));
+    }
+
+    #[tokio::test]
+    async fn the_host_files_a_report_for_a_player_with_the_chat_they_agreed_to_share() {
+        let cas = crate::cas::Cas::open(std::env::temp_dir().join(format!("mcmesh-hostreport-{}", std::process::id()))).unwrap();
+        let mut g = Gateway::open(rusqlite::Connection::open_in_memory().unwrap(), cas, 0).unwrap();
+        g.create_world("w1", "x", "1.21.1", "neoforge").unwrap();
+        for (u, n, d, t, r) in [("u-a", "alice", "dev-a", "tok-a", Role::Admin), ("u-b", "bob", "dev-b", "tok-b", Role::HostEligible), ("u-c", "carol", "dev-c", "tok-c", Role::ClientOnly)] {
+            g.add_member("w1", u, n, d, r).unwrap();
+            g.add_token(d, t).unwrap();
+        }
+        g.ops_init().unwrap();
+        let cfg = crate::auth::AuthCfg { admins: vec!["u-a".into()], ..Default::default() };
+        let app = router(AppState::with_auth(g, cfg));
+        let call = |tok: &'static str, method: &'static str, path: String, body: Value| {
+            let app = app.clone();
+            async move {
+                let r = Request::builder().method(method).uri(path).header("content-type", "application/json").header("authorization", format!("Bearer {tok}")).body(Body::from(body.to_string())).unwrap();
+                let resp = app.oneshot(r).await.unwrap();
+                let code = resp.status().as_u16();
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                (code, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+            }
+        };
+        let (_, v) = call("tok-b", "POST", "/v1/worlds/w1/join".into(), json!({ "hw": { "tier": 2, "score": 5.0 } })).await;
+        let lease = v["lease"]["id"].as_str().unwrap().to_string();
+        let path = format!("/v1/leases/{lease}/report");
+        let body = |evidence: &str| json!({ "epoch": 1, "reporter": "carol", "name": "alice", "reason": "built over my base", "evidence": evidence });
+        assert_eq!(call("tok-a", "POST", path.clone(), body("x")).await.0, 403, "only the lease holder can vouch");
+        let (c, v) = call("tok-b", "POST", path.clone(), body("<alice> hi\n<alice> your base is mine")).await;
+        assert_eq!((c, v["id"].as_i64()), (200, Some(1)));
+        assert_eq!(call("tok-b", "POST", path.clone(), body(&"x".repeat(4001))).await.1["error"], "EVIDENCE_TOO_LONG");
+        assert_eq!(call("tok-b", "POST", path.clone(), json!({ "epoch": 1, "reporter": "nobody", "name": "alice", "reason": "r" })).await.1["error"], "NO_SUCH_USER");
+        assert_eq!(call("tok-b", "POST", path, json!({ "epoch": 1, "reporter": "carol", "name": "carol", "reason": "r" })).await.1["error"], "CANNOT_TARGET_SELF");
+        let (_, v) = call("tok-a", "GET", "/v1/worlds/w1/reports".into(), Value::Null).await;
+        assert_eq!((v["reports"][0]["reporter"].as_str(), v["reports"][0]["evidence"].as_str()), (Some("carol"), Some("<alice> hi\n<alice> your base is mine")));
+        let (_, v) = call("tok-a", "GET", "/v1/worlds/w1/moderation".into(), Value::Null).await;
+        assert_eq!(v["events"][0]["detail"]["via_host"], true, "the log says the host vouched for it");
     }
 
     #[test]
