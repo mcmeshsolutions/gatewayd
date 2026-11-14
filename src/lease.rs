@@ -329,6 +329,15 @@ impl Gateway {
         Some(hold.saturating_sub(now.saturating_sub(t.granted)).div_ceil(1000))
     }
 
+    /// World and registered memory of every live lease held by an operator-flagged anchor.
+    pub fn anchor_hosted_profiles(&self) -> Result<Vec<(String, Option<i64>)>> {
+        let mut st = self.db.prepare(
+            "SELECT l.world_id, d.anchor_ram_mb FROM leases l JOIN devices d ON d.id=l.device_id WHERE l.status IN('ACTIVE','HANDOFF') AND d.anchor=1",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     /// Worlds whose live lease belongs to a device an operator flagged as an anchor.
     pub fn anchor_hosted_worlds(&self) -> Result<Vec<String>> {
         let mut st = self.db.prepare(

@@ -158,8 +158,9 @@ fn meter_anchor_time(gw: &Gateway) {
         return;
     }
     LAST_ANCHOR_METER_S.store(now, std::sync::atomic::Ordering::Relaxed);
-    for w in gw.anchor_hosted_worlds().unwrap_or_default() {
+    for (w, ram) in gw.anchor_hosted_profiles().unwrap_or_default() {
         gw.meter(&w, "anchor_seconds", now - last);
+        gw.meter(&w, &format!("anchor_seconds_{}", crate::admin::anchor_profile(ram)), now - last);
     }
 }
 

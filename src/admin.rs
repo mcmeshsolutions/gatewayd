@@ -64,6 +64,8 @@ impl Gateway {
              CREATE TABLE IF NOT EXISTS world_host_allow(
                world_id TEXT NOT NULL, player_uuid TEXT NOT NULL, PRIMARY KEY(world_id, player_uuid)) WITHOUT ROWID;",
         )?;
+        let _ = self.db.execute("ALTER TABLE devices ADD COLUMN anchor_ram_mb INTEGER", []);
+        let _ = self.db.execute("ALTER TABLE devices ADD COLUMN anchor_cores INTEGER", []);
         let _ = self.db.execute("ALTER TABLE world_policy ADD COLUMN require_signed INTEGER NOT NULL DEFAULT 0", []);
         let _ = self.db.execute("ALTER TABLE world_policy ADD COLUMN handover_vote INTEGER NOT NULL DEFAULT 0", []);
         Ok(())
@@ -808,6 +810,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/worlds/:id/handover-vote", get(get_handover_vote).post(cast_handover_vote))
         .route("/v1/worlds/:id/handover-vote/propose", post(propose_handover))
         .route("/v1/admin/usage", get(admin_usage))
+        .route("/v1/anchors/register", post(anchor_register))
+        .route("/v1/admin/anchors", get(admin_anchors))
         .route("/v1/worlds/:id/transfer", post(post_transfer))
         .route("/v1/worlds/:id/fork", post(post_fork))
         .route("/v1/worlds/:id/template", put(put_template))
@@ -1321,6 +1325,63 @@ async fn moderation_log(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world
         .take(200)
         .collect();
     Ok(Json(json!({ "events": keep })))
+}
+
+/// Size class of an anchor by its memory, used to meter anchor time per profile.
+pub fn anchor_profile(ram_mb: Option<i64>) -> &'static str {
+    match ram_mb {
+        None => "unknown",
+        Some(m) if m < 4096 => "s",
+        Some(m) if m < 8192 => "m",
+        Some(m) if m < 16384 => "l",
+        Some(_) => "xl",
+    }
+}
+
+#[derive(Deserialize)]
+struct AnchorReg {
+    ram_mb: i64,
+    #[serde(default)]
+    cores: i64,
+}
+
+/// An operator-flagged anchor (`gatewayd set-anchor`) tells the gateway what it has. Registering never makes a device an anchor.
+async fn anchor_register(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): Json<AnchorReg>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    if !(256..=4_194_304).contains(&b.ram_mb) || !(0..=4096).contains(&b.cores) {
+        return Err(ApiErr::BadRequest("BAD_PROFILE"));
+    }
+    let flagged: bool = gw.db.query_row("SELECT anchor FROM devices WHERE id=?", params![dev], |r| r.get(0)).unwrap_or(false);
+    if !flagged {
+        return Err(ApiErr::Forbidden("NOT_AN_ANCHOR"));
+    }
+    gw.db.execute("UPDATE devices SET anchor_ram_mb=?, anchor_cores=? WHERE id=?", params![b.ram_mb, b.cores, dev]).map_err(|e| ApiErr::Domain(Error::Db(e)))?;
+    gw.audit(&dev, "anchor.register", "", &dev, json!({ "ram_mb": b.ram_mb, "cores": b.cores }));
+    Ok(Json(json!({ "ok": true, "profile": anchor_profile(Some(b.ram_mb)) })))
+}
+
+async fn admin_anchors(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_admin(&s, &gw, &dev)?;
+    let db = |e: rusqlite::Error| ApiErr::Domain(Error::Db(e));
+    let mut st = gw
+        .db
+        .prepare(
+            "SELECT d.id, COALESCE(p.name,''), d.anchor_ram_mb, d.anchor_cores, \
+             (SELECT l.world_id FROM leases l WHERE l.device_id=d.id AND l.status IN('ACTIVE','HANDOFF') LIMIT 1) \
+             FROM devices d LEFT JOIN players p ON p.uuid=d.player_uuid WHERE d.anchor=1 ORDER BY d.id",
+        )
+        .map_err(db)?;
+    let rows = st
+        .query_map([], |r| {
+            let ram: Option<i64> = r.get(2)?;
+            Ok(json!({ "device": r.get::<_, String>(0)?, "owner": r.get::<_, String>(1)?, "ram_mb": ram, "cores": r.get::<_, Option<i64>>(3)?,
+                       "profile": anchor_profile(ram), "hosting": r.get::<_, Option<String>>(4)? }))
+        })
+        .map_err(db)?;
+    Ok(Json(json!({ "anchors": rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db)? })))
 }
 
 impl Gateway {
