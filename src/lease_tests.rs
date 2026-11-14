@@ -826,3 +826,36 @@ fn diff_report_lists_added_changed_and_removed_chunks() {
     assert!(short[2].contains("2 more chunks"));
     assert!(g.diff_report(&r1.id, "R_nope", 5).is_err());
 }
+
+#[test]
+fn a_host_that_restarts_gets_a_fresh_lease_from_the_current_head_and_keeps_its_wal() {
+    let mut g = setup();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    let h1 = g.cas.put(b"one").unwrap();
+    wal_row(&g, &a.lease_id, 1, "put:region", 1, 1, h1);
+    wal_row(&g, &a.lease_id, 2, "barrier", 0, 0, [0; 32]);
+    let r1 = g.commit(&a.lease_id, a.epoch, &a.base_rev, CommitKind::Autosave, false, 1_000).unwrap();
+    let h2 = g.cas.put(b"two").unwrap();
+    wal_row(&g, &a.lease_id, 3, "put:region", 2, 1, h2);
+    wal_row(&g, &a.lease_id, 4, "barrier", 0, 0, [0; 32]);
+
+    assert!(g.drop_own_lease(W, "dev-a").unwrap());
+    let b = host(g.join(W, "dev-a", hw(2, 5.0), 2_000).unwrap());
+    assert_eq!(b.epoch, a.epoch + 1, "a new lease, not the old one");
+    assert_ne!(b.lease_id, a.lease_id);
+    assert_ne!(b.base_rev, a.base_rev, "the base is the current head, not the stale base of the old lease");
+    assert_ne!(b.base_rev, r1.id, "the frames after the commit were kept as a recovered revision");
+    assert!(matches!(g.commit(&a.lease_id, a.epoch, &r1.id, CommitKind::Autosave, false, 3_000), Err(Error::StaleEpoch)), "the old lease is fenced");
+    assert_eq!(g.state(W).unwrap().0, "LOCKED");
+}
+
+#[test]
+fn dropping_an_own_lease_is_a_noop_for_other_devices_and_during_a_handover() {
+    let mut g = setup();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    assert!(!g.drop_own_lease(W, "dev-b").unwrap(), "only the device that holds it");
+    assert_eq!(g.lease_of_world(W).as_deref(), Some(a.lease_id.as_str()));
+    g.db().execute("UPDATE worlds SET state='MIGRATING', phase='BOOTING' WHERE id=?", rusqlite::params![W]).unwrap();
+    assert!(!g.drop_own_lease(W, "dev-a").unwrap(), "a grant being picked up during a handover stays");
+    assert_eq!(g.lease_of_world(W).as_deref(), Some(a.lease_id.as_str()));
+}

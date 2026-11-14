@@ -146,3 +146,21 @@ async fn a_player_who_cannot_host_an_idle_world_raises_world_wanted_once() {
     let n = ev["events"].as_array().unwrap().iter().filter(|e| e["event"] == "world.wanted").count();
     assert_eq!(n, 1, "no event while a host is live");
 }
+
+#[tokio::test]
+async fn only_a_fresh_join_replaces_the_lease_the_same_device_still_holds() {
+    let app = app();
+    let first = host(&app, "tok-a", "w1").await;
+    let join = |body: Value| {
+        let app = app.clone();
+        async move { call(&app, "POST", Some("tok-a"), "/v1/worlds/w1/join", body).await.1 }
+    };
+    let retry = join(json!({ "hw": { "tier": 2, "score": 5.0 } })).await;
+    assert_eq!(retry["lease"]["id"], first.as_str(), "a retried join gets the same lease back");
+    let fresh = join(json!({ "hw": { "tier": 2, "score": 5.0 }, "fresh": true })).await;
+    assert_eq!(fresh["decision"], "HOST");
+    assert_ne!(fresh["lease"]["id"], first.as_str(), "a restarted host process gets a new lease");
+    assert_eq!(fresh["lease"]["epoch"], 2);
+    let guest_only = join(json!({ "hw": { "tier": 2, "score": 5.0, "wants_host": false }, "fresh": true })).await;
+    assert_eq!(guest_only["lease"]["id"], fresh["lease"]["id"], "a join that does not want to host never drops a lease");
+}

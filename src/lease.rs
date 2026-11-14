@@ -755,6 +755,22 @@ impl Gateway {
         self.wal_trim(lease, barrier, true)
     }
 
+    /// A host process that has just started asks for its world again. A lease its device still holds belongs to a process that is
+    /// gone, so what reached the WAL is kept and the lease ends; the join that follows starts a new one from the current head.
+    /// During a handover the elected device joins to pick up its grant, so only a running (LOCKED) lease is dropped.
+    pub fn drop_own_lease(&mut self, world: &str, device: &str) -> Result<bool> {
+        let Some((lid, dev, _, _)) = self.active_lease(world)? else { return Ok(false) };
+        let (state, _, _) = self.world_state(world)?;
+        if dev != device || state != "LOCKED" {
+            return Ok(false);
+        }
+        self.check_storage(world)?;
+        self.promote(&lid, world)?;
+        self.end_lease(&lid, "EXPIRED", "host restarted")?;
+        self.set_state(world, "IDLE", None)?;
+        Ok(true)
+    }
+
     /// Host is leaving. With guests present the world migrates; the host still sends its final commit.
     pub fn release(&mut self, lease: &str, epoch: i64, guests_present: bool) -> Result<()> {
         let (world, _) = self.require_live(lease, epoch)?;

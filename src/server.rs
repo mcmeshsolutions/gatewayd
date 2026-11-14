@@ -310,6 +310,9 @@ struct HwReq {
 #[derive(Deserialize)]
 struct JoinReq {
     hw: HwReq,
+    /// The client process has just started and holds no lease state.
+    #[serde(default)]
+    fresh: bool,
 }
 
 #[derive(Deserialize)]
@@ -439,6 +442,9 @@ async fn join(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<St
         gw.record_bench(&dev, b)?;
     }
     gw.meter(&world, "joins", 1);
+    if b.fresh && host_allowed && b.hw.wants_host {
+        gw.drop_own_lease(&world, &dev)?;
+    }
     let before = gw.lease_of_world(&world);
     let wanted = before.is_none() && s.wanted_due(&world);
     let mut out = match gw.join(&world, &dev, hw, now)? {
