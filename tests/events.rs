@@ -8,6 +8,10 @@ use std::time::{Duration, Instant};
 use tower::ServiceExt;
 
 fn app() -> Router {
+    app_state().0
+}
+
+fn app_state() -> (Router, std::sync::Arc<AppState>) {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let dir = std::env::temp_dir().join(format!("mcmesh-events-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     let mut g = Gateway::open(Connection::open_in_memory().unwrap(), gatewayd::cas::Cas::open(dir).unwrap(), 0).unwrap();
@@ -19,7 +23,8 @@ fn app() -> Router {
     for (d, t) in [("dev-a", "tok-a"), ("dev-b", "tok-b"), ("dev-c", "tok-c")] {
         g.add_token(d, t).unwrap();
     }
-    router(AppState::new(g))
+    let state = AppState::new(g);
+    (router(state.clone()), state)
 }
 
 async fn call(app: &Router, method: &str, tok: Option<&str>, path: &str, body: Value) -> (u16, Value) {
@@ -163,4 +168,53 @@ async fn only_a_fresh_join_replaces_the_lease_the_same_device_still_holds() {
     assert_eq!(fresh["lease"]["epoch"], 2);
     let guest_only = join(json!({ "hw": { "tier": 2, "score": 5.0, "wants_host": false }, "fresh": true })).await;
     assert_eq!(guest_only["lease"]["id"], fresh["lease"]["id"], "a join that does not want to host never drops a lease");
+}
+
+async fn read_frames(body: &mut Body, want: &str, within: Duration) -> String {
+    let mut seen = String::new();
+    let end = Instant::now() + within;
+    while !seen.contains(want) && Instant::now() < end {
+        match tokio::time::timeout(Duration::from_millis(300), body.frame()).await {
+            Ok(Some(Ok(f))) => {
+                if let Some(d) = f.data_ref() {
+                    seen.push_str(&String::from_utf8_lossy(d));
+                }
+            }
+            Ok(_) => break,
+            Err(_) => {}
+        }
+    }
+    seen
+}
+
+#[tokio::test]
+async fn the_stream_delivers_backlog_then_live_events_and_resumes_from_the_last_id() {
+    let app = app();
+    let lease = host(&app, "tok-a", "w1").await;
+    let req = |tok: &str, path: &str, last: Option<&str>| {
+        let mut r = Request::builder().uri(path).header("authorization", format!("Bearer {tok}"));
+        if let Some(l) = last {
+            r = r.header("last-event-id", l);
+        }
+        r.body(Body::empty()).unwrap()
+    };
+    let resp = app.clone().oneshot(req("tok-c", "/v1/worlds/w1/events/stream", None)).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers()["content-type"].to_str().unwrap().starts_with("text/event-stream"));
+    let mut body = resp.into_body();
+    let seen = read_frames(&mut body, "host.started", Duration::from_secs(5)).await;
+    assert!(seen.contains("event: host.started") && seen.contains("id: 1"), "backlog first: {seen}");
+
+    let (c, _) = call(&app, "POST", Some("tok-a"), &format!("/v1/leases/{lease}/release"), json!({ "epoch": 1 })).await;
+    assert_eq!(c, 200);
+    let seen = read_frames(&mut body, "host.released", Duration::from_secs(5)).await;
+    assert!(seen.contains("event: host.released"), "a live event arrives on the open stream: {seen}");
+
+    let resp = app.clone().oneshot(req("tok-c", "/v1/worlds/w1/events/stream", Some("1"))).await.unwrap();
+    let mut body = resp.into_body();
+    let seen = read_frames(&mut body, "NEVER", Duration::from_millis(800)).await;
+    assert!(!seen.contains("id: 1\n"), "nothing at or before Last-Event-ID is sent again: {seen}");
+
+    assert_eq!(app.clone().oneshot(req("tok-c", "/v1/worlds/w2/events/stream", None)).await.unwrap().status(), 403, "members of other worlds are refused");
+    assert_eq!(app.clone().oneshot(Request::builder().uri("/v1/worlds/w1/events/stream").body(Body::empty()).unwrap()).await.unwrap().status(), 401);
 }

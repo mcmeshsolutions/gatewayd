@@ -323,6 +323,84 @@ async fn world_events(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world):
     }
 }
 
+static STREAMS_OPEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const STREAMS_MAX: usize = 200;
+const STREAM_LIFETIME: Duration = Duration::from_secs(3600);
+
+struct StreamGuard;
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        STREAMS_OPEN.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+struct SseState {
+    s: Arc<AppState>,
+    world: String,
+    after: u64,
+    boot: Option<u64>,
+    pending: std::collections::VecDeque<axum::response::sse::Event>,
+    deadline: tokio::time::Instant,
+    _guard: StreamGuard,
+}
+
+/// Server-sent events for one world: the same events as the long poll, each with `id` = its sequence number, so a client that
+/// reconnects with `Last-Event-ID` (or `?after=`) misses nothing still in the log. A `reset` event means the gateway restarted
+/// and sequence numbers started over. The stream ends after an hour; reconnect with the last id.
+async fn world_event_stream(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Query(q): Query<std::collections::HashMap<String, String>>) -> Result<axum::response::Response, ApiErr> {
+    {
+        let gw = s.gw();
+        let dev = crate::server::auth(&gw, &h)?;
+        gw.pack_of(&world)?;
+        gw.require_member(&world, &dev)?;
+    }
+    let last_id = h.get("last-event-id").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+    let after = match (last_id, q.get("after")) {
+        (Some(id), _) => id,
+        (None, Some(a)) => a.parse::<u64>().map_err(|_| ApiErr::BadRequest("BAD_QUERY"))?,
+        (None, None) => 0,
+    };
+    let boot = q.get("boot").map(|b| b.parse::<u64>().map_err(|_| ApiErr::BadRequest("BAD_QUERY"))).transpose()?;
+    if STREAMS_OPEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= STREAMS_MAX {
+        STREAMS_OPEN.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        return Err(ApiErr::Conflict("TOO_MANY_STREAMS"));
+    }
+    let st = SseState { s, world, after, boot, pending: Default::default(), deadline: tokio::time::Instant::now() + STREAM_LIFETIME, _guard: StreamGuard };
+    let stream = futures_util::stream::unfold(st, |mut st| async move {
+        use axum::response::sse::Event;
+        loop {
+            if let Some(e) = st.pending.pop_front() {
+                return Some((Ok::<Event, std::convert::Infallible>(e), st));
+            }
+            if tokio::time::Instant::now() >= st.deadline {
+                return None;
+            }
+            let notified = st.s.hooks.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let (events, next, boot_id, reset) = st.s.hooks.events_after(&st.world, st.after, st.boot, 100);
+            if reset {
+                st.pending.push_back(Event::default().event("reset").data(json!({ "boot": boot_id }).to_string()));
+            }
+            st.boot = Some(boot_id);
+            st.after = next;
+            for e in events {
+                let name = e["event"].as_str().unwrap_or("event").to_string();
+                st.pending.push_back(Event::default().id(e["seq"].to_string()).event(name).data(e.to_string()));
+            }
+            if !st.pending.is_empty() {
+                continue;
+            }
+            tokio::select! {
+                _ = &mut notified => {}
+                _ = tokio::time::sleep_until(st.deadline) => {}
+            }
+        }
+    });
+    Ok(axum::response::sse::Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::new().interval(Duration::from_secs(15))).into_response())
+}
+
 pub fn sign(secret: &str, body: &str) -> String {
     use hmac::{Hmac, Mac};
     let mut m = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("hmac takes any key length");
@@ -486,6 +564,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/metrics", get(metrics))
         .route("/invite/:code", get(invite_page))
         .route("/v1/worlds/:id/events", get(world_events))
+        .route("/v1/worlds/:id/events/stream", get(world_event_stream))
 }
 
 #[cfg(test)]
