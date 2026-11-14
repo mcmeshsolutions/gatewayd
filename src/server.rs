@@ -46,6 +46,11 @@ impl AppState {
         let hooks = crate::ops::Hooks::new(&auth.webhooks, auth.webhook_secret.clone());
         Arc::new(AppState { gw: Mutex::new(gw), start: Instant::now(), auth, challenges: Mutex::new(Default::default()), tickets: Mutex::new(Default::default()), panel_codes: Mutex::new(Default::default()), live_worlds: Mutex::new(Default::default()), sync: Mutex::new(Default::default()), wanted: Mutex::new(Default::default()), hooks, relay_bytes: Mutex::new(Default::default()), limiter: crate::ratelimit::Limiter::from_env() })
     }
+    /// Seconds since this world was last asked for by someone who could not get in, or None if never.
+    fn wanted_age_s(&self, world: &str) -> Option<u64> {
+        let m = self.wanted.lock().unwrap_or_else(|e| e.into_inner());
+        m.get(world).map(|t| t.elapsed().as_secs())
+    }
     /// True at most once per 30 s per world.
     fn wanted_due(&self, world: &str) -> bool {
         let mut m = self.wanted.lock().unwrap_or_else(|e| e.into_inner());
@@ -447,7 +452,7 @@ async fn join(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<St
         gw.drop_own_lease(&world, &dev)?;
     }
     let before = gw.lease_of_world(&world);
-    let wanted = before.is_none() && s.wanted_due(&world);
+    let unhosted = before.is_none();
     let mut out = match gw.join(&world, &dev, hw, now)? {
         Join::Host(g) => {
             if before.as_deref() != Some(g.lease_id.as_str()) {
@@ -464,7 +469,8 @@ async fn join(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<St
         Join::Guest { epoch, host_device } => json!({ "decision": "GUEST", "epoch": epoch, "host": { "device": host_device } }),
         Join::Wait { phase } => json!({ "decision": "WAIT", "phase": phase, "retry_ms": 1500 }),
     };
-    if wanted && out["decision"] != "HOST" {
+    // the mark goes down only for demand that stayed unmet: the client that becomes the host is not waiting for one
+    if unhosted && out["decision"] != "HOST" && s.wanted_due(&world) {
         let player = gw.device_player(&dev)?.map(|p| p.1);
         s.hooks.emit("world.wanted", &world, json!({ "player": player, "decision": out["decision"] }));
     }
@@ -539,6 +545,22 @@ async fn lock_release(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease):
     own_lease(&gw, &dev, &lease)?;
     let (world, _) = gw.require_live(&lease, b.epoch)?;
     Ok(Json(json!({ "released": gw.lock_release(&world, &b.name, &b.owner, b.epoch)? })))
+}
+
+/// Does anyone want this world right now? An anchor that only hosts on demand polls this instead of holding the
+/// lease all day. `wanted_s_ago` is from the in-memory rate limiter for the `world.wanted` event, so it is reset by
+/// a gateway restart and is a hint, never a promise.
+async fn world_demand(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    gw.require_member(&world, &dev)?;
+    let hosted = gw.lease_of_world(&world).is_some();
+    let live = s.live_worlds.lock().unwrap_or_else(|e| e.into_inner()).contains(&world);
+    Ok(Json(json!({
+        "wanted_s_ago": s.wanted_age_s(&world),
+        "hosted": hosted,
+        "live": live,
+    })))
 }
 
 async fn locks_list(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> R {
@@ -874,6 +896,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/leases/:id/report", post(crate::admin::host_report))
         .route("/v1/leases/:id/unlock", post(lock_release))
         .route("/v1/worlds/:id/locks", get(locks_list))
+        .route("/v1/worlds/:id/demand", get(world_demand))
         .route("/v1/leases/:id/release", post(release))
         .route("/v1/leases/:id/host-ready", post(host_ready))
         .route("/v1/leases/:id/wal", post(wal_append).layer(DefaultBodyLimit::max(MAX_WAL)))
