@@ -288,6 +288,9 @@ async fn a_world_ban_removes_the_seat_and_blocks_invites_until_lifted() {
     assert_eq!((c, v["error"].as_str()), (403, Some("BANNED_FROM_WORLD")));
     let (_, v) = call(&app, "GET", "tok-a", "/v1/worlds/w1/bans", Value::Null).await;
     assert_eq!((v["bans"][0]["name"].as_str(), v["bans"][0]["reason"].as_str()), (Some("bob"), Some("griefing")));
+    let (_, v) = call(&app, "GET", "tok-a", "/v1/worlds/w1/banned", Value::Null).await;
+    assert_eq!((v["banned"][0]["name"].as_str(), v["banned"][0]["reason"].is_null(), v["banned"][0]["uuid"].is_string()), (Some("bob"), true, true), "members see names and ids, not reasons");
+    assert_eq!(call(&app, "GET", "tok-b", "/v1/worlds/w1/banned", Value::Null).await.0, 403, "a banned player no longer sees the list");
     assert_eq!(call(&app, "DELETE", "tok-a", "/v1/worlds/w1/bans/bob", Value::Null).await.0, 200);
     assert_eq!(call(&app, "DELETE", "tok-a", "/v1/worlds/w1/bans/bob", Value::Null).await.0, 404);
     let (c, _) = call(&app, "POST", "tok-b", "/v1/invites/redeem", json!({ "code": code })).await;
@@ -321,4 +324,37 @@ async fn members_report_each_other_and_only_the_owner_reads_and_resolves() {
     let (_, all) = call(&app, "GET", "tok-a", &format!("{path}?all=1"), Value::Null).await;
     assert_eq!(all["reports"].as_array().unwrap().len(), 5);
     assert!(all.to_string().contains("talked to them"));
+}
+
+#[tokio::test]
+async fn a_banned_player_appeals_the_owner_decides_and_the_log_shows_all_of_it() {
+    let app = app();
+    let (c, v) = call(&app, "POST", "tok-b", "/v1/worlds/w1/appeals", json!({ "text": "sorry" })).await;
+    assert_eq!((c, v["error"].as_str()), (409, Some("NOT_BANNED")), "only banned players appeal");
+    call(&app, "POST", "tok-a", "/v1/worlds/w1/bans", json!({ "name": "bob", "reason": "griefing" })).await;
+    assert_eq!(call(&app, "POST", "tok-b", "/v1/worlds/w1/appeals", json!({ "text": " " })).await.1["error"], "BAD_TEXT");
+    let (c, v) = call(&app, "POST", "tok-b", "/v1/worlds/w1/appeals", json!({ "text": "it was an accident" })).await;
+    assert_eq!(c, 200);
+    let id = v["id"].as_i64().unwrap();
+    assert_eq!(call(&app, "POST", "tok-b", "/v1/worlds/w1/appeals", json!({ "text": "again" })).await.1["error"], "APPEAL_ALREADY_OPEN");
+    assert_eq!(call(&app, "GET", "tok-b", "/v1/worlds/w1/appeals", Value::Null).await.0, 403, "the appellant cannot read the queue");
+    let (_, v) = call(&app, "GET", "tok-a", "/v1/worlds/w1/appeals", Value::Null).await;
+    assert_eq!((v["appeals"][0]["player"].as_str(), v["appeals"][0]["text"].as_str()), (Some("bob"), Some("it was an accident")));
+    let path = format!("/v1/worlds/w1/appeals/{id}/decide");
+    assert_eq!(call(&app, "POST", "tok-b", &path, json!({ "decision": "lift" })).await.0, 403);
+    assert_eq!(call(&app, "POST", "tok-a", &path, json!({ "decision": "maybe" })).await.1["error"], "BAD_DECISION");
+    assert_eq!(call(&app, "POST", "tok-a", &path, json!({ "decision": "keep", "note": "no" })).await.0, 200);
+    assert_eq!(call(&app, "POST", "tok-a", &path, json!({ "decision": "lift" })).await.1["error"], "NO_SUCH_APPEAL", "decided once");
+    let (_, v) = call(&app, "GET", "tok-b", "/v1/worlds/w1/banned", Value::Null).await;
+    assert_eq!(v["error"].as_str(), Some("NOT_MEMBER"), "no seat after keep");
+    let (_, v) = call(&app, "POST", "tok-b", "/v1/worlds/w1/appeals", json!({ "text": "second try" })).await;
+    let id2 = v["id"].as_i64().unwrap();
+    assert_eq!(call(&app, "POST", "tok-a", &format!("/v1/worlds/w1/appeals/{id2}/decide"), json!({ "decision": "lift" })).await.0, 200);
+    let (_, v) = call(&app, "GET", "tok-a", "/v1/worlds/w1/bans", Value::Null).await;
+    assert!(v["bans"].as_array().unwrap().is_empty(), "lifting removes the ban");
+    let (c, v) = call(&app, "GET", "tok-a", "/v1/worlds/w1/moderation", Value::Null).await;
+    assert_eq!(c, 200);
+    let actions: Vec<&str> = v["events"].as_array().unwrap().iter().map(|e| e["action"].as_str().unwrap()).collect();
+    assert_eq!(actions, ["world.appeal.decide", "world.appeal", "world.appeal.decide", "world.appeal", "world.ban"], "newest first, nothing else in it");
+    assert_eq!(call(&app, "GET", "tok-b", "/v1/worlds/w1/moderation", Value::Null).await.0, 403);
 }

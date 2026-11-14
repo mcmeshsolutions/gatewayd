@@ -52,6 +52,9 @@ impl Gateway {
              CREATE TABLE IF NOT EXISTS world_reports(
                id INTEGER PRIMARY KEY AUTOINCREMENT, world_id TEXT NOT NULL, reporter TEXT NOT NULL, target TEXT NOT NULL, reason TEXT NOT NULL,
                created_at INTEGER NOT NULL, resolved_at INTEGER, note TEXT NOT NULL DEFAULT '');
+             CREATE TABLE IF NOT EXISTS world_appeals(
+               id INTEGER PRIMARY KEY AUTOINCREMENT, world_id TEXT NOT NULL, player_uuid TEXT NOT NULL, text TEXT NOT NULL, created_at INTEGER NOT NULL,
+               resolved_at INTEGER, decision TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '');
              CREATE TABLE IF NOT EXISTS world_bans(
                world_id TEXT NOT NULL, player_uuid TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', banned_by TEXT NOT NULL, banned_at INTEGER NOT NULL,
                PRIMARY KEY(world_id, player_uuid)) WITHOUT ROWID;
@@ -811,6 +814,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/worlds/:id/reports", get(list_reports).post(world_report))
         .route("/v1/worlds/:id/reports/:rid/resolve", post(resolve_report))
         .route("/v1/worlds/:id/bans", get(world_bans).post(world_ban))
+        .route("/v1/worlds/:id/banned", get(world_banned))
+        .route("/v1/worlds/:id/appeals", get(list_appeals).post(world_appeal))
+        .route("/v1/worlds/:id/appeals/:aid/decide", post(decide_appeal))
+        .route("/v1/worlds/:id/moderation", get(moderation_log))
         .route("/v1/worlds/:id/bans/:name", axum::routing::delete(world_unban))
         .route("/v1/templates", get(list_templates))
         .route("/v1/templates/:id/fork", post(fork_template))
@@ -1207,6 +1214,112 @@ async fn world_bans(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): P
         .map_err(db)?;
     let rows = st.query_map(params![world], |r| Ok(json!({ "name": r.get::<_, String>(0)?, "reason": r.get::<_, String>(1)?, "banned_at": r.get::<_, i64>(2)? }))).map_err(db)?;
     Ok(Json(json!({ "bans": rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db)? })))
+}
+
+/// Any member of the world can read who is banned (names and ids, no reasons): the host applies it to its own ban list.
+async fn world_banned(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    gw.require_member(&world, &dev)?;
+    let db = |e: rusqlite::Error| ApiErr::Domain(Error::Db(e));
+    let mut st = gw.db.prepare("SELECT p.uuid, p.name FROM world_bans b JOIN players p ON p.uuid=b.player_uuid WHERE b.world_id=? ORDER BY p.name").map_err(db)?;
+    let rows = st.query_map(params![world], |r| Ok(json!({ "uuid": r.get::<_, String>(0)?, "name": r.get::<_, String>(1)? }))).map_err(db)?;
+    Ok(Json(json!({ "banned": rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db)? })))
+}
+
+#[derive(Deserialize)]
+struct AppealReq {
+    text: String,
+}
+
+/// A banned player says why the ban should be lifted. One open appeal per player and world; the owner or an admin decides.
+async fn world_appeal(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<AppealReq>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    let (me, _) = gw.device_player(&dev)?.ok_or(ApiErr::Unauthorized)?;
+    if !gw.is_world_banned(&world, &me) {
+        return Err(ApiErr::Conflict("NOT_BANNED"));
+    }
+    if b.text.trim().is_empty() || b.text.len() > 1000 {
+        return Err(ApiErr::BadRequest("BAD_TEXT"));
+    }
+    let db = |e: rusqlite::Error| ApiErr::Domain(Error::Db(e));
+    let open: i64 = gw.db.query_row("SELECT COUNT(*) FROM world_appeals WHERE world_id=? AND player_uuid=? AND resolved_at IS NULL", params![world, me], |r| r.get(0)).map_err(db)?;
+    if open > 0 {
+        return Err(ApiErr::Conflict("APPEAL_ALREADY_OPEN"));
+    }
+    gw.db.execute("INSERT INTO world_appeals(world_id, player_uuid, text, created_at) VALUES(?,?,?,?)", params![world, me, b.text, wall_s()]).map_err(db)?;
+    let id = gw.db.last_insert_rowid();
+    gw.audit(&dev, "world.appeal", &world, &id.to_string(), json!({}));
+    s.hooks.emit("member.appealed", &world, json!({ "appeal": id }));
+    Ok(Json(json!({ "id": id })))
+}
+
+async fn list_appeals(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Query(q): Query<HashMap<String, String>>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_owner_or_admin(&s, &gw, &dev, &world)?;
+    let all = q.get("all").is_some_and(|v| v == "1");
+    let db = |e: rusqlite::Error| ApiErr::Domain(Error::Db(e));
+    let mut st = gw
+        .db
+        .prepare(
+            "SELECT a.id, p.name, a.text, a.created_at, a.resolved_at, a.decision, a.note FROM world_appeals a JOIN players p ON p.uuid=a.player_uuid \
+             WHERE a.world_id=? AND (?2 OR a.resolved_at IS NULL) ORDER BY a.id DESC LIMIT 200",
+        )
+        .map_err(db)?;
+    let rows = st
+        .query_map(params![world, all], |r| {
+            Ok(json!({ "id": r.get::<_, i64>(0)?, "player": r.get::<_, String>(1)?, "text": r.get::<_, String>(2)?, "created_at": r.get::<_, i64>(3)?,
+                       "resolved_at": r.get::<_, Option<i64>>(4)?, "decision": r.get::<_, String>(5)?, "note": r.get::<_, String>(6)? }))
+        })
+        .map_err(db)?;
+    Ok(Json(json!({ "appeals": rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db)? })))
+}
+
+#[derive(Deserialize)]
+struct DecideReq {
+    decision: String,
+    #[serde(default)]
+    note: String,
+}
+
+/// `lift` removes the ban (the seat is not given back: invite the player again), `keep` closes the appeal and leaves the ban.
+async fn decide_appeal(State(s): State<Arc<AppState>>, h: HeaderMap, Path((world, id)): Path<(String, i64)>, Json(b): Json<DecideReq>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_owner_or_admin(&s, &gw, &dev, &world)?;
+    if b.decision != "lift" && b.decision != "keep" {
+        return Err(ApiErr::BadRequest("BAD_DECISION"));
+    }
+    if b.note.len() > 1000 {
+        return Err(ApiErr::BadRequest("BAD_NOTE"));
+    }
+    let db = |e: rusqlite::Error| ApiErr::Domain(Error::Db(e));
+    let who: String = gw
+        .db
+        .query_row("SELECT player_uuid FROM world_appeals WHERE id=? AND world_id=? AND resolved_at IS NULL", params![id, world], |r| r.get(0))
+        .map_err(|_| ApiErr::NotFound("NO_SUCH_APPEAL"))?;
+    gw.db.execute("UPDATE world_appeals SET resolved_at=?, decision=?, note=? WHERE id=?", params![wall_s(), b.decision, b.note, id]).map_err(db)?;
+    if b.decision == "lift" {
+        gw.db.execute("DELETE FROM world_bans WHERE world_id=? AND player_uuid=?", params![world, who]).map_err(db)?;
+    }
+    gw.audit(&dev, "world.appeal.decide", &world, &id.to_string(), json!({ "decision": b.decision }));
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// The dispute log: every ban, unban, report, appeal and decision for the world, newest first, from the append-only audit log.
+async fn moderation_log(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_owner_or_admin(&s, &gw, &dev, &world)?;
+    let rows = gw.audit_page(Some(&world), None, None, None, 1000)?;
+    let keep: Vec<Value> = rows
+        .into_iter()
+        .filter(|r| r["action"].as_str().is_some_and(|a| matches!(a, "world.ban" | "world.unban" | "world.report" | "world.report.resolve" | "world.appeal" | "world.appeal.decide")))
+        .take(200)
+        .collect();
+    Ok(Json(json!({ "events": keep })))
 }
 
 impl Gateway {
