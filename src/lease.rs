@@ -209,6 +209,8 @@ impl Gateway {
         let _ = db.execute("ALTER TABLE leases ADD COLUMN players INTEGER", []);
         let _ = db.execute("ALTER TABLE leases ADD COLUMN load INTEGER", []);
         let _ = db.execute("ALTER TABLE devices ADD COLUMN anchor INTEGER NOT NULL DEFAULT 0", []);
+        let _ = db.execute("ALTER TABLE shard_offers ADD COLUMN players TEXT NOT NULL DEFAULT '[]'", []);
+        let _ = db.execute("ALTER TABLE shard_leases ADD COLUMN merged INTEGER NOT NULL DEFAULT 0", []);
         db.execute("UPDATE sessions SET last_used=? WHERE last_used IS NULL", params![unix_s()])?;
         db.execute("DELETE FROM sessions WHERE last_used>0 AND last_used<?", params![unix_s() - session_ttl_s()])?;
         let mut g = Gateway {

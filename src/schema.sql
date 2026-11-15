@@ -62,8 +62,12 @@ CREATE INDEX IF NOT EXISTS blob_world_by_world ON blob_world(world_id);
 CREATE TABLE IF NOT EXISTS shard_leases(
   id TEXT PRIMARY KEY, world_id TEXT NOT NULL REFERENCES worlds(id), device_id TEXT NOT NULL REFERENCES devices(id),
   epoch INTEGER NOT NULL, hmac_key BLOB NOT NULL, regions TEXT NOT NULL,
-  status TEXT NOT NULL CHECK(status IN('ACTIVE','ENDED')), granted_at INTEGER NOT NULL, last_hb INTEGER NOT NULL, end_reason TEXT);
+  status TEXT NOT NULL CHECK(status IN('ACTIVE','ENDED')), granted_at INTEGER NOT NULL, last_hb INTEGER NOT NULL, end_reason TEXT,
+  merged INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS shard_standby(
+  world_id TEXT NOT NULL, device_id TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY(world_id, device_id)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS shard_offers(
-  id INTEGER PRIMARY KEY AUTOINCREMENT, world_id TEXT NOT NULL REFERENCES worlds(id), regions TEXT NOT NULL, created_at INTEGER NOT NULL);
+  id INTEGER PRIMARY KEY AUTOINCREMENT, world_id TEXT NOT NULL REFERENCES worlds(id), regions TEXT NOT NULL, created_at INTEGER NOT NULL,
+  players TEXT NOT NULL DEFAULT '[]');
 CREATE TABLE IF NOT EXISTS shard_homes(
   world_id TEXT NOT NULL, uuid TEXT NOT NULL, lease_id TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY(world_id, uuid)) WITHOUT ROWID;

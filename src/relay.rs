@@ -414,6 +414,14 @@ async fn guest_session(relay: Arc<Relay>, mut sock: TcpStream, peer: SocketAddr)
     };
     drop(permit);
     // a player whose file a shard host wrote last is on that host's part of the world
+    if uuid.as_deref().is_some_and(|u| relay.state.gw().shard_blocked(&world, u).unwrap_or(false)) {
+        eprintln!("relay: guest turned away from {world}, their part of the world is moving between hosts");
+        if first.as_deref().is_some_and(|b| !is_status(b)) {
+            use tokio::io::AsyncWriteExt;
+            let _ = sock.write_all(&crate::mcproto::login_disconnect("Your part of the world is moving to another host. Try again in a few seconds.")).await;
+        }
+        return;
+    }
     let home = uuid.as_deref().and_then(|u| relay.state.gw().shard_home(&world, u).ok().flatten());
     let tunnel = match &home {
         Some(lease) => relay.shard_current(lease).filter(|t| relay.live(t)),

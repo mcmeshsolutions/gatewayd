@@ -89,7 +89,7 @@ impl Gateway {
     /// Regions of every live shard lease and every open offer of the world: the main host may not write these.
     pub(crate) fn shard_reserved(&self, world: &str) -> Result<Vec<Region>> {
         let mut out = Vec::new();
-        for sql in ["SELECT regions FROM shard_leases WHERE world_id=? AND status='ACTIVE'", "SELECT regions FROM shard_offers WHERE world_id=?"] {
+        for sql in ["SELECT regions FROM shard_leases WHERE world_id=? AND (status='ACTIVE' OR merged=0)", "SELECT regions FROM shard_offers WHERE world_id=?"] {
             let mut st = self.db.prepare(sql)?;
             let rows = st.query_map(params![world], |r| r.get::<_, String>(0))?;
             for row in rows {
@@ -100,7 +100,9 @@ impl Gateway {
     }
 
     /// The main host sets regions aside for another machine. Returns the offer id.
-    pub fn shard_offer(&mut self, device: &str, world: &str, regions: Vec<Region>) -> Result<i64> {
+    /// `players` are the uuids of the players who are in those regions and are being moved with them: whoever takes the offer becomes
+    /// their home, so the relay sends them there when they log in again.
+    pub fn shard_offer(&mut self, device: &str, world: &str, regions: Vec<Region>, players: &[String]) -> Result<i64> {
         match self.active_lease(world)? {
             Some((_, d, _, _)) if d == device => {}
             _ => return Err(Error::Rejected("NOT_LEASE_HOLDER".into())),
@@ -112,9 +114,12 @@ impl Gateway {
         if regions.iter().any(|r| reserved.iter().any(|o| o.overlaps(r))) {
             return Err(Error::Rejected("SHARD_OVERLAP".into()));
         }
+        if players.len() > 256 || players.iter().any(|p| p.is_empty() || p.len() > 64 || p.contains('/')) {
+            return Err(Error::Rejected("BAD_SHARD_PLAYERS".into()));
+        }
         self.db.execute(
-            "INSERT INTO shard_offers(world_id, regions, created_at) VALUES(?,?,?)",
-            params![world, serde_json::to_string(&regions).unwrap_or_default(), wall_s()],
+            "INSERT INTO shard_offers(world_id, regions, created_at, players) VALUES(?,?,?,?)",
+            params![world, serde_json::to_string(&regions).unwrap_or_default(), wall_s(), serde_json::to_string(players).unwrap_or_default()],
         )?;
         Ok(self.db.last_insert_rowid())
     }
@@ -132,15 +137,22 @@ impl Gateway {
         if !allowed {
             return Err(Error::NotMember);
         }
+        // asking is how a machine says it is waiting to host a shard
+        self.db.execute(
+            "INSERT INTO shard_standby(world_id, device_id, ts) VALUES(?,?,?) ON CONFLICT(world_id, device_id) DO UPDATE SET ts=excluded.ts",
+            params![world, device, wall_s()],
+        )?;
         // the main host never takes its own offers, and a device takes one shard of a world at a time
         let holds: bool = self.active_lease(world)?.is_some_and(|(_, d, _, _)| d == device)
             || self.db.query_row("SELECT EXISTS(SELECT 1 FROM shard_leases WHERE world_id=? AND device_id=? AND status='ACTIVE')", params![world, device], |r| r.get(0))?;
         if holds {
             return Ok(None);
         }
-        let offer: Option<(i64, String)> =
-            self.db.query_row("SELECT id, regions FROM shard_offers WHERE world_id=? ORDER BY id LIMIT 1", params![world], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-        let Some((offer_id, regions_json)) = offer else { return Ok(None) };
+        let offer: Option<(i64, String, String)> = self
+            .db
+            .query_row("SELECT id, regions, players FROM shard_offers WHERE world_id=? ORDER BY id LIMIT 1", params![world], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()?;
+        let Some((offer_id, regions_json, players_json)) = offer else { return Ok(None) };
         let mut key = [0u8; 32];
         getrandom::getrandom(&mut key).map_err(|_| Error::Rand)?;
         let base = self.head(world)?;
@@ -151,6 +163,12 @@ impl Gateway {
             "INSERT INTO shard_leases(id, world_id, device_id, epoch, hmac_key, regions, status, granted_at, last_hb) VALUES(?,?,?,?,?,?, 'ACTIVE', ?, ?)",
             params![id, world, device, offer_id, key.as_slice(), regions_json, wall_s(), wall_s()],
         )?;
+        for uuid in serde_json::from_str::<Vec<String>>(&players_json).unwrap_or_default() {
+            tx.execute(
+                "INSERT INTO shard_homes(world_id, uuid, lease_id, ts) VALUES(?,?,?,?) ON CONFLICT(world_id, uuid) DO UPDATE SET lease_id=excluded.lease_id, ts=excluded.ts",
+                params![world, uuid, id, wall_s()],
+            )?;
+        }
         tx.commit()?;
         Ok(Some(ShardGrant { lease_id: id, epoch: offer_id, base_rev: base, hmac_key: key, regions: parse_regions(&regions_json) }))
     }
@@ -220,9 +238,48 @@ impl Gateway {
             .optional()?)
     }
 
+    /// A player who has to wait: named in an offer nobody has taken yet, or living on a shard that has ended and not yet been taken back.
+    pub fn shard_blocked(&self, world: &str, uuid: &str) -> Result<bool> {
+        let mut st = self.db.prepare("SELECT players FROM shard_offers WHERE world_id=?")?;
+        for row in st.query_map(params![world], |r| r.get::<_, String>(0))? {
+            if serde_json::from_str::<Vec<String>>(&row?).unwrap_or_default().iter().any(|p| p == uuid) {
+                return Ok(true);
+            }
+        }
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM shard_homes h JOIN shard_leases l ON l.id=h.lease_id WHERE h.world_id=?1 AND h.uuid=?2 AND l.status!='ACTIVE')",
+            params![world, uuid],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The main host says it has the shard's regions and players back: from now on they are its to write.
+    pub fn shard_merged(&mut self, device: &str, world: &str, lease: &str) -> Result<()> {
+        match self.active_lease(world)? {
+            Some((_, d, _, _)) if d == device => {}
+            _ => return Err(Error::Rejected("NOT_LEASE_HOLDER".into())),
+        }
+        let n = self.db.execute("UPDATE shard_leases SET merged=1 WHERE id=? AND world_id=? AND status='ENDED'", params![lease, world])?;
+        if n == 0 {
+            return Err(Error::Rejected("NO_SUCH_SHARD".into()));
+        }
+        self.db.execute("DELETE FROM shard_homes WHERE lease_id=?", params![lease])?;
+        Ok(())
+    }
+
+    /// Machines other than the main host that asked for an offer in the last half minute.
+    pub fn shard_standby_count(&self, world: &str) -> Result<i64> {
+        let main = self.active_lease(world)?.map(|(_, d, _, _)| d).unwrap_or_default();
+        Ok(self.db.query_row(
+            "SELECT COUNT(*) FROM shard_standby WHERE world_id=? AND device_id!=? AND ts>?",
+            params![world, main, wall_s() - 30],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Players whose files only a live shard may write.
     pub(crate) fn shard_player_files(&self, world: &str) -> Result<Vec<String>> {
-        let mut st = self.db.prepare("SELECT h.uuid FROM shard_homes h JOIN shard_leases l ON l.id=h.lease_id WHERE h.world_id=? AND l.status='ACTIVE'")?;
+        let mut st = self.db.prepare("SELECT h.uuid FROM shard_homes h JOIN shard_leases l ON l.id=h.lease_id WHERE h.world_id=? AND (l.status='ACTIVE' OR l.merged=0)")?;
         let rows = st.query_map(params![world], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
@@ -270,13 +327,19 @@ impl Gateway {
         Ok(())
     }
 
-    /// Live shards and open offers of a world, for the main host and the members.
-    pub fn shard_list(&self, world: &str) -> Result<(Vec<(String, String, Vec<Region>)>, Vec<(i64, Vec<Region>)>)> {
+    /// Shards of a world that still matter (live, or ended and not yet taken back by the main host) with their players, and open offers.
+    #[allow(clippy::type_complexity)]
+    pub fn shard_list(&self, world: &str) -> Result<(Vec<(String, String, Vec<Region>, bool, Vec<String>)>, Vec<(i64, Vec<Region>)>)> {
         let mut shards = Vec::new();
-        let mut st = self.db.prepare("SELECT id, device_id, regions FROM shard_leases WHERE world_id=? AND status='ACTIVE' ORDER BY id")?;
-        for r in st.query_map(params![world], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
-            let (id, dev, regions) = r?;
-            shards.push((id, dev, parse_regions(&regions)));
+        let mut st = self.db.prepare("SELECT id, device_id, regions, status FROM shard_leases WHERE world_id=? AND (status='ACTIVE' OR merged=0) ORDER BY id")?;
+        for r in st.query_map(params![world], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?)))? {
+            let (id, dev, regions, status) = r?;
+            let mut players = Vec::new();
+            let mut ps = self.db.prepare("SELECT uuid FROM shard_homes WHERE lease_id=? ORDER BY uuid")?;
+            for p in ps.query_map(params![id], |r| r.get::<_, String>(0))? {
+                players.push(p?);
+            }
+            shards.push((id, dev, parse_regions(&regions), status == "ACTIVE", players));
         }
         let mut offers = Vec::new();
         let mut st = self.db.prepare("SELECT id, regions FROM shard_offers WHERE world_id=? ORDER BY id")?;
@@ -291,6 +354,8 @@ impl Gateway {
 #[derive(Deserialize)]
 struct OfferReq {
     regions: Vec<Region>,
+    #[serde(default)]
+    players: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -298,13 +363,18 @@ struct EpochReq {
     epoch: i64,
 }
 
+/// The same body as a main lease's commit, so one client sends both; `base_rev` is signed but never compared, shards do not compare and swap.
 #[derive(Deserialize)]
 struct CommitReq {
     epoch: i64,
     #[serde(default)]
+    base_rev: String,
+    #[serde(default, rename = "final")]
     last: bool,
     #[serde(default)]
     kind: String,
+    #[serde(default)]
+    sig: Option<String>,
 }
 
 fn reject(e: Error) -> ApiErr {
@@ -314,7 +384,7 @@ fn reject(e: Error) -> ApiErr {
 async fn offer(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<OfferReq>) -> std::result::Result<Json<Value>, ApiErr> {
     let mut gw = s.gw();
     let dev = auth(&gw, &h)?;
-    let id = gw.shard_offer(&dev, &world, b.regions).map_err(reject)?;
+    let id = gw.shard_offer(&dev, &world, b.regions, &b.players).map_err(reject)?;
     Ok(Json(json!({ "offer": id })))
 }
 
@@ -326,8 +396,9 @@ async fn list(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<St
     }
     let (shards, offers) = gw.shard_list(&world)?;
     Ok(Json(json!({
-        "shards": shards.iter().map(|(id, d, r)| json!({ "id": id, "device": d, "regions": r })).collect::<Vec<_>>(),
+        "shards": shards.iter().map(|(id, d, r, live, p)| json!({ "id": id, "device": d, "regions": r, "live": live, "players": p })).collect::<Vec<_>>(),
         "offers": offers.iter().map(|(id, r)| json!({ "id": id, "regions": r })).collect::<Vec<_>>(),
+        "standby": gw.shard_standby_count(&world)?,
     })))
 }
 
@@ -356,6 +427,23 @@ async fn heartbeat(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Pa
     let dev = auth(&gw, &h)?;
     own(&gw, &dev, &lease)?;
     gw.shard_heartbeat(&lease, b.epoch).map_err(reject)?;
+    // the same shape as a main lease's answer, which has directives; a shard is never asked to hand over
+    Ok(Json(json!({ "ok": true, "directives": [] })))
+}
+
+/// A shard host announces that its server accepts connections; nothing waits for it, it only answers like a main lease does.
+async fn merged(State(s): State<Arc<AppState>>, h: HeaderMap, Path((world, lease)): Path<(String, String)>) -> std::result::Result<Json<Value>, ApiErr> {
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    gw.shard_merged(&dev, &world, &lease).map_err(reject)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn host_ready(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Path<String>, Json(b): Json<EpochReq>) -> std::result::Result<Json<Value>, ApiErr> {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    own(&gw, &dev, &lease)?;
+    gw.shard_live(&lease, b.epoch).map_err(reject)?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -378,7 +466,24 @@ async fn commit(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Path<
     let mut gw = s.gw();
     let dev = auth(&gw, &h)?;
     own(&gw, &dev, &lease)?;
+    let (world, _, _) = gw.shard_live(&lease, b.epoch).map_err(reject)?;
+    let sig: Option<[u8; 64]> = match &b.sig {
+        Some(v) => Some(crate::server::b64_fixed(v).ok_or(ApiErr::BadRequest("BAD_SIG"))?),
+        None => None,
+    };
+    if sig.is_none() && (s.auth.require_signed || gw.world_requires_signed(&world)) {
+        return Err(ApiErr::Forbidden("SIGNATURE_REQUIRED"));
+    }
+    let signer = match &sig {
+        Some(sg) => Some(gw.verify_commit(&world, &lease, &dev, b.epoch, &b.base_rev, kind, b.last, sg).map_err(reject)?),
+        None => None,
+    };
     let r = gw.shard_commit(&lease, b.epoch, b.last, kind).map_err(reject)?;
+    if let (Some(key), Some(sg)) = (&signer, &sig) {
+        if r.seq != 0 {
+            gw.store_signature(&r.id, key, sg).map_err(reject)?;
+        }
+    }
     Ok(Json(json!({ "rev_id": r.id, "parent": r.parent, "seq": r.seq })))
 }
 
@@ -386,7 +491,9 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/v1/worlds/:id/shards", get(list).post(offer))
         .route("/v1/worlds/:id/shards/claim", post(claim))
+        .route("/v1/worlds/:id/shards/:lease/merged", post(merged))
         .route("/v1/shards/:id/heartbeat", post(heartbeat))
+        .route("/v1/shards/:id/host-ready", post(host_ready))
         .route("/v1/shards/:id/wal", post(wal).layer(axum::extract::DefaultBodyLimit::max(4 << 20)))
         .route("/v1/shards/:id/commit", post(commit))
 }
@@ -462,20 +569,20 @@ mod tests {
     #[test]
     fn only_the_main_host_offers_regions_and_offers_may_not_overlap() {
         let mut g = gw();
-        assert!(g.shard_offer("dev-a", W, vec![region(0, 0, 0, 0)]).is_err(), "nobody hosts yet");
+        assert!(g.shard_offer("dev-a", W, vec![region(0, 0, 0, 0)], &[]).is_err(), "nobody hosts yet");
         main_host(&mut g);
-        assert!(g.shard_offer("dev-b", W, vec![region(0, 0, 0, 0)]).is_err(), "a guest cannot offer");
-        assert!(g.shard_offer("dev-a", W, vec![]).is_err() && g.shard_offer("dev-a", W, vec![region(2, 0, 1, 0)]).is_err(), "empty and inverted sets are refused");
-        g.shard_offer("dev-a", W, vec![region(10, 0, 12, 3)]).unwrap();
-        assert!(matches!(g.shard_offer("dev-a", W, vec![region(12, 3, 14, 5)]), Err(Error::Rejected(c)) if c == "SHARD_OVERLAP"));
-        g.shard_offer("dev-a", W, vec![region(13, 0, 14, 3)]).unwrap();
+        assert!(g.shard_offer("dev-b", W, vec![region(0, 0, 0, 0)], &[]).is_err(), "a guest cannot offer");
+        assert!(g.shard_offer("dev-a", W, vec![], &[]).is_err() && g.shard_offer("dev-a", W, vec![region(2, 0, 1, 0)], &[]).is_err(), "empty and inverted sets are refused");
+        g.shard_offer("dev-a", W, vec![region(10, 0, 12, 3)], &[]).unwrap();
+        assert!(matches!(g.shard_offer("dev-a", W, vec![region(12, 3, 14, 5)], &[]), Err(Error::Rejected(c)) if c == "SHARD_OVERLAP"));
+        g.shard_offer("dev-a", W, vec![region(13, 0, 14, 3)], &[]).unwrap();
     }
 
     #[test]
     fn a_member_who_may_host_claims_an_offer_once_and_the_main_host_cannot() {
         let mut g = gw();
         main_host(&mut g);
-        g.shard_offer("dev-a", W, vec![region(10, 0, 12, 3)]).unwrap();
+        g.shard_offer("dev-a", W, vec![region(10, 0, 12, 3)], &[]).unwrap();
         assert!(g.shard_claim("dev-a", W).unwrap().is_none(), "the main host does not take its own offer");
         assert!(matches!(g.shard_claim("dev-d", W), Err(Error::NotMember)), "a client-only member cannot host");
         let s = g.shard_claim("dev-b", W).unwrap().unwrap();
@@ -486,10 +593,41 @@ mod tests {
     }
 
     #[test]
+    fn the_players_named_in_an_offer_live_on_the_shard_that_takes_it() {
+        let mut g = gw();
+        main_host(&mut g);
+        g.shard_offer("dev-a", W, vec![region(10, 0, 12, 3)], &["u-d".to_string()]).unwrap();
+        assert_eq!(g.shard_home(W, "u-d").unwrap(), None, "not before somebody has taken the offer");
+        let s = g.shard_claim("dev-b", W).unwrap().unwrap();
+        assert_eq!(g.shard_home(W, "u-d").unwrap(), Some(s.lease_id.clone()));
+        assert_eq!(g.shard_player_files(W).unwrap(), vec!["u-d".to_string()], "and the main host may not write that player's file any more");
+        g.shard_commit(&s.lease_id, s.epoch, true, "SHUTDOWN").unwrap();
+        assert_eq!(g.shard_home(W, "u-d").unwrap(), None, "the player is the main host's again when the shard ends");
+    }
+
+    #[test]
+    fn players_wait_while_they_move_and_while_they_come_back_and_hosts_waiting_are_counted() {
+        let mut g = gw();
+        main_host(&mut g);
+        assert_eq!(g.shard_standby_count(W).unwrap(), 0);
+        assert!(g.shard_claim("dev-b", W).unwrap().is_none());
+        assert_eq!(g.shard_standby_count(W).unwrap(), 1, "asking is how a machine says it is waiting");
+        g.shard_offer("dev-a", W, vec![region(10, 0, 12, 3)], &["u-d".to_string()]).unwrap();
+        assert!(g.shard_blocked(W, "u-d").unwrap(), "named in an offer nobody took");
+        assert!(!g.shard_blocked(W, "u-c").unwrap());
+        let s = g.shard_claim("dev-b", W).unwrap().unwrap();
+        assert!(!g.shard_blocked(W, "u-d").unwrap(), "taken: routed to the shard instead");
+        g.shard_commit(&s.lease_id, s.epoch, true, "SHUTDOWN").unwrap();
+        assert!(g.shard_blocked(W, "u-d").unwrap(), "the shard ended, the main host has not taken the player back");
+        g.shard_merged("dev-a", W, &s.lease_id).unwrap();
+        assert!(!g.shard_blocked(W, "u-d").unwrap());
+    }
+
+    #[test]
     fn a_shard_writes_inside_its_regions_only_and_the_main_host_stays_out_of_them() {
         let mut g = gw();
         let main = main_host(&mut g);
-        g.shard_offer("dev-a", W, vec![region(10, 0, 12, 3)]).unwrap();
+        g.shard_offer("dev-a", W, vec![region(10, 0, 12, 3)], &[]).unwrap();
         let s = g.shard_claim("dev-b", W).unwrap().unwrap();
         let blob = g.cas.put(b"chunk").unwrap();
         let mut sw = Wal::new(&s.lease_id, s.epoch, &s.hmac_key);
@@ -517,7 +655,7 @@ mod tests {
     fn a_shard_may_carry_player_files_but_not_the_worlds() {
         let mut g = gw();
         main_host(&mut g);
-        g.shard_offer("dev-a", W, vec![region(10, 0, 12, 3)]).unwrap();
+        g.shard_offer("dev-a", W, vec![region(10, 0, 12, 3)], &[]).unwrap();
         let s = g.shard_claim("dev-b", W).unwrap().unwrap();
         let blob = g.cas.put(b"data").unwrap();
         let mut sw = Wal::new(&s.lease_id, s.epoch, &s.hmac_key);
@@ -534,7 +672,7 @@ mod tests {
     fn both_hosts_commit_and_the_head_has_both_sets_of_chunks() {
         let mut g = gw();
         let main = main_host(&mut g);
-        g.shard_offer("dev-a", W, vec![region(10, 0, 12, 3)]).unwrap();
+        g.shard_offer("dev-a", W, vec![region(10, 0, 12, 3)], &[]).unwrap();
         let s = g.shard_claim("dev-b", W).unwrap().unwrap();
         let a = g.cas.put(b"from main").unwrap();
         let b = g.cas.put(b"from shard").unwrap();
@@ -550,8 +688,15 @@ mod tests {
         g.commit(&main.lease_id, main.epoch, &head, CommitKind::Autosave, false, 2_000).unwrap();
         assert_eq!(chunk(&g, 1, 1), Some(a));
         assert_eq!(chunk(&g, 330, 40), Some(b));
-        // the shard ends: nothing is reserved any more and the main host may write there again
+        // the shard ends, but the regions stay out of the main host's reach until it says it has them back
         g.shard_commit(&s.lease_id, s.epoch, true, "SHUTDOWN").unwrap();
+        assert!(!g.shard_reserved(W).unwrap().is_empty());
+        let (n0, p0) = (mw.next, mw.prev);
+        let more = mw.frames(&[("put:region", OVER, 320, 0, a)]);
+        assert!(matches!(g.wal_append(&main.lease_id, main.epoch, &more), Err(Error::Rejected(c)) if c == "SHARD_OWNED"));
+        (mw.next, mw.prev) = (n0, p0);
+        assert!(g.shard_merged("dev-b", W, &s.lease_id).is_err(), "only the main host takes regions back");
+        g.shard_merged("dev-a", W, &s.lease_id).unwrap();
         assert!(g.shard_reserved(W).unwrap().is_empty());
         let more = mw.frames(&[("put:region", OVER, 320, 0, a)]);
         g.wal_append(&main.lease_id, main.epoch, &more).unwrap();
@@ -561,7 +706,7 @@ mod tests {
     fn a_shard_that_goes_silent_keeps_what_it_sealed() {
         let mut g = gw();
         main_host(&mut g);
-        g.shard_offer("dev-a", W, vec![region(10, 0, 12, 3)]).unwrap();
+        g.shard_offer("dev-a", W, vec![region(10, 0, 12, 3)], &[]).unwrap();
         let s = g.shard_claim("dev-b", W).unwrap().unwrap();
         let b = g.cas.put(b"from shard").unwrap();
         let mut sw = Wal::new(&s.lease_id, s.epoch, &s.hmac_key);
@@ -571,6 +716,6 @@ mod tests {
         assert_eq!(chunk(&g, 330, 40), Some(b), "up to the barrier");
         assert_eq!(chunk(&g, 331, 40), None, "after it is dropped");
         assert!(g.shard_live(&s.lease_id, s.epoch).is_err());
-        assert!(g.shard_reserved(W).unwrap().is_empty());
+        assert!(!g.shard_reserved(W).unwrap().is_empty(), "reserved until the main host has taken the regions back");
     }
 }

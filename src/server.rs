@@ -582,7 +582,7 @@ struct CommitReq {
     sig: Option<String>,
 }
 
-fn b64_fixed<const N: usize>(s: &str) -> Option<[u8; N]> {
+pub(crate) fn b64_fixed<const N: usize>(s: &str) -> Option<[u8; N]> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.decode(s).ok()?.try_into().ok()
 }
