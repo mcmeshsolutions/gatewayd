@@ -766,7 +766,10 @@ async fn blob_put(State(s): State<Arc<AppState>>, h: HeaderMap, Path(hash): Path
     let want = parse_hex(&hash).ok_or(ApiErr::BadRequest("BAD_HASH"))?;
     let gw = s.gw();
     let dev = auth(&gw, &h)?;
-    let world = gw.hosted_world(&dev)?.ok_or(ApiErr::Forbidden("NOT_LEASE_HOLDER"))?;
+    let world = match gw.hosted_world(&dev)? {
+        Some(w) => w,
+        None => gw.worldgen_claim_world(&dev, crate::lease::wall_s())?.ok_or(ApiErr::Forbidden("NOT_LEASE_HOLDER"))?,
+    };
     if crate::cas::sha256(&body) != want {
         return Err(ApiErr::BadRequest("HASH_MISMATCH"));
     }
@@ -907,6 +910,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(crate::ops::routes())
         .merge(crate::admin::routes())
         .merge(crate::crash::routes())
+        .merge(crate::worldgen::routes())
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::admin::gate))
         .layer(DefaultBodyLimit::max(MAX_JSON))
         .layer(axum::middleware::from_fn_with_state(state.clone(), client_gate))

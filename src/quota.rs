@@ -305,6 +305,7 @@ impl Gateway {
                     keep.insert(h);
                 }
             }
+            self.worldgen_keep(&mut keep)?;
         }
 
         let tx = self.db.transaction()?;

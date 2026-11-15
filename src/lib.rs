@@ -25,3 +25,4 @@ pub mod sanity;
 pub mod server;
 pub mod tunnel;
 pub mod wal;
+pub mod worldgen;
