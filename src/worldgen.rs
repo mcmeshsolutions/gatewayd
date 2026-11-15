@@ -33,9 +33,9 @@ const MAX_ROUNDS: i64 = 3;
 const MAX_QUEUED_PER_WORLD: i64 = 256;
 const MAX_REQUEST_TILES: usize = 64;
 const FRONTIER_MAX: i64 = 16;
-const MAX_LEAVES: usize = 3 * 1024 * 2;
+const MAX_LEAVES: usize = 16 * 1024;
 const KINDS: [&str; 3] = ["region", "entities", "poi"];
-const MAX_RESULT_BODY: usize = 768 << 10;
+const MAX_RESULT_BODY: usize = 3 << 20;
 
 /// One stored chunk of a tile: the blob is in the CAS under `hash`. `frontier` marks chunks outside the tile that carry
 /// the spill of the tile's edge; they are not covered by the digest and only ever come from the generator.
@@ -106,7 +106,10 @@ impl Gateway {
                expires_at INTEGER NOT NULL, PRIMARY KEY(tile_id, device)) WITHOUT ROWID;
              CREATE TABLE IF NOT EXISTS worldgen_results(
                tile_id INTEGER NOT NULL, device TEXT NOT NULL, role TEXT NOT NULL, digest BLOB NOT NULL,
-               chunk_digests TEXT, leaves TEXT, ts INTEGER NOT NULL, PRIMARY KEY(tile_id, device)) WITHOUT ROWID;",
+               chunk_digests TEXT, leaves TEXT, ts INTEGER NOT NULL, PRIMARY KEY(tile_id, device)) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS worldgen_rounds(
+               tile_id INTEGER NOT NULL, round INTEGER NOT NULL, devices TEXT NOT NULL, differing INTEGER, first_chunk INTEGER, ts INTEGER NOT NULL,
+               PRIMARY KEY(tile_id, round)) WITHOUT ROWID;",
         )?;
         Ok(())
     }
@@ -140,6 +143,7 @@ impl Gateway {
             params![now - TILE_TTL_S],
         )?;
         self.db.execute("DELETE FROM worldgen_tiles WHERE requested_at<?", params![now - TILE_TTL_S])?;
+        self.db.execute("DELETE FROM worldgen_rounds WHERE tile_id NOT IN (SELECT id FROM worldgen_tiles)", [])?;
         Ok(())
     }
 
@@ -363,6 +367,7 @@ impl Gateway {
         }
         // everyone reported and nobody agreed with the generator: throw the round away and ask again
         let attempts: i64 = self.db.query_row("SELECT attempts+1 FROM worldgen_tiles WHERE id=?", params![t.id], |r| r.get(0))?;
+        self.worldgen_note_disagreement(t, attempts, now)?;
         self.db.execute("DELETE FROM worldgen_results WHERE tile_id=?", params![t.id])?;
         if attempts >= MAX_ROUNDS {
             self.db.execute("UPDATE worldgen_tiles SET state='REJECTED', attempts=? WHERE id=?", params![attempts, t.id])?;
@@ -371,6 +376,49 @@ impl Gateway {
             self.db.execute("UPDATE worldgen_tiles SET attempts=? WHERE id=?", params![attempts, t.id])?;
             Ok(Submit::Retry)
         }
+    }
+
+    /// Keeps what a disagreement showed before the round is thrown away: which devices, and how many chunks of the tile differed
+    /// (counted from the per-chunk digests of the first two results, 64 hex characters per chunk, tile order).
+    fn worldgen_note_disagreement(&self, t: &TileRow, round: i64, now: i64) -> Result<(), Error> {
+        let detail: Vec<(String, Option<String>)> = {
+            let mut st = self.db.prepare("SELECT device, chunk_digests FROM worldgen_results WHERE tile_id=? ORDER BY ts, device")?;
+            let r = st.query_map(params![t.id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            r.collect::<rusqlite::Result<_>>()?
+        };
+        let (mut differing, mut first) = (None, None);
+        if let (Some(a), Some(b)) = (detail.first().and_then(|d| d.1.as_deref()), detail.get(1).and_then(|d| d.1.as_deref())) {
+            if a.len() == b.len() && a.len() % 64 == 0 && a.is_ascii() && b.is_ascii() {
+                let (mut n, mut f) = (0i64, None);
+                for i in 0..a.len() / 64 {
+                    if a[i * 64..(i + 1) * 64] != b[i * 64..(i + 1) * 64] {
+                        n += 1;
+                        f.get_or_insert(i as i64);
+                    }
+                }
+                differing = Some(n);
+                first = f;
+            }
+        }
+        let devices = detail.iter().map(|d| d.0.as_str()).collect::<Vec<_>>().join(",");
+        self.db.execute(
+            "INSERT OR REPLACE INTO worldgen_rounds(tile_id, round, devices, differing, first_chunk, ts) VALUES(?,?,?,?,?,?)",
+            params![t.id, round, devices, differing, first, now],
+        )?;
+        Ok(())
+    }
+
+    /// The last rounds in which workers disagreed, newest first: the tile, who, and how many chunks differed (null when they sent no per-chunk digests).
+    pub fn worldgen_disagreements(&self, world: &str, limit: i64) -> Result<Vec<Value>, Error> {
+        let mut st = self.db.prepare(
+            "SELECT r.tile_id, t.x, t.z, r.round, r.devices, r.differing, r.first_chunk, r.ts FROM worldgen_rounds r JOIN worldgen_tiles t ON t.id=r.tile_id
+             WHERE t.world_id=? ORDER BY r.ts DESC, r.round DESC LIMIT ?",
+        )?;
+        let rows = st.query_map(params![world, limit], |r| {
+            Ok(json!({ "tile": r.get::<_, i64>(0)?, "x": r.get::<_, i64>(1)?, "z": r.get::<_, i64>(2)?, "round": r.get::<_, i64>(3)?, "devices": r.get::<_, String>(4)?,
+                       "differing": r.get::<_, Option<i64>>(5)?, "first_chunk": r.get::<_, Option<i64>>(6)?, "ts": r.get::<_, i64>(7)? }))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// READY tiles with the generator's chunk list, and tiles the peers could never agree on, for the host.
@@ -479,7 +527,7 @@ async fn settings_get(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world):
     let dev = auth(&gw, &h)?;
     gw.require_member(&world, &dev)?;
     let (enabled, quorum) = gw.worldgen_settings(&world)?;
-    Ok(Json(json!({ "enabled": enabled, "quorum": quorum, "tile_size": TILE_SIZE, "halo": HALO, "gen_version": GEN_VERSION, "tiles": gw.worldgen_counts(&world)? })))
+    Ok(Json(json!({ "enabled": enabled, "quorum": quorum, "tile_size": TILE_SIZE, "halo": HALO, "gen_version": GEN_VERSION, "tiles": gw.worldgen_counts(&world)?, "recent_disagreements": gw.worldgen_disagreements(&world, 5)? })))
 }
 
 async fn settings_put(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<SettingsReq>) -> Result<Json<Value>, ApiErr> {
@@ -682,15 +730,23 @@ mod tests {
         let g = gw();
         g.worldgen_request(W, P, "4242", "minecraft:overworld", &[(0, 0)], 10).unwrap();
         let l = leaves(&g, 0, 0);
+        // two peers whose per-chunk digests differ in exactly one chunk, number 5
+        let da = "00".repeat(32 * 1024);
+        let mut db = da.clone();
+        db.replace_range(5 * 64..6 * 64, &"11".repeat(32));
         for round in 1..=3 {
             let a = g.worldgen_claim("dev-b", P, 100 * round).unwrap().unwrap();
             let b = g.worldgen_claim("dev-c", P, 100 * round + 1).unwrap().unwrap();
             assert_eq!((a.role, b.role), ("generate", "verify"));
-            g.worldgen_submit("dev-b", a.tile_id, digest(1), None, Some(&l), 100 * round + 2).unwrap();
-            let out = g.worldgen_submit("dev-c", a.tile_id, digest(2), None, None, 100 * round + 3).unwrap();
+            g.worldgen_submit("dev-b", a.tile_id, digest(1), Some(&da), Some(&l), 100 * round + 2).unwrap();
+            let out = g.worldgen_submit("dev-c", a.tile_id, digest(2), Some(&db), None, 100 * round + 3).unwrap();
             assert_eq!(out, if round == 3 { Submit::Rejected } else { Submit::Retry });
         }
         assert!(g.worldgen_claim("dev-b", P, 1_000).unwrap().is_none(), "a refused tile is not handed out again");
+        let why = g.worldgen_disagreements(W, 10).unwrap();
+        assert_eq!(why.len(), 3, "every round that failed is remembered after its results are thrown away");
+        assert_eq!((why[0]["differing"].as_i64(), why[0]["first_chunk"].as_i64()), (Some(1), Some(5)), "one chunk differed, number 5");
+        assert_eq!(why[0]["devices"], "dev-b,dev-c");
         let (ready, refused) = g.worldgen_ready(W, 4).unwrap();
         assert!(ready.is_empty());
         assert_eq!(refused.len(), 1);
