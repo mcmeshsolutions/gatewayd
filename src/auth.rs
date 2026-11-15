@@ -63,6 +63,34 @@ fn valid_name(n: &str) -> bool {
     (3..=16).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// Moves everything that belongs to the placeholder player `old` to `new` and removes the placeholder. Tables are found by their column
+/// names (`player_uuid`, `owner_uuid`) so one added later is moved too; `new` has no rows of its own yet.
+fn adopt_placeholder(tx: &rusqlite::Transaction, old: &str, new: &str, name: &str) -> Result<(), Error> {
+    // the new player first (foreign keys), so the placeholder steps aside under a name nobody can have
+    tx.execute("UPDATE players SET name=name||'~adopted' WHERE uuid=?", params![old])?;
+    tx.execute("INSERT INTO players(uuid,name,created_at) SELECT ?1, ?2, created_at FROM players WHERE uuid=?3", params![new, name, old])?;
+    let tables: Vec<String> = {
+        let mut st = tx.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for t in tables {
+        if t == "players" {
+            continue;
+        }
+        let cols: Vec<String> = {
+            let mut st = tx.prepare(&format!("PRAGMA table_info(\"{t}\")"))?;
+            let rows = st.query_map([], |r| r.get::<_, String>(1))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for c in cols.iter().filter(|c| *c == "player_uuid" || *c == "owner_uuid") {
+            tx.execute(&format!("UPDATE \"{t}\" SET \"{c}\"=?1 WHERE \"{c}\"=?2"), params![new, old])?;
+        }
+    }
+    tx.execute("DELETE FROM players WHERE uuid=?", params![old])?;
+    Ok(())
+}
+
 fn rand_b64(n: usize) -> Result<String, Error> {
     let mut b = vec![0u8; n];
     getrandom::getrandom(&mut b).map_err(|_| Error::Rand)?;
@@ -105,6 +133,10 @@ impl Gateway {
                 if kind == IdKind::Mojang && hk.as_deref() == Some("KEY") {
                     let renamed = format!("{}_{}", &name[..name.len().min(11)], &hu[..4]);
                     tx.execute("UPDATE players SET name=? WHERE uuid=?", params![renamed, hu])?;
+                } else if hk.is_none() {
+                    // a name an operator put on a member list (an offline uuid, no identity, never logged in): the first login under it,
+                    // verified or by key, becomes that player, and everything the placeholder was (memberships, roles, devices) moves along
+                    adopt_placeholder(&tx, &hu, uuid, name)?;
                 } else {
                     return Ok(Err("NAME_TAKEN"));
                 }
@@ -316,5 +348,49 @@ impl Gateway {
 
     pub fn require_member(&self, world: &str, device: &str) -> Result<(), Error> {
         self.role(world, device).map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod placeholder_tests {
+    use super::*;
+    use crate::cas::Cas;
+    use crate::lease::Role;
+    use rusqlite::Connection;
+
+    fn gw() -> Gateway {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let k = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let cas = Cas::open(std::env::temp_dir().join(format!("mcmesh-adopt-{}-{k}", std::process::id()))).unwrap();
+        let mut g = Gateway::open(Connection::open_in_memory().unwrap(), cas, 0).unwrap();
+        g.create_world("w", "w", "1.21.1", "neoforge").unwrap();
+        g.add_member("w", "u-a", "alice", "dev-a", Role::Admin).unwrap();
+        // what `add-member` leaves for a friend who has not logged in yet: a player and a device, no identity
+        g.add_member("w", "42ab389a-offline", "janmclovin", "d_placeholder", Role::HostEligible).unwrap();
+        g
+    }
+
+    fn role(g: &Gateway, uuid: &str) -> Option<String> {
+        g.db().query_row("SELECT role FROM members WHERE world_id='w' AND player_uuid=?", params![uuid], |r| r.get(0)).optional().unwrap()
+    }
+
+    #[test]
+    fn the_first_key_login_under_a_name_an_operator_added_becomes_that_player_and_keeps_the_membership() {
+        let mut g = gw();
+        let ok = g.login_identity(IdKind::Key, "key-uuid-1", "janmclovin", Some(&[7u8; 32])).unwrap().expect("not refused");
+        assert_eq!(ok.uuid, "key-uuid-1");
+        assert_eq!(role(&g, "key-uuid-1"), Some("HOST_ELIGIBLE".to_string()));
+        assert_eq!(role(&g, "42ab389a-offline"), None, "the placeholder is gone");
+        // a second client under the same name with another key is a stranger and is still refused
+        assert_eq!(g.login_identity(IdKind::Key, "key-uuid-2", "janmclovin", Some(&[8u8; 32])).unwrap().err(), Some("NAME_TAKEN"));
+        // the same player logging in again is fine
+        assert!(g.login_identity(IdKind::Key, "key-uuid-1", "janmclovin", Some(&[7u8; 32])).unwrap().is_ok());
+    }
+
+    #[test]
+    fn a_name_that_already_belongs_to_a_logged_in_player_is_still_taken() {
+        let mut g = gw();
+        g.login_identity(IdKind::Key, "key-uuid-1", "bobby", Some(&[1u8; 32])).unwrap().unwrap();
+        assert_eq!(g.login_identity(IdKind::Key, "key-uuid-9", "bobby", Some(&[2u8; 32])).unwrap().err(), Some("NAME_TAKEN"));
     }
 }
