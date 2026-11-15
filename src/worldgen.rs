@@ -256,6 +256,24 @@ impl Gateway {
         Ok(None)
     }
 
+
+    /// The (seed, profile) pairs a device could work on right now: queued tiles of worlds it may help with. Lets a worker learn the
+    /// seed before it starts a server, since a worker's profile is derived from its own seed.
+    pub fn worldgen_demand(&self, device: &str) -> Result<Vec<(String, String)>, Error> {
+        self.worldgen_init()?;
+        let mut st = self.db.prepare(
+            "SELECT DISTINCT t.seed, t.profile FROM worldgen_tiles t
+             JOIN worldgen_settings s ON s.world_id=t.world_id AND s.enabled=1
+             WHERE t.state='QUEUED'
+               AND t.world_id IN (SELECT m.world_id FROM members m JOIN devices d ON d.player_uuid=m.player_uuid
+                                  WHERE d.id=?1 AND d.revoked=0 AND m.role IN('ADMIN','HOST_ELIGIBLE'))
+               AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.world_id=t.world_id AND l.device_id=?1 AND l.status IN('ACTIVE','HANDOFF'))
+             LIMIT 8",
+        )?;
+        let rows = st.query_map(params![device], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// The world a device may upload tile blobs into right now: only a generator with a live claim.
     pub fn worldgen_claim_world(&self, device: &str, now: i64) -> Result<Option<String>, Error> {
         Ok(self
@@ -623,6 +641,13 @@ async fn claim(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): Json<Claim
     }))
 }
 
+async fn demand(State(s): State<Arc<AppState>>, h: HeaderMap) -> Result<Json<Value>, ApiErr> {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    let list: Vec<Value> = gw.worldgen_demand(&dev)?.into_iter().map(|(seed, profile)| json!({ "seed": seed, "profile": profile })).collect();
+    Ok(Json(json!({ "demand": list })))
+}
+
 async fn result(State(s): State<Arc<AppState>>, h: HeaderMap, Path(tile): Path<i64>, Json(b): Json<ResultReq>) -> Result<Json<Value>, ApiErr> {
     let digest = parse_hex(&b.digest).ok_or(ApiErr::BadRequest("BAD_DIGEST"))?;
     let gw = s.gw();
@@ -648,6 +673,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/worlds/:id/worldgen/tiles", get(tiles_list).post(tiles_request))
         .route("/v1/worlds/:id/worldgen/tiles/:tile/consumed", post(tile_consumed))
         .route("/v1/worldgen/claim", post(claim))
+        .route("/v1/worldgen/demand", get(demand))
         .route("/v1/worldgen/tiles/:tile/result", put(result).layer(DefaultBodyLimit::max(MAX_RESULT_BODY)))
 }
 
@@ -713,6 +739,17 @@ mod tests {
         assert!(matches!(g.worldgen_request(W, P, "4242", "minecraft:overworld", &[(0, 0)], 10), Err(Error::Rejected(c)) if c == "WORLDGEN_OFF"));
         assert!(g.set_worldgen(W, true, 3, 4).is_err(), "a quorum of 3 is not offered");
         assert!(g.set_worldgen(W, true, 2, 2).is_err() && g.set_worldgen(W, true, 2, 17).is_err(), "a halo under 4 or over 16 is refused");
+    }
+
+    #[test]
+    fn a_worker_learns_the_seed_of_waiting_tiles_but_not_its_own_hosts_or_a_client_only_members() {
+        let g = gw();
+        hosting(&g);
+        assert!(g.worldgen_demand("dev-b").unwrap().is_empty(), "nothing waiting");
+        g.worldgen_request(W, P, "4242", "minecraft:overworld", &[(0, 0), (32, 0)], 10).unwrap();
+        assert_eq!(g.worldgen_demand("dev-b").unwrap(), vec![("4242".to_string(), P.to_string())], "one pair however many tiles");
+        assert!(g.worldgen_demand("dev-a").unwrap().is_empty(), "the host does not work for itself");
+        assert!(g.worldgen_demand("dev-d").unwrap().is_empty(), "a client-only member cannot work");
     }
 
     #[test]
