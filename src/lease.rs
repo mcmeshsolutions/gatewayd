@@ -920,7 +920,7 @@ impl Gateway {
     pub fn lease_device(&self, lease: &str) -> Result<Option<String>> {
         Ok(self
             .db
-            .query_row("SELECT device_id FROM leases WHERE id=?", params![lease], |r| r.get(0))
+            .query_row("SELECT device_id FROM leases WHERE id=?1 UNION ALL SELECT device_id FROM shard_leases WHERE id=?1", params![lease], |r| r.get(0))
             .optional()?)
     }
 

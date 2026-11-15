@@ -86,7 +86,7 @@ impl AppState {
         if gw.lease_device(lease).ok()?? != dev {
             return None;
         }
-        gw.require_live(lease, epoch).ok().map(|(world, _)| world)
+        gw.require_live(lease, epoch).ok().map(|(world, _)| world).or_else(|| gw.shard_live(lease, epoch).ok().map(|(world, _, _)| world))
     }
 
     pub fn tunnel_auth_proof(&self, lease: &str, epoch: i64, ts: u64, proof: &str) -> Option<String> {
@@ -98,7 +98,7 @@ impl AppState {
         if !gw.verify_tunnel_proof(lease, epoch, ts, proof) {
             return None;
         }
-        gw.require_live(lease, epoch).ok().map(|(world, _)| world)
+        gw.require_live(lease, epoch).ok().map(|(world, _)| world).or_else(|| gw.shard_live(lease, epoch).ok().map(|(world, _, _)| world))
     }
 
     pub fn lease_live(&self, lease: &str, epoch: i64) -> bool {

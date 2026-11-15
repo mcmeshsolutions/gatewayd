@@ -54,6 +54,8 @@ async fn env_limited(require_ticket: bool, proxy_protocol: bool, limits: Option<
     g.add_token("dev-b", "tok-b").unwrap();
     g.add_member("w1", "u-c", "carol", "dev-c", Role::ClientOnly).unwrap();
     g.add_token("dev-c", "tok-c").unwrap();
+    g.add_member("w1", "u-s", "sam", "dev-s", Role::HostEligible).unwrap();
+    g.add_token("dev-s", "tok-s").unwrap();
     if let Some(l) = limits {
         g.set_limits(gatewayd::quota::Scope::World, "w1", &l).unwrap();
     }
@@ -116,13 +118,17 @@ async fn fake_server() -> (SocketAddr, SocketAddr) {
 }
 
 async fn run_agent(e: &Env, tok: &str, epoch: i64, mc: SocketAddr, voice: SocketAddr) -> Result<(), String> {
+    run_agent_for(e, &e.lease, tok, epoch, mc, voice).await
+}
+
+async fn run_agent_for(e: &Env, lease: &str, tok: &str, epoch: i64, mc: SocketAddr, voice: SocketAddr) -> Result<(), String> {
     let mut s = TcpStream::connect(e.agents).await.unwrap();
     if e.proxy {
         s.write_all(b"PROXY TCP4 192.0.2.10 10.0.0.1 41000 9000\r\n").await.unwrap();
     }
     let (rd, mut wr) = s.into_split();
     let mut rd = BufReader::new(rd);
-    let h = Hello { lease: e.lease.clone(), epoch, token: tok.into(), ts: None, proof: None };
+    let h = Hello { lease: lease.to_string(), epoch, token: tok.into(), ts: None, proof: None };
     write_frame(&mut wr, &Frame::new(HELLO, 0, serde_json::to_vec(&h).unwrap())).await.unwrap();
     let f = read_frame(&mut rd).await.unwrap();
     if f.ty != HELLO_OK {
@@ -453,4 +459,82 @@ async fn voice_udp_is_dropped_until_the_sender_passed_the_ticket_gate() {
     s.send(&[4, 5, 6]).await.unwrap();
     let n = tokio::time::timeout(Duration::from_secs(5), s.recv(&mut b)).await.expect("udp timeout").unwrap();
     assert_eq!(&b[..n], &[4, 5, 6]);
+}
+
+/// Like the stand-in above but it answers in lower case, so a test can tell which host a guest reached.
+async fn fake_server_lower() -> SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tcp = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = l.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut b = [0u8; 4096];
+                while let Ok(n) = s.read(&mut b).await {
+                    if n == 0 || s.write_all(&b[..n].to_ascii_lowercase()).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    tcp
+}
+
+async fn put_blob(app: &axum::Router, tok: &str, data: &[u8]) -> [u8; 32] {
+    let hash = gatewayd::cas::sha256(data);
+    let r = Request::put(format!("/v1/blobs/{}", gatewayd::cas::hex(&hash))).header("authorization", format!("Bearer {tok}"));
+    let resp = app.clone().oneshot(r.body(Body::from(data.to_vec())).unwrap()).await.unwrap();
+    assert!(resp.status().is_success(), "blob upload refused: {}", resp.status());
+    hash
+}
+
+#[tokio::test]
+async fn a_guest_whose_player_file_a_shard_wrote_is_routed_to_that_shard_host() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let e = env_with(true).await;
+    let (main_mc, voice) = fake_server().await;
+    let shard_mc = fake_server_lower().await;
+    run_agent(&e, "tok-a", 1, main_mc, voice).await.unwrap();
+
+    let offer = http(&e.app, "tok-a", "/v1/worlds/w1/shards", json!({"regions": [{"dim": "minecraft:overworld", "x1": 10, "z1": 0, "x2": 12, "z2": 3}]})).await;
+    assert!(offer["offer"].as_i64().is_some(), "{offer}");
+    let grant = http(&e.app, "tok-s", "/v1/worlds/w1/shards/claim", json!({})).await["grant"].clone();
+    let (lease, epoch) = (grant["id"].as_str().unwrap().to_string(), grant["epoch"].as_i64().unwrap());
+    let key = URL_SAFE_NO_PAD.decode(grant["hmac_key"].as_str().unwrap()).unwrap();
+
+    // the shard host writes Bob's player file: from now on Bob belongs to it
+    let blob = put_blob(&e.app, "tok-s", b"bob's player data").await;
+    let path = "playerdata/u-b.dat";
+    let entry = gatewayd::chain::Entry { seq: 0, dim: path, kind: "aux_put", cx: 0, cz: 0, hash: &blob };
+    let mac = gatewayd::chain::next_mac(&key, &[0; 32], &entry);
+    let wal = http(&e.app, "tok-s", &format!("/v1/shards/{lease}/wal"), json!({"epoch": epoch, "frames": [{"seq": 0, "op": "aux_put", "dim": path, "cx": 0, "cz": 0, "hash": format!("sha256:{}", gatewayd::cas::hex(&blob)), "mac": gatewayd::cas::hex(&mac)}]})).await;
+    assert_eq!(wal["next_seq"], 1, "{wal}");
+
+    // before the shard host is connected, Bob is turned away rather than sent to a host that does not have his part of the world
+    let t = ticket(&e, "tok-b").await;
+    let (hs, login) = login_bytes(&format!("play.example.org\0mesh={t}"), "Bob", 2);
+    let (clean, _) = login_bytes("play.example.org", "Bob", 2);
+    let mut sent = clean.clone();
+    sent.extend_from_slice(&login);
+    let got = send_and_read(e.guests, &[hs, login].concat(), sent.len()).await;
+    assert_ne!(got, sent.to_ascii_uppercase(), "the main host does not take a player who lives on the shard");
+
+    run_agent_for(&e, &lease, "tok-s", epoch, shard_mc, voice).await.unwrap();
+    let t = ticket(&e, "tok-b").await;
+    let (hs, login) = login_bytes(&format!("play.example.org\0mesh={t}"), "Bob", 2);
+    let (clean, _) = login_bytes("play.example.org", "Bob", 2);
+    let mut want = clean.clone();
+    want.extend_from_slice(&login);
+    let got = send_and_read(e.guests, &[hs, login].concat(), want.len()).await;
+    assert_eq!(got, want.to_ascii_lowercase(), "Bob reached the shard host");
+
+    // Carol has no file on the shard: the main host
+    let t = ticket(&e, "tok-c").await;
+    let (hs, login) = login_bytes(&format!("play.example.org\0mesh={t}"), "Carol", 2);
+    let (clean, _) = login_bytes("play.example.org", "Carol", 2);
+    let mut want = clean.clone();
+    want.extend_from_slice(&login);
+    let got = send_and_read(e.guests, &[hs, login].concat(), want.len()).await;
+    assert_eq!(got, want.to_ascii_uppercase(), "Carol reached the main host");
 }

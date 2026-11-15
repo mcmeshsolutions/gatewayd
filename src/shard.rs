@@ -1,5 +1,5 @@
 //! Shard leases: more than one machine hosting the same world at once, each for its own set of regions (ROADMAP "Dynamic multi-host
-//! sharding", board/RESEARCH.md 4 and 6). The world still has one lease and one head; this adds leases that can only write inside
+//! sharding", board/RESEARCH.md 4 and 7). The world still has one lease and one head; this adds leases that can only write inside
 //! a set of regions the main host gave up. Because the sets never overlap, a shard's changes commute with everything else and
 //! its commit is applied on top of whatever the head is by then, so no host ever waits for another. The gateway enforces the
 //! sets on every WAL append, so a bug or a lie in a mod can lose that host's own edits but never overwrite another host's chunks.
@@ -62,6 +62,11 @@ fn frame_region(f: &Frame) -> Option<(&str, i32, i32)> {
 /// True when `f` writes a chunk inside any of `regions`.
 pub(crate) fn frame_hits(regions: &[Region], f: &Frame) -> bool {
     frame_region(f).is_some_and(|(d, x, z)| regions.iter().any(|r| r.contains(d, x, z)))
+}
+
+/// The player a path like `playerdata/<uuid>.dat` belongs to.
+pub(crate) fn player_file_of(path: &str) -> Option<&str> {
+    path.strip_prefix("playerdata/")?.strip_suffix(".dat").filter(|u| !u.is_empty() && !u.contains('/'))
 }
 
 fn aux_allowed(path: &str) -> bool {
@@ -182,13 +187,44 @@ impl Gateway {
     pub fn shard_wal_append(&mut self, lease: &str, epoch: i64, frames: &[Frame]) -> Result<u64> {
         let (world, _, regions) = self.shard_live(lease, epoch)?;
         let key: Vec<u8> = self.db.query_row("SELECT hmac_key FROM shard_leases WHERE id=?", params![lease], |r| r.get(0))?;
-        self.wal_store(lease, &world, &key, frames, |f| match f.op.as_str() {
+        let next = self.wal_store(lease, &world, &key, frames, |f| match f.op.as_str() {
             "barrier" => Ok(()),
             "aux_put" | "aux_del" if aux_allowed(&f.dim) => Ok(()),
             "aux_put" | "aux_del" => Err(Error::Rejected("OUT_OF_SHARD".into())),
             _ if frame_hits(&regions, f) => Ok(()),
             _ => Err(Error::Rejected("OUT_OF_SHARD".into())),
-        })
+        })?;
+        // the machine that last wrote a player's file is where that player is: guests of that player are routed to it
+        for f in frames {
+            if let Some(uuid) = player_file_of(&f.dim) {
+                if f.op == "aux_put" {
+                    self.db.execute(
+                        "INSERT INTO shard_homes(world_id, uuid, lease_id, ts) VALUES(?,?,?,?) ON CONFLICT(world_id, uuid) DO UPDATE SET lease_id=excluded.lease_id, ts=excluded.ts",
+                        params![world, uuid, lease, wall_s()],
+                    )?;
+                }
+            }
+        }
+        Ok(next)
+    }
+
+    /// The live shard lease that is home to this player, if any.
+    pub fn shard_home(&self, world: &str, uuid: &str) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT h.lease_id FROM shard_homes h JOIN shard_leases l ON l.id=h.lease_id WHERE h.world_id=? AND h.uuid=? AND l.status='ACTIVE'",
+                params![world, uuid],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Players whose files only a live shard may write.
+    pub(crate) fn shard_player_files(&self, world: &str) -> Result<Vec<String>> {
+        let mut st = self.db.prepare("SELECT h.uuid FROM shard_homes h JOIN shard_leases l ON l.id=h.lease_id WHERE h.world_id=? AND l.status='ACTIVE'")?;
+        let rows = st.query_map(params![world], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// Builds a revision from the shard's WAL up to its last barrier on top of the current head. With `last` the shard ends and its

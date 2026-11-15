@@ -31,6 +31,12 @@ const MAX_HALO: i64 = 16;
 /// Bumped when the worker procedure changes in a way that changes results; workers on different versions never agree.
 pub const GEN_VERSION: i64 = 1;
 const CLAIM_TTL_S: i64 = 1800;
+/// A worker is expected to need this much longer than its average, so a tile that only just fits is not given to it.
+const SAFETY: f64 = 1.3;
+/// A tile that nobody who could make its deadline took within this time is given to whoever asks.
+const ORPHAN_S: i64 = 600;
+/// What a device that has never reported a tile is assumed to need.
+const DEFAULT_TILE_S: f64 = 300.0;
 const TILE_TTL_S: i64 = 86_400;
 const MAX_ROUNDS: i64 = 3;
 const MAX_QUEUED_PER_WORLD: i64 = 256;
@@ -113,8 +119,12 @@ impl Gateway {
                chunk_digests TEXT, leaves TEXT, ts INTEGER NOT NULL, PRIMARY KEY(tile_id, device)) WITHOUT ROWID;
              CREATE TABLE IF NOT EXISTS worldgen_rounds(
                tile_id INTEGER NOT NULL, round INTEGER NOT NULL, devices TEXT NOT NULL, differing INTEGER, first_chunk INTEGER, ts INTEGER NOT NULL,
-               PRIMARY KEY(tile_id, round)) WITHOUT ROWID;",
+               PRIMARY KEY(tile_id, round)) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS worldgen_speed(
+               device TEXT PRIMARY KEY, ewma_s REAL NOT NULL, samples INTEGER NOT NULL) WITHOUT ROWID;",
         )?;
+        // older databases lack the deadline; a tile without one is treated as having all the time in the world
+        let _ = self.db.execute("ALTER TABLE worldgen_tiles ADD COLUMN deadline INTEGER", []);
         Ok(())
     }
 
@@ -157,6 +167,13 @@ impl Gateway {
     /// The host asks for tiles. `tiles` are the south-west chunk of each tile and must sit on the region grid.
     /// Returns how many were new; asking again for a tile that is queued, ready or already taken changes nothing.
     pub fn worldgen_request(&self, world: &str, profile: &str, seed: &str, dim: &str, tiles: &[(i64, i64)], now: i64) -> Result<usize, Error> {
+        self.worldgen_request_eta(world, profile, seed, dim, tiles, &[], now)
+    }
+
+    /// `etas` is, per tile, how many seconds the host expects to have before a player needs it (empty: no estimate). A worker is only
+    /// handed a tile it can finish in time at its measured speed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn worldgen_request_eta(&self, world: &str, profile: &str, seed: &str, dim: &str, tiles: &[(i64, i64)], etas: &[i64], now: i64) -> Result<usize, Error> {
         let (enabled, quorum, halo) = self.worldgen_settings(world)?;
         if !enabled {
             return Err(rejected("WORLDGEN_OFF"));
@@ -173,14 +190,24 @@ impl Gateway {
         self.worldgen_gc(now)?;
         let queued: i64 = self.db.query_row("SELECT COUNT(*) FROM worldgen_tiles WHERE world_id=? AND state='QUEUED'", params![world], |r| r.get(0))?;
         let mut added = 0usize;
-        for (x, z) in tiles {
+        let etas = if etas.len() == tiles.len() { etas } else { &[] };
+        for (i, (x, z)) in tiles.iter().enumerate() {
             if queued + added as i64 >= MAX_QUEUED_PER_WORLD {
                 return Err(rejected("TILE_QUEUE_FULL"));
             }
-            added += self.db.execute(
-                "INSERT OR IGNORE INTO worldgen_tiles(world_id, dim, x, z, size, profile, seed, quorum, halo, state, requested_at) VALUES(?,?,?,?,?,?,?,?,?,'QUEUED',?)",
-                params![world, dim, x, z, TILE_SIZE, profile, seed, quorum, halo, now],
+            let deadline: Option<i64> = etas.get(i).filter(|e| **e >= 0).map(|e| now + (*e).min(86_400));
+            let new = self.db.execute(
+                "INSERT OR IGNORE INTO worldgen_tiles(world_id, dim, x, z, size, profile, seed, quorum, halo, state, requested_at, deadline) VALUES(?,?,?,?,?,?,?,?,?,'QUEUED',?,?)",
+                params![world, dim, x, z, TILE_SIZE, profile, seed, quorum, halo, now, deadline],
             )?;
+            added += new;
+            if new == 0 && deadline.is_some() {
+                // asked again with a nearer need: the earlier of the two deadlines stands
+                self.db.execute(
+                    "UPDATE worldgen_tiles SET deadline=?1 WHERE world_id=?2 AND dim=?3 AND x=?4 AND z=?5 AND size=?6 AND profile=?7 AND state='QUEUED' AND (deadline IS NULL OR deadline>?1)",
+                    params![deadline, world, dim, x, z, TILE_SIZE, profile],
+                )?;
+            }
         }
         Ok(added)
     }
@@ -223,9 +250,9 @@ impl Gateway {
         if let Some(id) = open {
             return self.worldgen_claim_row(id, device, now);
         }
-        let candidates: Vec<(i64, i64)> = {
+        let candidates: Vec<(i64, i64, Option<i64>, i64)> = {
             let mut st = self.db.prepare(
-                "SELECT t.id, t.quorum FROM worldgen_tiles t
+                "SELECT t.id, t.quorum, t.deadline, t.requested_at FROM worldgen_tiles t
                  JOIN worldgen_settings s ON s.world_id=t.world_id AND s.enabled=1
                  WHERE t.state='QUEUED' AND t.profile=?1
                    AND t.world_id IN (SELECT m.world_id FROM members m JOIN devices d ON d.player_uuid=m.player_uuid
@@ -234,10 +261,32 @@ impl Gateway {
                    AND NOT EXISTS (SELECT 1 FROM worldgen_results r WHERE r.tile_id=t.id AND r.device=?2)
                  ORDER BY t.id LIMIT 64",
             )?;
-            let rows = st.query_map(params![profile, device], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let rows = st.query_map(params![profile, device], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
-        for (id, quorum) in candidates {
+        // best fit: of the tiles this device can still finish before they are needed, the one with the least time to spare, so a fast
+        // machine takes the urgent tiles and a slow one only those that are far off. A tile nobody could make in time waits for a
+        // faster machine, and is taken anyway once it has sat unclaimed for ORPHAN_S.
+        // a device that has never reported has no speed yet: every tile fits it, and it is given the one with the most time to spare, so that
+        // its first result costs the pool nothing and tells the gateway how fast it is
+        let measured = self.worldgen_measured(device)?;
+        let est = measured.unwrap_or(0.0);
+        let mut ranked: Vec<(f64, i64, i64)> = Vec::new();
+        for (id, quorum, deadline, requested_at) in candidates {
+            let slack = match deadline {
+                Some(d) => (d - now) as f64 - est * SAFETY,
+                None => f64::MAX,
+            };
+            if slack >= 0.0 || now - requested_at > ORPHAN_S {
+                ranked.push((slack.max(0.0), id, quorum));
+            }
+        }
+        if measured.is_some() {
+            ranked.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
+        } else {
+            ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
+        }
+        for (_, id, quorum) in ranked {
             let results: i64 = self.db.query_row("SELECT COUNT(*) FROM worldgen_results WHERE tile_id=?", params![id], |r| r.get(0))?;
             let live: i64 = self.db.query_row("SELECT COUNT(*) FROM worldgen_claims WHERE tile_id=? AND expires_at>?", params![id, now], |r| r.get(0))?;
             if results + live >= quorum {
@@ -334,6 +383,35 @@ impl Gateway {
     }
 
     /// A claimant hands in its result. A generator sends `leaves` (its chunks, already uploaded), a verifier sends none.
+    /// The device's smoothed seconds per tile, None until it has reported one.
+    fn worldgen_measured(&self, device: &str) -> Result<Option<f64>, Error> {
+        Ok(self.db.query_row("SELECT ewma_s FROM worldgen_speed WHERE device=?", params![device], |r| r.get(0)).optional()?)
+    }
+
+    /// Seconds this device usually needs for a tile (claim to result), smoothed over its last reports.
+    pub fn worldgen_estimate(&self, device: &str) -> Result<f64, Error> {
+        Ok(self.db.query_row("SELECT ewma_s FROM worldgen_speed WHERE device=?", params![device], |r| r.get(0)).optional()?.unwrap_or(DEFAULT_TILE_S))
+    }
+
+    fn worldgen_note_speed(&self, device: &str, seconds: f64) -> Result<(), Error> {
+        self.db.execute(
+            "INSERT INTO worldgen_speed(device, ewma_s, samples) VALUES(?1, ?2, 1)
+             ON CONFLICT(device) DO UPDATE SET ewma_s = 0.7 * ewma_s + 0.3 * ?2, samples = samples + 1",
+            params![device, seconds.max(1.0)],
+        )?;
+        Ok(())
+    }
+
+    /// (fastest, median) seconds per tile among the devices of the world that may host and have reported at least one; None until one has.
+    pub fn worldgen_pool(&self, world: &str) -> Result<Option<(f64, f64)>, Error> {
+        let mut st = self.db.prepare(
+            "SELECT s.ewma_s FROM worldgen_speed s WHERE s.device IN (SELECT d.id FROM devices d JOIN members m ON m.player_uuid=d.player_uuid
+                                                                     WHERE m.world_id=?1 AND d.revoked=0 AND m.role IN('ADMIN','HOST_ELIGIBLE')) ORDER BY s.ewma_s",
+        )?;
+        let v: Vec<f64> = st.query_map(params![world], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(v.first().map(|f| (*f, v[v.len() / 2])))
+    }
+
     pub fn worldgen_submit(&self, device: &str, tile_id: i64, digest: Hash, chunk_digests: Option<&str>, leaves: Option<&[Leaf]>, now: i64) -> Result<Submit, Error> {
         let claim: Option<(String, i64)> = self
             .db
@@ -366,6 +444,8 @@ impl Gateway {
             params![tile_id, device, role, &digest[..], chunk_digests, leaves_json, now],
         )?;
         self.db.execute("DELETE FROM worldgen_claims WHERE tile_id=? AND device=?", params![tile_id, device])?;
+        // how long this device took, for the next time it is offered a tile
+        self.worldgen_note_speed(device, (now - (expires - CLAIM_TTL_S)) as f64)?;
         let outcome = self.worldgen_evaluate(&tile, now)?;
         tx.commit()?;
         Ok(outcome)
@@ -531,6 +611,9 @@ struct TilesReq {
     seed: String,
     dim: String,
     tiles: Vec<(i64, i64)>,
+    /// per tile, seconds until a player is expected to need it; empty when the host has no estimate
+    #[serde(default)]
+    eta_s: Vec<i64>,
 }
 
 #[derive(Deserialize)]
@@ -559,7 +642,7 @@ async fn settings_get(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world):
     let dev = auth(&gw, &h)?;
     gw.require_member(&world, &dev)?;
     let (enabled, quorum, halo) = gw.worldgen_settings(&world)?;
-    Ok(Json(json!({ "enabled": enabled, "quorum": quorum, "tile_size": TILE_SIZE, "halo": halo, "gen_version": GEN_VERSION, "tiles": gw.worldgen_counts(&world)?, "recent_disagreements": gw.worldgen_disagreements(&world, 5)? })))
+    Ok(Json(json!({ "enabled": enabled, "quorum": quorum, "tile_size": TILE_SIZE, "halo": halo, "gen_version": GEN_VERSION, "tiles": gw.worldgen_counts(&world)?, "pool": gw.worldgen_pool(&world)?.map(|(fastest, median)| json!({ "fastest_s": fastest, "median_s": median })), "recent_disagreements": gw.worldgen_disagreements(&world, 5)? })))
 }
 
 async fn settings_put(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<SettingsReq>) -> Result<Json<Value>, ApiErr> {
@@ -612,7 +695,7 @@ async fn tiles_request(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world)
     let gw = s.gw();
     let dev = auth(&gw, &h)?;
     require_host(&gw, &dev, &world)?;
-    let added = gw.worldgen_request(&world, &b.profile, &b.seed, &b.dim, &b.tiles, wall_s()).map_err(reject)?;
+    let added = gw.worldgen_request_eta(&world, &b.profile, &b.seed, &b.dim, &b.tiles, &b.eta_s, wall_s()).map_err(reject)?;
     Ok(Json(json!({ "queued": added, "requested": b.tiles.len() })))
 }
 
@@ -726,6 +809,59 @@ mod tests {
 
     fn digest(n: u8) -> Hash {
         [n; 32]
+    }
+
+    #[test]
+    fn a_fast_worker_takes_the_urgent_tile_and_a_slow_one_only_what_it_can_still_deliver() {
+        let g = gw();
+        g.set_worldgen(W, true, 1, 4).unwrap();
+        hosting(&g);
+        // tile 0,0 is needed in 100 s, tile 32,0 in 2000 s
+        g.worldgen_request_eta(W, P, "4242", "minecraft:overworld", &[(0, 0), (32, 0)], &[100, 2000], 1_000).unwrap();
+        g.worldgen_note_speed("dev-b", 50.0).unwrap();
+        g.worldgen_note_speed("dev-c", 900.0).unwrap();
+        let slow = g.worldgen_claim("dev-c", P, 1_000).unwrap().unwrap();
+        assert_eq!((slow.x, slow.z), (32, 0), "the slow machine cannot make the urgent tile, it gets the one that has time");
+        let fast = g.worldgen_claim("dev-b", P, 1_000).unwrap().unwrap();
+        assert_eq!((fast.x, fast.z), (0, 0), "the fast machine takes the one with the least time to spare");
+    }
+
+    #[test]
+    fn a_machine_that_has_never_reported_takes_the_tile_with_the_most_time_to_spare() {
+        let g = gw();
+        g.set_worldgen(W, true, 1, 4).unwrap();
+        hosting(&g);
+        g.worldgen_request_eta(W, P, "4242", "minecraft:overworld", &[(0, 0), (32, 0)], &[100, 2000], 1_000).unwrap();
+        let first = g.worldgen_claim("dev-c", P, 1_000).unwrap().unwrap();
+        assert_eq!((first.x, first.z), (32, 0), "the urgent tile is not risked on an unknown machine");
+    }
+
+    #[test]
+    fn a_tile_nobody_can_make_waits_for_a_faster_machine_and_is_taken_when_it_has_waited_long_enough() {
+        let g = gw();
+        g.set_worldgen(W, true, 1, 4).unwrap();
+        hosting(&g);
+        g.worldgen_request_eta(W, P, "4242", "minecraft:overworld", &[(0, 0)], &[30], 1_000).unwrap();
+        g.worldgen_note_speed("dev-c", 900.0).unwrap();
+        assert!(g.worldgen_claim("dev-c", P, 1_001).unwrap().is_none(), "too slow for a tile needed in 30 s");
+        assert!(g.worldgen_claim("dev-c", P, 1_000 + ORPHAN_S + 1).unwrap().is_some(), "but not for ever");
+    }
+
+    #[test]
+    fn a_worker_that_reports_gets_a_speed_and_the_pool_is_summarised() {
+        let g = gw();
+        g.set_worldgen(W, true, 1, 4).unwrap();
+        hosting(&g);
+        assert!(g.worldgen_pool(W).unwrap().is_none(), "nobody has reported");
+        g.worldgen_request(W, P, "4242", "minecraft:overworld", &[(0, 0)], 10).unwrap();
+        let c = g.worldgen_claim("dev-b", P, 20).unwrap().unwrap();
+        let l = leaves(&g, 0, 0);
+        g.worldgen_submit("dev-b", c.tile_id, digest(7), None, Some(&l), 20 + 60).unwrap();
+        assert_eq!(g.worldgen_estimate("dev-b").unwrap(), 60.0);
+        assert_eq!(g.worldgen_estimate("dev-c").unwrap(), DEFAULT_TILE_S, "a device that never reported is assumed to be average");
+        assert_eq!(g.worldgen_pool(W).unwrap(), Some((60.0, 60.0)));
+        g.worldgen_note_speed("dev-b", 160.0).unwrap();
+        assert!((g.worldgen_estimate("dev-b").unwrap() - 90.0).abs() < 1e-9, "0.7 * 60 + 0.3 * 160");
     }
 
     #[test]

@@ -47,8 +47,9 @@ impl Gateway {
         let key: Vec<u8> = self.db.query_row("SELECT hmac_key FROM leases WHERE id=?", params![lease], |r| r.get(0))?;
         // regions that a shard host owns are not the main host's to write
         let reserved = self.shard_reserved(&world)?;
+        let away = self.shard_player_files(&world)?;
         self.wal_store(lease, &world, &key, frames, |f| {
-            if crate::shard::frame_hits(&reserved, f) {
+            if crate::shard::frame_hits(&reserved, f) || crate::shard::player_file_of(&f.dim).is_some_and(|u| f.op.starts_with("aux_") && away.iter().any(|a| a == u)) {
                 Err(Error::Rejected("SHARD_OWNED".into()))
             } else {
                 Ok(())

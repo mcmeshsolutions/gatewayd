@@ -30,6 +30,8 @@ struct Peers {
 
 struct Tunnel {
     world: String,
+    /// a shard host's tunnel: only guests whose player file lives on that shard come through it
+    shard: bool,
     lease: String,
     epoch: i64,
     up: mpsc::Sender<Frame>,
@@ -49,6 +51,8 @@ pub struct Relay {
     /// Source addresses that recently passed the ticket gate; extra TCP channels only talk to them.
     known_ips: Mutex<HashMap<std::net::IpAddr, Instant>>,
     cur: Mutex<HashMap<String, Arc<Tunnel>>>,
+    /// Shard hosts' tunnels by shard lease id.
+    shards: Mutex<HashMap<String, Arc<Tunnel>>>,
     /// MCMESH_PROXY_PROTOCOL=1: TCP listeners sit behind a forwarder that prepends a PROXY header with the real client address.
     proxy_protocol: bool,
     /// Guests that have connected but not yet passed the ticket gate; bounded so slow or silent connections cannot pile up.
@@ -61,7 +65,7 @@ impl Relay {
     }
 
     pub fn with_proxy_protocol(state: Arc<AppState>, default_world: Option<&str>, udp: Option<Arc<UdpSocket>>, proxy_protocol: bool) -> Arc<Self> {
-        Arc::new(Relay { state, default_world: default_world.map(Into::into), udp, chan_udp: Mutex::new(HashMap::new()), known_ips: Mutex::new(HashMap::new()), cur: Mutex::new(HashMap::new()), proxy_protocol, pre_auth: Arc::new(tokio::sync::Semaphore::new(MAX_PRE_AUTH)) })
+        Arc::new(Relay { state, default_world: default_world.map(Into::into), udp, chan_udp: Mutex::new(HashMap::new()), known_ips: Mutex::new(HashMap::new()), cur: Mutex::new(HashMap::new()), shards: Mutex::new(HashMap::new()), proxy_protocol, pre_auth: Arc::new(tokio::sync::Semaphore::new(MAX_PRE_AUTH)) })
     }
 
     /// Per-source-address limit shared with the HTTP side, so a flood on any listener is cut at the same place.
@@ -104,7 +108,18 @@ impl Relay {
         }
     }
 
+    fn shard_current(&self, lease: &str) -> Option<Arc<Tunnel>> {
+        lock(&self.shards).get(lease).cloned()
+    }
+
     fn drop_tunnel(&self, t: &Arc<Tunnel>) {
+        if t.shard {
+            let mut shards = lock(&self.shards);
+            if shards.get(&t.lease).is_some_and(|c| Arc::ptr_eq(c, t)) {
+                shards.remove(&t.lease);
+            }
+            return;
+        }
         let mut cur = lock(&self.cur);
         if cur.get(&t.world).is_some_and(|c| Arc::ptr_eq(c, t)) {
             cur.remove(&t.world);
@@ -114,7 +129,7 @@ impl Relay {
 
     /// Only the lease epoch the gateway currently honours may carry traffic.
     fn live(&self, t: &Arc<Tunnel>) -> bool {
-        if self.state.lease_live(&t.lease, t.epoch) {
+        if self.state.lease_live(&t.lease, t.epoch) || (t.shard && self.state.gw().shard_live(&t.lease, t.epoch).is_ok()) {
             return true;
         }
         self.drop_tunnel(t);
@@ -153,8 +168,10 @@ async fn agent_session(relay: Arc<Relay>, sock: TcpStream) {
         return;
     };
     let (up, mut up_rx) = mpsc::channel::<Frame>(256);
+    let shard = relay.state.gw().shard_live(&h.lease, h.epoch).is_ok();
     let t = Arc::new(Tunnel {
         world: w,
+        shard,
         lease: h.lease,
         epoch: h.epoch,
         up,
@@ -163,7 +180,12 @@ async fn agent_session(relay: Arc<Relay>, sock: TcpStream) {
         peers: Mutex::new(Peers::default()),
         kill: Notify::new(),
     });
-    let superseded = {
+    let superseded = if t.shard {
+        if let Some(old) = lock(&relay.shards).insert(t.lease.clone(), t.clone()) {
+            old.kill.notify_one();
+        }
+        false
+    } else {
         let mut cur = lock(&relay.cur);
         if cur.get(&t.world).is_some_and(|c| c.epoch > t.epoch) {
             true
@@ -264,7 +286,7 @@ pub async fn serve_guests(relay: Arc<Relay>, l: TcpListener) {
 
 /// Reads the handshake (and Login Start for logins) and returns the bytes to forward, or None to drop.
 /// Returns the bytes to forward and the world the guest's ticket was issued for.
-async fn gate(relay: &Relay, sock: &mut TcpStream) -> Option<(Vec<u8>, String)> {
+async fn gate(relay: &Relay, sock: &mut TcpStream) -> Option<(Vec<u8>, String, Option<String>)> {
     use crate::mcproto::{build_handshake, frame, parse_handshake, parse_login_start, split_ticket, Frame as P};
     use tokio::io::AsyncReadExt;
     let mut buf: Vec<u8> = Vec::with_capacity(256);
@@ -296,7 +318,7 @@ async fn gate(relay: &Relay, sock: &mut TcpStream) -> Option<(Vec<u8>, String)> 
         None
     })?;
     if hs.next == 1 {
-        return Some((buf, relay.default_world.clone()?));
+        return Some((buf, relay.default_world.clone()?, None));
     }
     if hs.next != 2 && hs.next != 3 {
         return None;
@@ -319,7 +341,7 @@ async fn gate(relay: &Relay, sock: &mut TcpStream) -> Option<(Vec<u8>, String)> 
     hs.address = clean;
     let mut out = build_handshake(&hs);
     out.extend_from_slice(&buf);
-    Some((out, ticket.world))
+    Some((out, ticket.world, Some(ticket.uuid)))
 }
 
 fn is_status(first: &[u8]) -> bool {
@@ -371,15 +393,15 @@ async fn guest_session(relay: Arc<Relay>, mut sock: TcpStream, peer: SocketAddr)
         eprintln!("relay: guest turned away, too many unauthenticated handshakes in flight");
         return;
     };
-    let (first, world) = if relay.state.auth.require_ticket {
+    let (first, world, uuid) = if relay.state.auth.require_ticket {
         match tokio::time::timeout(HANDSHAKE_DEADLINE, gate(&relay, &mut sock)).await.ok().flatten() {
-            Some((b, w)) => {
+            Some((b, w, u)) => {
                 {
                     let mut k = lock(&relay.known_ips);
                     k.retain(|_, t| t.elapsed() < KNOWN_IP_TTL);
                     k.insert(peer.ip(), Instant::now());
                 }
-                (Some(b), w)
+                (Some(b), w, u)
             }
             None => {
                 eprintln!("relay: guest dropped at gate (bad handshake, ticket or name)");
@@ -388,12 +410,17 @@ async fn guest_session(relay: Arc<Relay>, mut sock: TcpStream, peer: SocketAddr)
         }
     } else {
         let Some(w) = relay.default_world.clone() else { return };
-        (None, w)
+        (None, w, None)
     };
     drop(permit);
-    let tunnel = relay.current(&world).filter(|t| relay.live(t));
+    // a player whose file a shard host wrote last is on that host's part of the world
+    let home = uuid.as_deref().and_then(|u| relay.state.gw().shard_home(&world, u).ok().flatten());
+    let tunnel = match &home {
+        Some(lease) => relay.shard_current(lease).filter(|t| relay.live(t)),
+        None => relay.current(&world).filter(|t| relay.live(t)),
+    };
     let Some(t) = tunnel else {
-        eprintln!("relay: guest turned away, no live host tunnel for {world}");
+        eprintln!("relay: guest turned away, no live host tunnel for {world}{}", if home.is_some() { " (the shard host of this player)" } else { "" });
         if let Some(b) = first.as_deref().filter(|b| is_status(b)) {
             status_reply(&mut sock, b, "The host is loading the world. Try again in a minute.").await;
         } else if first.is_some() {
