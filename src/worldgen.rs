@@ -22,9 +22,12 @@ use std::sync::Arc;
 
 /// A tile is exactly one region file, so installing it needs no merging with anything already on disk.
 pub const TILE_SIZE: i64 = 32;
-/// Chunks generated around a tile and thrown away (board/RESEARCH.md section 1). Dictated by the gateway so every
-/// worker cuts the same shape, which matters: generation is only reproducible between identical requests.
-pub const HALO: i64 = 4;
+/// Chunks generated around a tile and thrown away. The gateway dictates it so every worker cuts the same shape, which matters:
+/// generation is only reproducible between identical requests. 4 settles vanilla (board/RESEARCH.md section 1); a modded pack may need
+/// more (1f), so the world owner sets it and each tile keeps the value it was requested with.
+pub const DEFAULT_HALO: i64 = 4;
+const MIN_HALO: i64 = 4;
+const MAX_HALO: i64 = 16;
 /// Bumped when the worker procedure changes in a way that changes results; workers on different versions never agree.
 pub const GEN_VERSION: i64 = 1;
 const CLAIM_TTL_S: i64 = 1800;
@@ -32,7 +35,7 @@ const TILE_TTL_S: i64 = 86_400;
 const MAX_ROUNDS: i64 = 3;
 const MAX_QUEUED_PER_WORLD: i64 = 256;
 const MAX_REQUEST_TILES: usize = 64;
-const FRONTIER_MAX: i64 = 16;
+const FRONTIER_MAX: i64 = 24;
 const MAX_LEAVES: usize = 16 * 1024;
 const KINDS: [&str; 3] = ["region", "entities", "poi"];
 const MAX_RESULT_BODY: usize = 3 << 20;
@@ -60,6 +63,7 @@ pub struct Claim {
     pub seed: String,
     pub profile: String,
     pub role: &'static str,
+    pub halo: i64,
     pub expires_at: i64,
 }
 
@@ -92,11 +96,11 @@ impl Gateway {
     pub(crate) fn worldgen_init(&self) -> Result<(), Error> {
         self.db.execute_batch(
             "CREATE TABLE IF NOT EXISTS worldgen_settings(
-               world_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0, quorum INTEGER NOT NULL DEFAULT 2) WITHOUT ROWID;
+               world_id TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0, quorum INTEGER NOT NULL DEFAULT 2, halo INTEGER NOT NULL DEFAULT 4) WITHOUT ROWID;
              CREATE TABLE IF NOT EXISTS worldgen_tiles(
                id INTEGER PRIMARY KEY AUTOINCREMENT, world_id TEXT NOT NULL, dim TEXT NOT NULL,
                x INTEGER NOT NULL, z INTEGER NOT NULL, size INTEGER NOT NULL,
-               profile TEXT NOT NULL, seed TEXT NOT NULL, quorum INTEGER NOT NULL,
+               profile TEXT NOT NULL, seed TEXT NOT NULL, quorum INTEGER NOT NULL, halo INTEGER NOT NULL DEFAULT 4,
                state TEXT NOT NULL CHECK(state IN('QUEUED','READY','REJECTED','CONSUMED')),
                attempts INTEGER NOT NULL DEFAULT 0, requested_at INTEGER NOT NULL, ready_at INTEGER, winner BLOB,
                UNIQUE(world_id, dim, x, z, size, profile));
@@ -114,23 +118,26 @@ impl Gateway {
         Ok(())
     }
 
-    /// (enabled, quorum). Off by default: a world opts in, because it spends other members' CPU.
-    pub fn worldgen_settings(&self, world: &str) -> Result<(bool, i64), Error> {
+    /// (enabled, quorum, halo). Off by default: a world opts in, because it spends other members' CPU.
+    pub fn worldgen_settings(&self, world: &str) -> Result<(bool, i64, i64), Error> {
         Ok(self
             .db
-            .query_row("SELECT enabled, quorum FROM worldgen_settings WHERE world_id=?", params![world], |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)?)))
+            .query_row("SELECT enabled, quorum, halo FROM worldgen_settings WHERE world_id=?", params![world], |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))
             .optional()?
-            .unwrap_or((false, 2)))
+            .unwrap_or((false, 2, DEFAULT_HALO)))
     }
 
-    pub fn set_worldgen(&self, world: &str, enabled: bool, quorum: i64) -> Result<(), Error> {
+    pub fn set_worldgen(&self, world: &str, enabled: bool, quorum: i64, halo: i64) -> Result<(), Error> {
         if !(1..=2).contains(&quorum) {
             return Err(rejected("BAD_QUORUM"));
         }
+        if !(MIN_HALO..=MAX_HALO).contains(&halo) {
+            return Err(rejected("BAD_HALO"));
+        }
         self.db.execute(
-            "INSERT INTO worldgen_settings(world_id, enabled, quorum) VALUES(?,?,?)
-             ON CONFLICT(world_id) DO UPDATE SET enabled=excluded.enabled, quorum=excluded.quorum",
-            params![world, enabled as i64, quorum],
+            "INSERT INTO worldgen_settings(world_id, enabled, quorum, halo) VALUES(?,?,?,?)
+             ON CONFLICT(world_id) DO UPDATE SET enabled=excluded.enabled, quorum=excluded.quorum, halo=excluded.halo",
+            params![world, enabled as i64, quorum, halo],
         )?;
         Ok(())
     }
@@ -150,7 +157,7 @@ impl Gateway {
     /// The host asks for tiles. `tiles` are the south-west chunk of each tile and must sit on the region grid.
     /// Returns how many were new; asking again for a tile that is queued, ready or already taken changes nothing.
     pub fn worldgen_request(&self, world: &str, profile: &str, seed: &str, dim: &str, tiles: &[(i64, i64)], now: i64) -> Result<usize, Error> {
-        let (enabled, quorum) = self.worldgen_settings(world)?;
+        let (enabled, quorum, halo) = self.worldgen_settings(world)?;
         if !enabled {
             return Err(rejected("WORLDGEN_OFF"));
         }
@@ -171,8 +178,8 @@ impl Gateway {
                 return Err(rejected("TILE_QUEUE_FULL"));
             }
             added += self.db.execute(
-                "INSERT OR IGNORE INTO worldgen_tiles(world_id, dim, x, z, size, profile, seed, quorum, state, requested_at) VALUES(?,?,?,?,?,?,?,?,'QUEUED',?)",
-                params![world, dim, x, z, TILE_SIZE, profile, seed, quorum, now],
+                "INSERT OR IGNORE INTO worldgen_tiles(world_id, dim, x, z, size, profile, seed, quorum, halo, state, requested_at) VALUES(?,?,?,?,?,?,?,?,?,'QUEUED',?)",
+                params![world, dim, x, z, TILE_SIZE, profile, seed, quorum, halo, now],
             )?;
         }
         Ok(added)
@@ -182,7 +189,7 @@ impl Gateway {
         Ok(self
             .db
             .query_row(
-                "SELECT t.world_id, t.dim, t.x, t.z, t.size, t.seed, t.profile, c.role, c.expires_at
+                "SELECT t.world_id, t.dim, t.x, t.z, t.size, t.seed, t.profile, c.role, c.expires_at, t.halo
                  FROM worldgen_claims c JOIN worldgen_tiles t ON t.id=c.tile_id WHERE c.tile_id=? AND c.device=? AND c.expires_at>?",
                 params![tile_id, device, now],
                 |r| {
@@ -197,6 +204,7 @@ impl Gateway {
                         profile: r.get(6)?,
                         role: if r.get::<_, String>(7)? == "generate" { "generate" } else { "verify" },
                         expires_at: r.get(8)?,
+                        halo: r.get(9)?,
                     })
                 },
             )
@@ -487,6 +495,12 @@ struct SettingsReq {
     enabled: bool,
     #[serde(default = "default_quorum")]
     quorum: i64,
+    #[serde(default = "default_halo")]
+    halo: i64,
+}
+
+fn default_halo() -> i64 {
+    DEFAULT_HALO
 }
 
 fn default_quorum() -> i64 {
@@ -517,7 +531,7 @@ struct ResultReq {
 
 fn claim_json(c: &Claim, now: i64) -> Value {
     json!({
-        "tile": c.tile_id, "world": c.world, "dim": c.dim, "x": c.x, "z": c.z, "size": c.size, "halo": HALO,
+        "tile": c.tile_id, "world": c.world, "dim": c.dim, "x": c.x, "z": c.z, "size": c.size, "halo": c.halo,
         "gen_version": GEN_VERSION, "seed": c.seed, "profile": c.profile, "role": c.role, "expires_in": c.expires_at - now,
     })
 }
@@ -526,20 +540,21 @@ async fn settings_get(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world):
     let gw = s.gw();
     let dev = auth(&gw, &h)?;
     gw.require_member(&world, &dev)?;
-    let (enabled, quorum) = gw.worldgen_settings(&world)?;
-    Ok(Json(json!({ "enabled": enabled, "quorum": quorum, "tile_size": TILE_SIZE, "halo": HALO, "gen_version": GEN_VERSION, "tiles": gw.worldgen_counts(&world)?, "recent_disagreements": gw.worldgen_disagreements(&world, 5)? })))
+    let (enabled, quorum, halo) = gw.worldgen_settings(&world)?;
+    Ok(Json(json!({ "enabled": enabled, "quorum": quorum, "tile_size": TILE_SIZE, "halo": halo, "gen_version": GEN_VERSION, "tiles": gw.worldgen_counts(&world)?, "recent_disagreements": gw.worldgen_disagreements(&world, 5)? })))
 }
 
 async fn settings_put(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<SettingsReq>) -> Result<Json<Value>, ApiErr> {
     let gw = s.gw();
     let dev = auth(&gw, &h)?;
     crate::admin::require_owner_or_admin(&s, &gw, &dev, &world)?;
-    gw.set_worldgen(&world, b.enabled, b.quorum).map_err(|e| match e {
+    gw.set_worldgen(&world, b.enabled, b.quorum, b.halo).map_err(|e| match e {
+        Error::Rejected(code) if code == "BAD_HALO" => ApiErr::BadRequest("BAD_HALO"),
         Error::Rejected(_) => ApiErr::BadRequest("BAD_QUORUM"),
         other => ApiErr::Domain(other),
     })?;
-    gw.audit(&dev, "worldgen.settings", &world, "", json!({ "enabled": b.enabled, "quorum": b.quorum }));
-    Ok(Json(json!({ "enabled": b.enabled, "quorum": b.quorum })))
+    gw.audit(&dev, "worldgen.settings", &world, "", json!({ "enabled": b.enabled, "quorum": b.quorum, "halo": b.halo }));
+    Ok(Json(json!({ "enabled": b.enabled, "quorum": b.quorum, "halo": b.halo })))
 }
 
 fn reject(e: Error) -> ApiErr {
@@ -657,7 +672,7 @@ mod tests {
         g.add_member(W, "u-c", "carol", "dev-c", Role::HostEligible).unwrap();
         g.add_member(W, "u-d", "dave", "dev-d", Role::ClientOnly).unwrap();
         g.ops_init().unwrap();
-        g.set_worldgen(W, true, 2).unwrap();
+        g.set_worldgen(W, true, 2, 4).unwrap();
         g
     }
 
@@ -694,9 +709,10 @@ mod tests {
         assert_eq!(g.worldgen_request(W, P, "4242", "minecraft:overworld", &[(64, -32)], 11).unwrap(), 0, "asking again is a no-op");
         assert!(matches!(g.worldgen_request(W, P, "4242", "minecraft:overworld", &[(65, 0)], 10), Err(Error::Rejected(c)) if c == "TILE_NOT_ALIGNED"));
         assert!(matches!(g.worldgen_request(W, P, "4242", "minecraft:overworld", &[], 10), Err(Error::Rejected(c)) if c == "BAD_TILE_COUNT"));
-        g.set_worldgen(W, false, 2).unwrap();
+        g.set_worldgen(W, false, 2, 4).unwrap();
         assert!(matches!(g.worldgen_request(W, P, "4242", "minecraft:overworld", &[(0, 0)], 10), Err(Error::Rejected(c)) if c == "WORLDGEN_OFF"));
-        assert!(g.set_worldgen(W, true, 3).is_err(), "a quorum of 3 is not offered");
+        assert!(g.set_worldgen(W, true, 3, 4).is_err(), "a quorum of 3 is not offered");
+        assert!(g.set_worldgen(W, true, 2, 2).is_err() && g.set_worldgen(W, true, 2, 17).is_err(), "a halo under 4 or over 16 is refused");
     }
 
     #[test]
@@ -755,7 +771,7 @@ mod tests {
     #[test]
     fn a_quorum_of_one_trusts_the_generator() {
         let g = gw();
-        g.set_worldgen(W, true, 1).unwrap();
+        g.set_worldgen(W, true, 1, 4).unwrap();
         g.worldgen_request(W, P, "4242", "minecraft:overworld", &[(0, 0)], 10).unwrap();
         let a = g.worldgen_claim("dev-b", P, 20).unwrap().unwrap();
         g.worldgen_submit("dev-b", a.tile_id, digest(5), None, Some(&leaves(&g, 0, 0)), 30).unwrap();
@@ -774,6 +790,22 @@ mod tests {
         let after_expiry = g.worldgen_claim("dev-c", P, 20 + CLAIM_TTL_S + 5).unwrap().unwrap();
         assert_eq!(after_expiry.role, "generate", "with the generator gone the next claimant takes that role");
         assert!(matches!(g.worldgen_submit("dev-b", first.tile_id, digest(1), None, Some(&leaves(&g, 0, 0)), 20 + CLAIM_TTL_S + 6), Err(Error::Rejected(c)) if c == "NO_CLAIM"));
+    }
+
+    #[test]
+    fn a_tile_keeps_the_halo_it_was_requested_with() {
+        let g = gw();
+        g.set_worldgen(W, true, 2, 8).unwrap();
+        g.worldgen_request(W, P, "4242", "minecraft:overworld", &[(0, 0)], 10).unwrap();
+        g.set_worldgen(W, true, 2, 12).unwrap();
+        g.worldgen_request(W, P, "4242", "minecraft:overworld", &[(32, 0)], 11).unwrap();
+        g.set_worldgen(W, true, 2, 4).unwrap();
+        let first = g.worldgen_claim("dev-b", P, 20).unwrap().unwrap();
+        assert_eq!((first.x, first.halo), (0, 8), "changing the setting later does not change a queued tile, or two workers could cut different shapes");
+        g.worldgen_submit("dev-b", first.tile_id, digest(1), None, Some(&leaves(&g, 0, 0)), 30).unwrap();
+        let second = g.worldgen_claim("dev-b", P, 40).unwrap().unwrap();
+        assert_eq!((second.x, second.halo), (32, 12));
+        assert_eq!(g.worldgen_settings(W).unwrap(), (true, 2, 4));
     }
 
     #[test]
