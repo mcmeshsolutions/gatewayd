@@ -432,7 +432,7 @@ impl Gateway {
             .ok_or(Error::NoSuchWorld)
     }
 
-    fn active_lease(&self, world: &str) -> Result<Option<(String, String, i64, i64)>> {
+    pub(crate) fn active_lease(&self, world: &str) -> Result<Option<(String, String, i64, i64)>> {
         Ok(self
             .db
             .query_row(
@@ -670,7 +670,7 @@ impl Gateway {
     }
 
     /// Applies `changes` to the head and advances `main`. The caller has already checked the lease.
-    fn new_revision(&mut self, world: &str, lease: &str, kind: &str, changes: &[Change]) -> Result<Revision> {
+    pub(crate) fn new_revision(&mut self, world: &str, lease: &str, kind: &str, changes: &[Change]) -> Result<Revision> {
         let head = self.head(world)?;
         let base = self.revision_root(&head)?;
         let root = manifest::apply(&self.cas, Some(base), changes)?;
@@ -801,6 +801,7 @@ impl Gateway {
 
     /// Expires silent hosts and stuck boots, then re-elects. Call once a second or so.
     pub fn tick(&mut self, now: u64) -> Result<()> {
+        self.shard_expire()?;
         let live: Vec<(String, String, String, i64)> = {
             let mut st = self.db.prepare(
                 "SELECT l.id, l.world_id, l.device_id, 0 FROM leases l WHERE l.status IN('ACTIVE','HANDOFF')",

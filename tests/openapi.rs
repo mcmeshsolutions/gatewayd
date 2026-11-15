@@ -5,7 +5,7 @@ const PAGES: [&str; 4] = ["/", "/panel", "/status", "/invite/{code}"];
 
 fn registered() -> BTreeMap<String, BTreeSet<String>> {
     let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for file in ["admin.rs", "panel.rs", "ops.rs", "worldgen.rs"] {
+    for file in ["admin.rs", "panel.rs", "ops.rs", "worldgen.rs", "shard.rs"] {
         let src = std::fs::read_to_string(format!("{}/src/{file}", env!("CARGO_MANIFEST_DIR"))).unwrap();
         for line in src.lines().filter(|l| l.trim_start().starts_with(".route(\"")) {
             let rest = &line.trim_start()[".route(\"".len()..];

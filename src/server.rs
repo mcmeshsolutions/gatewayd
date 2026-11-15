@@ -587,7 +587,7 @@ fn b64_fixed<const N: usize>(s: &str) -> Option<[u8; N]> {
     base64::engine::general_purpose::STANDARD.decode(s).ok()?.try_into().ok()
 }
 
-fn parse_hash(s: &str) -> Option<[u8; 32]> {
+pub(crate) fn parse_hash(s: &str) -> Option<[u8; 32]> {
     parse_hex(s.strip_prefix("sha256:")?)
 }
 
@@ -685,7 +685,7 @@ async fn host_ready(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): P
 }
 
 #[derive(Deserialize)]
-struct FrameReq {
+pub(crate) struct FrameReq {
     seq: u64,
     op: String,
     #[serde(default)]
@@ -699,12 +699,12 @@ struct FrameReq {
 }
 
 #[derive(Deserialize)]
-struct WalReq {
-    epoch: i64,
-    frames: Vec<FrameReq>,
+pub(crate) struct WalReq {
+    pub(crate) epoch: i64,
+    pub(crate) frames: Vec<FrameReq>,
 }
 
-async fn wal_append(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Path<String>, Json(b): Json<WalReq>) -> R {
+pub(crate) fn frames_of(b: WalReq) -> Result<Vec<Frame>, ApiErr> {
     let mut frames = Vec::with_capacity(b.frames.len());
     for f in b.frames {
         frames.push(Frame {
@@ -717,10 +717,16 @@ async fn wal_append(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): P
             mac: parse_hex(&f.mac).ok_or(ApiErr::BadRequest("BAD_MAC_ENCODING"))?.to_vec(),
         });
     }
+    Ok(frames)
+}
+
+async fn wal_append(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Path<String>, Json(b): Json<WalReq>) -> R {
+    let epoch = b.epoch;
+    let frames = frames_of(b)?;
     let mut gw = s.gw();
     let dev = auth(&gw, &h)?;
     own_lease(&gw, &dev, &lease)?;
-    let next = gw.wal_append(&lease, b.epoch, &frames)?;
+    let next = gw.wal_append(&lease, epoch, &frames)?;
     Ok(Json(json!({ "next_seq": next })))
 }
 
@@ -768,7 +774,10 @@ async fn blob_put(State(s): State<Arc<AppState>>, h: HeaderMap, Path(hash): Path
     let dev = auth(&gw, &h)?;
     let world = match gw.hosted_world(&dev)? {
         Some(w) => w,
-        None => gw.worldgen_claim_world(&dev, crate::lease::wall_s())?.ok_or(ApiErr::Forbidden("NOT_LEASE_HOLDER"))?,
+        None => match gw.shard_world_of(&dev)? {
+            Some(w) => w,
+            None => gw.worldgen_claim_world(&dev, crate::lease::wall_s())?.ok_or(ApiErr::Forbidden("NOT_LEASE_HOLDER"))?,
+        },
     };
     if crate::cas::sha256(&body) != want {
         return Err(ApiErr::BadRequest("HASH_MISMATCH"));
@@ -911,6 +920,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(crate::admin::routes())
         .merge(crate::crash::routes())
         .merge(crate::worldgen::routes())
+        .merge(crate::shard::routes())
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::admin::gate))
         .layer(DefaultBodyLimit::max(MAX_JSON))
         .layer(axum::middleware::from_fn_with_state(state.clone(), client_gate))

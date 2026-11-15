@@ -45,6 +45,19 @@ impl Gateway {
     pub fn wal_append(&mut self, lease: &str, epoch: i64, frames: &[Frame]) -> Result<u64> {
         let (world, _) = self.require_live(lease, epoch)?;
         let key: Vec<u8> = self.db.query_row("SELECT hmac_key FROM leases WHERE id=?", params![lease], |r| r.get(0))?;
+        // regions that a shard host owns are not the main host's to write
+        let reserved = self.shard_reserved(&world)?;
+        self.wal_store(lease, &world, &key, frames, |f| {
+            if crate::shard::frame_hits(&reserved, f) {
+                Err(Error::Rejected("SHARD_OWNED".into()))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    /// The part of an append that every kind of lease shares: chain check, blob check, storage. `allow` can refuse a frame.
+    pub(crate) fn wal_store(&mut self, lease: &str, world: &str, key: &[u8], frames: &[Frame], allow: impl Fn(&Frame) -> Result<()>) -> Result<u64> {
         let tx = self.db.transaction()?;
         let (mut next, prev): (i64, Vec<u8>) = tx
             .query_row("SELECT next_seq, prev_mac FROM wal_chain WHERE lease_id=?", params![lease], |r| {
@@ -61,8 +74,9 @@ impl Gateway {
             if f.seq as i64 != next {
                 return Err(Error::BadFrame("seq gap or replay"));
             }
+            allow(f)?;
             let e = Entry { seq: f.seq, dim: &f.dim, kind: &f.op, cx: f.cx, cz: f.cz, hash: &f.hash };
-            if !chain::verify_frame(&key, &prev, &e, &f.mac) {
+            if !chain::verify_frame(key, &prev, &e, &f.mac) {
                 return Err(Error::BadMac);
             }
             let ch = change(&f.op, &f.dim, f.cx, f.cz, f.hash).ok_or(Error::BadFrame("unknown op"))?;
@@ -71,13 +85,13 @@ impl Gateway {
             }
             // the host may have skipped the upload because another world already had the blob
             if matches!(ch, Some(Change::Put(..) | Change::AuxPut(..))) {
-                tag(&tx, &self.cas, &world, &f.hash)?;
+                tag(&tx, &self.cas, world, &f.hash)?;
             }
             tx.execute(
                 "INSERT INTO chunk_wal(lease_id,seq,op,dim,cx,cz,hash) VALUES(?,?,?,?,?,?,?)",
                 params![lease, f.seq as i64, f.op, f.dim, f.cx, f.cz, f.hash.as_slice()],
             )?;
-            prev = chain::next_mac(&key, &prev, &e);
+            prev = chain::next_mac(key, &prev, &e);
             next += 1;
         }
         tx.execute(

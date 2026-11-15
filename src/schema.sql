@@ -58,3 +58,10 @@ CREATE TABLE IF NOT EXISTS quotas(
   storage_bytes INTEGER, world_count INTEGER, keep_revisions INTEGER, keep_days INTEGER,
   PRIMARY KEY(scope, id)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS blob_world_by_world ON blob_world(world_id);
+
+CREATE TABLE IF NOT EXISTS shard_leases(
+  id TEXT PRIMARY KEY, world_id TEXT NOT NULL REFERENCES worlds(id), device_id TEXT NOT NULL REFERENCES devices(id),
+  epoch INTEGER NOT NULL, hmac_key BLOB NOT NULL, regions TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN('ACTIVE','ENDED')), granted_at INTEGER NOT NULL, last_hb INTEGER NOT NULL, end_reason TEXT);
+CREATE TABLE IF NOT EXISTS shard_offers(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, world_id TEXT NOT NULL REFERENCES worlds(id), regions TEXT NOT NULL, created_at INTEGER NOT NULL);
