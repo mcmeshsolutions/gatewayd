@@ -42,6 +42,7 @@ impl Gateway {
         self.worldgen_init()?;
         self.apikeys_init()?;
         self.sso_init()?;
+        self.host_sessions_init()?;
         Ok(())
     }
 

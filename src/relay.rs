@@ -208,6 +208,7 @@ async fn agent_session(relay: Arc<Relay>, sock: TcpStream) {
     let since = Instant::now();
     let host = relay.state.gw().lease_device(&t.lease).ok().flatten().unwrap_or_default();
     eprintln!("tunnel up: world={} host_device={host} epoch={}", t.world, t.epoch);
+    let _ = relay.state.gw().host_session_start(&t.world, &host, t.epoch);
     let meter = (relay.state.clone(), t.world.clone());
     let writer = tokio::spawn(async move {
         while let Some(f) = up_rx.recv().await {
@@ -264,7 +265,9 @@ async fn agent_session(relay: Arc<Relay>, sock: TcpStream) {
             _ => {}
         }
     }
-    eprintln!("tunnel down: world={} host_device={host} epoch={} up_s={} reason={reason}", t.world, t.epoch, since.elapsed().as_secs());
+    let up_s = since.elapsed().as_secs();
+    eprintln!("tunnel down: world={} host_device={host} epoch={} up_s={up_s} reason={reason}", t.world, t.epoch);
+    let _ = relay.state.gw().host_session_end(&t.world, &host, t.epoch, up_s, &reason);
     relay.drop_tunnel(&t);
     pinger.abort();
     writer.abort();

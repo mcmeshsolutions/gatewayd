@@ -169,6 +169,47 @@ impl Gateway {
         Ok(())
     }
 
+    pub fn host_sessions_init(&self) -> Result<(), Error> {
+        self.db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS host_sessions(
+               id INTEGER PRIMARY KEY AUTOINCREMENT, world_id TEXT NOT NULL, player_uuid TEXT,
+               device_id TEXT NOT NULL, epoch INTEGER NOT NULL, started_at INTEGER NOT NULL,
+               ended_at INTEGER, up_s INTEGER, end_reason TEXT);
+             CREATE INDEX IF NOT EXISTS host_sessions_world ON host_sessions(world_id, started_at);",
+        )?;
+        Ok(())
+    }
+
+    /// Called when a tunnel comes up; the matching row is closed by host_session_end.
+    pub fn host_session_start(&self, world: &str, device: &str, epoch: i64) -> Result<(), Error> {
+        let player = self.device_player(device)?.map(|(uuid, _)| uuid);
+        self.db.execute(
+            "INSERT INTO host_sessions(world_id,player_uuid,device_id,epoch,started_at) VALUES(?,?,?,?,strftime('%s','now'))",
+            params![world, player, device, epoch],
+        )?;
+        Ok(())
+    }
+
+    pub fn host_session_end(&self, world: &str, device: &str, epoch: i64, up_s: u64, reason: &str) -> Result<(), Error> {
+        self.db.execute(
+            "UPDATE host_sessions SET ended_at=strftime('%s','now'), up_s=?, end_reason=? \
+             WHERE world_id=? AND device_id=? AND epoch=? AND ended_at IS NULL",
+            params![up_s as i64, reason, world, device, epoch],
+        )?;
+        Ok(())
+    }
+
+    /// Hosting time per player for a world's activity tab: (player_uuid, name, total_seconds, session_count).
+    pub fn host_sessions_summary(&self, world: &str) -> Result<Vec<(Option<String>, Option<String>, i64, i64)>, Error> {
+        let mut st = self.db.prepare(
+            "SELECT h.player_uuid, p.name, COALESCE(SUM(h.up_s), 0), COUNT(*) \
+             FROM host_sessions h LEFT JOIN players p ON p.uuid = h.player_uuid \
+             WHERE h.world_id = ? GROUP BY h.player_uuid ORDER BY 3 DESC",
+        )?;
+        let rows = st.query_map(params![world], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Gateway-wide MOTD, shown to every player; None when never set.
     pub fn motd(&self) -> Option<String> {
         self.db.query_row("SELECT value FROM admin_settings WHERE key='motd'", [], |r| r.get(0)).ok()
@@ -445,6 +486,19 @@ async fn world_audit(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): 
     let (limit, before) = page_args(&q)?;
     let rows = gw.audit_page(Some(&world), q.get("actor").map(String::as_str), q.get("action").map(String::as_str), before, limit)?;
     Ok(Json(page_json(rows, limit)))
+}
+
+/// Hosting time per player for a world, for the dashboard's per-world activity tab.
+async fn world_activity(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_owner_or_admin(&s, &gw, &dev, &world)?;
+    let rows = gw.host_sessions_summary(&world)?;
+    Ok(Json(json!({
+        "players": rows.into_iter().map(|(uuid, name, seconds, sessions)| json!({
+            "uuid": uuid, "name": name, "seconds": seconds, "sessions": sessions,
+        })).collect::<Vec<_>>(),
+    })))
 }
 
 async fn get_user(State(s): State<Arc<AppState>>, h: HeaderMap, Path(name): Path<String>) -> R {
@@ -902,6 +956,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/admin/users/:name/status", put(put_status))
         .route("/v1/admin/users/:name/role", put(put_gateway_role))
         .route("/v1/worlds/:id/audit", get(world_audit))
+        .route("/v1/worlds/:id/activity", get(world_activity))
         .route("/v1/worlds/:id/policy", get(get_policy).put(put_policy))
 }
 
@@ -1606,4 +1661,45 @@ async fn resolve_report(State(s): State<Arc<AppState>>, h: HeaderMap, Path((worl
     }
     gw.audit(&dev, "world.report.resolve", &world, &id.to_string(), json!({}));
     Ok(Json(json!({ "ok": true })))
+}
+
+#[cfg(test)]
+mod host_sessions_tests {
+    use super::*;
+    use crate::cas::Cas;
+    use crate::lease::Role;
+
+    fn gw() -> Gateway {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let k = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let cas = Cas::open(std::env::temp_dir().join(format!("mcmesh-hs-{}-{k}", std::process::id()))).unwrap();
+        let mut g = Gateway::open(rusqlite::Connection::open_in_memory().unwrap(), cas, 0).unwrap();
+        g.host_sessions_init().unwrap();
+        g.create_world("w", "w", "1.21.1", "neoforge").unwrap();
+        g.add_member("w", "u-alice", "alice", "d-alice", Role::Admin).unwrap();
+        g
+    }
+
+    #[test]
+    fn open_sessions_do_not_count_until_they_end_and_then_sum_correctly() {
+        let g = gw();
+        g.host_session_start("w", "d-alice", 1).unwrap();
+        // no completed session yet: still counted (COUNT(*) includes the open row) but contributes 0 seconds
+        let rows = g.host_sessions_summary("w").unwrap();
+        assert_eq!(rows, vec![(Some("u-alice".to_string()), Some("alice".to_string()), 0, 1)]);
+        g.host_session_end("w", "d-alice", 1, 90, "read error").unwrap();
+        g.host_session_start("w", "d-alice", 2).unwrap();
+        g.host_session_end("w", "d-alice", 2, 30, "lease ended").unwrap();
+        let rows = g.host_sessions_summary("w").unwrap();
+        assert_eq!(rows, vec![(Some("u-alice".to_string()), Some("alice".to_string()), 120, 2)]);
+    }
+
+    #[test]
+    fn a_device_with_no_known_player_is_still_summarised() {
+        let g = gw();
+        g.host_session_start("w", "d-unknown", 1).unwrap();
+        g.host_session_end("w", "d-unknown", 1, 10, "read error").unwrap();
+        let rows = g.host_sessions_summary("w").unwrap();
+        assert_eq!(rows, vec![(None, None, 10, 1)]);
+    }
 }
