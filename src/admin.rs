@@ -169,6 +169,22 @@ impl Gateway {
         Ok(())
     }
 
+    /// Gateway-wide MOTD, shown to every player; None when never set.
+    pub fn motd(&self) -> Option<String> {
+        self.db.query_row("SELECT value FROM admin_settings WHERE key='motd'", [], |r| r.get(0)).ok()
+    }
+
+    pub fn set_motd(&self, text: Option<&str>) -> Result<(), Error> {
+        match text {
+            Some(t) if !t.is_empty() => {
+                let t = format_codes(t);
+                self.db.execute("INSERT OR REPLACE INTO admin_settings(key,value) VALUES('motd',?)", params![t])?
+            }
+            _ => self.db.execute("DELETE FROM admin_settings WHERE key='motd'", [])?,
+        };
+        Ok(())
+    }
+
     pub fn world_exists(&self, world: &str) -> bool {
         self.db.query_row("SELECT 1 FROM worlds WHERE id=?", params![world], |_| Ok(())).is_ok()
     }
@@ -535,6 +551,52 @@ async fn put_maintenance(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): 
     Ok(Json(json!({ "ok": true, "on": b.on })))
 }
 
+const MOTD_MAX: usize = 256;
+
+/// '&' + a legacy formatting code (0-9, a-f for color; k,l,m,n,o,r for styles) becomes the real section-sign code
+/// (U+00A7) Minecraft's font renderer already understands in a plain string, no text-component JSON needed. The
+/// '&' convention is what every Bukkit-style MOTD editor already uses, since typing § directly is awkward.
+fn format_codes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '&' {
+            if let Some(&n) = chars.peek() {
+                if "0123456789abcdefklmnor".contains(n.to_ascii_lowercase()) {
+                    out.push('\u{00a7}');
+                    out.push(n.to_ascii_lowercase());
+                    chars.next();
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Gateway MOTD: no auth, same as a vanilla server list description.
+async fn get_motd(State(s): State<Arc<AppState>>) -> R {
+    Ok(Json(json!({ "motd": s.gw().motd() })))
+}
+
+#[derive(Deserialize)]
+struct MotdReq {
+    #[serde(default)]
+    motd: String,
+}
+
+async fn put_motd(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): Json<MotdReq>) -> R {
+    let gw = s.gw();
+    let actor = admin_or_key(&s, &gw, &h, "op:lifecycle")?;
+    if b.motd.len() > MOTD_MAX {
+        return Err(ApiErr::BadRequest("MOTD_TOO_LONG"));
+    }
+    gw.set_motd((!b.motd.is_empty()).then_some(b.motd.as_str()))?;
+    actor.record(&gw, "motd.set", "", "", json!({ "motd": b.motd }));
+    Ok(Json(json!({ "ok": true })))
+}
+
 async fn get_policy(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> R {
     let gw = s.gw();
     let dev = auth(&gw, &h)?;
@@ -834,6 +896,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/worlds/:id/signing", put(put_signing))
         .route("/v1/admin/audit", get(admin_audit))
         .route("/v1/admin/maintenance", get(get_maintenance).put(put_maintenance))
+        .route("/v1/motd", get(get_motd))
+        .route("/v1/admin/motd", put(put_motd))
         .route("/v1/admin/users/:name", get(get_user))
         .route("/v1/admin/users/:name/status", put(put_status))
         .route("/v1/admin/users/:name/role", put(put_gateway_role))
