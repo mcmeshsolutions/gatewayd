@@ -478,3 +478,60 @@ async fn devices_me_returns_the_callers_device() {
     let id = get(&app, tok, "/v1/devices/me").await.1["device"].as_str().unwrap().to_string();
     assert!(id.starts_with("d_") && id.len() == 18, "{id}");
 }
+
+#[tokio::test]
+async fn sso_superadmin_and_account_linking_drive_the_dashboard() {
+    let app = app();
+    let (c, h, v) = req(&app, "POST", None, "/v1/auth/sso/register", Some(json!({"email": "boss@example.com", "password": "correct horse battery"}))).await;
+    assert_eq!((c, v["superadmin"].as_bool()), (200, Some(true)));
+    let cookie = h.get("set-cookie").unwrap().to_str().unwrap().split(';').next().unwrap().to_string();
+
+    let sso_call = |method: &str, path: &str, body: Option<Value>| {
+        let app = app.clone();
+        let cookie = cookie.clone();
+        let method = method.to_string();
+        let path = path.to_string();
+        async move {
+            let r = Request::builder()
+                .method(method.as_str())
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("cookie", cookie)
+                .body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
+                .unwrap();
+            let resp = app.oneshot(r).await.unwrap();
+            let code = resp.status().as_u16();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            (code, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+        }
+    };
+
+    // superadmin without a linked Minecraft player can still inspect all worlds, usage, quotas, activity, and MOTD
+    let (c, me) = sso_call("GET", "/v1/sso/me", None).await;
+    assert_eq!((c, me["mode"].as_str(), me["superadmin"].as_bool()), (200, Some("sso"), Some(true)));
+    let (c, w) = sso_call("GET", "/v1/worlds?all=1", None).await;
+    assert_eq!((c, w["worlds"].as_array().unwrap().len()), (200, 2));
+    let (c, u) = sso_call("GET", "/v1/admin/usage", None).await;
+    assert_eq!((c, u["total_worlds"].as_u64()), (200, Some(2)));
+    assert!(u["defaults"]["world"].is_object());
+    let (c, q) = sso_call("PUT", "/v1/admin/quotas", Some(json!({"scope": "world", "id": "w1", "storage_bytes": 104857600, "max_guests": 8}))).await;
+    assert_eq!((c, q["limits"]["max_guests"].as_u64()), (200, Some(8)));
+    let (c, _) = sso_call("PUT", "/v1/admin/motd", Some(json!({"motd": "&aHello &lMesh"}))).await;
+    assert_eq!(c, 200);
+    assert_eq!(req(&app, "GET", None, "/v1/motd", None).await.2["motd"].as_str(), Some("\u{00a7}aHello \u{00a7}lMesh"));
+    let (c, act) = sso_call("GET", "/v1/worlds/w1/activity", None).await;
+    assert_eq!(c, 200, "{act}");
+    let (c, mem) = sso_call("GET", "/v1/worlds/w1/members", None).await;
+    assert_eq!(c, 200, "{mem}");
+
+    // link alice's Minecraft account to the SSO account using a link code, then mint a device link code via SSO
+    let (_, lc) = call(&app, "POST", "tok-alice", "/v1/auth/link-code", json!({})).await;
+    let code = lc["code"].as_str().unwrap();
+    let (c, lk) = sso_call("POST", "/v1/sso/link", Some(json!({"code": code}))).await;
+    assert_eq!((c, lk["player"].as_str()), (200, Some("alice")));
+    let (_, me2) = sso_call("GET", "/v1/sso/me", None).await;
+    assert_eq!(me2["player"].as_str(), Some("alice"));
+    let (c, dc) = sso_call("POST", "/v1/auth/link-code", Some(json!({}))).await;
+    assert_eq!(c, 200);
+    assert_eq!(dc["code"].as_str().unwrap().len(), 12);
+}

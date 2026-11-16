@@ -150,9 +150,63 @@ impl Gateway {
 
     /// The player uuids an SSO account has linked, for "my worlds" views that are not superadmin.
     pub fn sso_linked_players(&self, sso_user_id: &str) -> Result<Vec<String>, Error> {
-        let mut st = self.db.prepare("SELECT player_uuid FROM sso_links WHERE sso_user_id=?")?;
+        let mut st = self.db.prepare("SELECT player_uuid FROM sso_links WHERE sso_user_id=? ORDER BY linked_at")?;
         let rows = st.query_map(rusqlite::params![sso_user_id], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Linked (uuid, name) pairs for an SSO account.
+    pub fn sso_linked_player_names(&self, sso_user_id: &str) -> Result<Vec<(String, String)>, Error> {
+        let mut st = self.db.prepare(
+            "SELECT l.player_uuid, p.name FROM sso_links l JOIN players p ON p.uuid=l.player_uuid WHERE l.sso_user_id=? ORDER BY l.linked_at",
+        )?;
+        let rows = st.query_map(rusqlite::params![sso_user_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// True when `player_uuid` is an SSO superadmin synthetic identity or is linked to a superadmin SSO account.
+    pub fn is_sso_superadmin(&self, player_uuid: &str) -> bool {
+        if let Some(id) = player_uuid.strip_prefix("sso:") {
+            return self
+                .db
+                .query_row("SELECT 1 FROM sso_users WHERE id=? AND is_superadmin=1", rusqlite::params![id], |_| Ok(()))
+                .is_ok();
+        }
+        self.db
+            .query_row(
+                "SELECT 1 FROM sso_links l JOIN sso_users u ON u.id=l.sso_user_id WHERE l.player_uuid=? AND u.is_superadmin=1",
+                rusqlite::params![player_uuid],
+                |_| Ok(()),
+            )
+            .is_ok()
+    }
+
+    /// Resolves an SSO user to a device id so every existing route that takes a device works with SSO cookies:
+    /// uses the first linked Minecraft player's device when linked, or a synthetic `sso:<id>` player/device otherwise.
+    pub fn sso_device(&self, user: &SsoUser) -> Result<String, Error> {
+        if let Some(uuid) = self.sso_linked_players(&user.id)?.into_iter().next() {
+            if let Some(dev) = self
+                .db
+                .query_row("SELECT id FROM devices WHERE player_uuid=? LIMIT 1", rusqlite::params![uuid], |r| r.get::<_, String>(0))
+                .optional()?
+            {
+                return Ok(dev);
+            }
+            use sha2::Digest;
+            let dev = format!("d_{}", &crate::cas::hex(&Sha256::digest(uuid.as_bytes()).into())[..16]);
+            self.db.execute("INSERT OR IGNORE INTO devices(id,player_uuid) VALUES(?,?)", rusqlite::params![dev, uuid])?;
+            return Ok(dev);
+        }
+        let uuid = format!("sso:{}", user.id);
+        let name = format!("sso:{}", user.email);
+        self.db.execute(
+            "INSERT OR IGNORE INTO players(uuid,name,created_at) VALUES(?,?,strftime('%s','now'))",
+            rusqlite::params![uuid, name],
+        )?;
+        let short = &user.id[..user.id.len().min(16)];
+        let dev = format!("d_sso_{short}");
+        self.db.execute("INSERT OR IGNORE INTO devices(id,player_uuid) VALUES(?,?)", rusqlite::params![dev, uuid])?;
+        Ok(dev)
     }
 
     fn sso_link(&self, sso_user_id: &str, player_uuid: &str) -> Result<(), Error> {
@@ -223,30 +277,71 @@ async fn logout(State(s): State<Arc<AppState>>, h: HeaderMap) -> Result<impl Int
 
 async fn me(State(s): State<Arc<AppState>>, h: HeaderMap) -> Result<Json<serde_json::Value>, ApiErr> {
     let gw = s.gw();
-    let user = sso_auth(&gw, &h)?;
-    let players = gw.sso_linked_players(&user.id)?;
-    Ok(Json(json!({ "email": user.email, "superadmin": user.is_superadmin, "linked_players": players })))
+    if let Ok(user) = sso_auth(&gw, &h) {
+        let players = gw.sso_linked_players(&user.id)?;
+        let linked = gw.sso_linked_player_names(&user.id)?;
+        let superadmin = user.is_superadmin || players.iter().any(|u| gw.is_admin(u, &s.auth.admins));
+        let primary = linked.first().map(|(_, n)| n.clone());
+        return Ok(Json(json!({
+            "mode": "sso",
+            "email": user.email,
+            "player": primary,
+            "superadmin": superadmin,
+            "linked_players": players,
+            "linked": linked.into_iter().map(|(u, n)| json!({ "uuid": u, "name": n })).collect::<Vec<_>>(),
+        })));
+    }
+    let dev = crate::server::auth(&gw, &h)?;
+    let (uuid, name) = gw.device_player(&dev)?.ok_or(ApiErr::Unauthorized)?;
+    let superadmin = gw.is_admin(&uuid, &s.auth.admins);
+    Ok(Json(json!({
+        "mode": "token",
+        "email": null,
+        "player": name,
+        "uuid": uuid,
+        "superadmin": superadmin,
+        "linked_players": [uuid],
+        "linked": [{ "uuid": uuid, "name": name }],
+    })))
 }
 
 #[derive(Deserialize)]
 struct LinkReq {
+    #[serde(default)]
     code: String,
 }
 
-/// Consumes a one-time code minted by an already-authenticated Minecraft device (auth::link_code is the same
-/// mechanism auth.rs uses to link a second device's key) and links that player to this SSO account.
+/// Consumes a one-time code minted by an already-authenticated Minecraft device (auth::link_code or panel_code,
+/// or an active Bearer token in the request header when `code` is omitted) and links that player to this SSO account.
 async fn link(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): Json<LinkReq>) -> Result<Json<serde_json::Value>, ApiErr> {
     let gw = s.gw();
     let user = sso_auth(&gw, &h)?;
-    let player = {
+    let code = b.code.trim();
+    let ttl = std::time::Duration::from_secs(300);
+    let player = if code.is_empty() {
+        let dev = crate::server::auth_bearer(&gw, &h)?;
+        gw.player_of_device(&dev)?.ok_or(ApiErr::Unauthorized)?
+    } else if let Some(p) = {
         let mut m = s.link_codes.lock().unwrap_or_else(|e| e.into_inner());
-        match m.remove(b.code.trim()) {
-            Some((p, t)) if t.elapsed() < std::time::Duration::from_secs(300) => p,
-            _ => return Err(ApiErr::Unauthorized),
-        }
+        m.remove(code).and_then(|(p, t)| (t.elapsed() < ttl).then_some(p))
+    } {
+        p
+    } else {
+        let dev = {
+            let mut m = s.panel_codes.lock().unwrap_or_else(|e| e.into_inner());
+            match m.remove(code) {
+                Some((d, t)) if t.elapsed() < ttl => d,
+                _ => return Err(ApiErr::Unauthorized),
+            }
+        };
+        gw.player_of_device(&dev)?.ok_or(ApiErr::Unauthorized)?
     };
+    if player.starts_with("sso:") {
+        return Err(ApiErr::BadRequest("NOT_MINECRAFT_PLAYER"));
+    }
     gw.sso_link(&user.id, &player)?;
-    Ok(Json(json!({ "ok": true })))
+    let name = gw.player_name(&player).ok();
+    Ok(Json(json!({ "ok": true, "player": name, "uuid": player })))
 }
 
 pub fn routes() -> Router<Arc<AppState>> {

@@ -130,6 +130,19 @@ impl Gateway {
     pub fn is_admin(&self, uuid: &str, from_config: &[String]) -> bool {
         from_config.iter().any(|a| a == uuid)
             || self.db.query_row("SELECT 1 FROM gateway_admins WHERE player_uuid=?", params![uuid], |_| Ok(())).is_ok()
+            || self.is_sso_superadmin(uuid)
+    }
+
+    /// Every world on the gateway, with role ADMIN for a gateway admin or superadmin.
+    pub fn all_worlds(&self) -> Result<Vec<(String, String, String, String, String, Option<String>)>, Error> {
+        let mut st = self.db.prepare(
+            "SELECT w.id, w.name, w.mc_version, 'ADMIN', w.state, \
+               (SELECT p.name FROM leases l JOIN devices hd ON hd.id=l.device_id JOIN players p ON p.uuid=hd.player_uuid \
+                WHERE l.world_id=w.id AND l.status IN('ACTIVE','HANDOFF')) \
+             FROM worlds w ORDER BY w.created_at, w.id",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn set_gateway_admin(&self, uuid: &str, admin: bool, by: &str) -> Result<(), Error> {
@@ -407,6 +420,9 @@ impl AppState {
 pub(crate) enum Actor {
     Admin(String),
     Key(i64, String),
+    /// A dashboard superadmin, an SSO account with no player identity of its own. Separate from the per-world
+    /// ADMIN role and from gateway_admins/MCMESH_ADMINS, but given the same admin-route authority.
+    Sso(String),
 }
 
 impl Actor {
@@ -414,11 +430,13 @@ impl Actor {
         match self {
             Actor::Admin(dev) => gw.audit(dev, action, world, target, detail),
             Actor::Key(id, name) => gw.audit_as(&format!("apikey:{id}"), name, action, world, target, detail),
+            Actor::Sso(email) => gw.audit_as(&format!("sso:{email}"), email, action, world, target, detail),
         }
     }
 }
 
-/// A real admin, or an API key that carries `scope`. 401 for an unknown key, 403 `SCOPE_DENIED` for a key without the scope.
+/// A real admin, an SSO superadmin, or an API key that carries `scope`. 401 for an unknown key, 403 `SCOPE_DENIED`
+/// for a key without the scope.
 fn admin_or_key(s: &AppState, gw: &Gateway, h: &HeaderMap, scope: &str) -> Result<Actor, ApiErr> {
     if let Some(t) = bearer(h).filter(|t| t.starts_with(crate::apikeys::PREFIX)) {
         return match gw.check_api_key(t, scope)? {
@@ -426,6 +444,11 @@ fn admin_or_key(s: &AppState, gw: &Gateway, h: &HeaderMap, scope: &str) -> Resul
             crate::apikeys::KeyCheck::Denied => Err(ApiErr::Forbidden("SCOPE_DENIED")),
             crate::apikeys::KeyCheck::Unknown => Err(ApiErr::Unauthorized),
         };
+    }
+    if let Ok(user) = crate::sso::sso_auth(gw, h) {
+        if user.is_superadmin {
+            return Ok(Actor::Sso(user.email));
+        }
     }
     let dev = auth(gw, h)?;
     require_admin(s, gw, &dev)?;
@@ -652,9 +675,15 @@ async fn put_motd(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): Json<Mo
 }
 
 async fn get_policy(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> R {
+    let _ = s;
     let gw = s.gw();
     let dev = auth(&gw, &h)?;
-    gw.require_member(&world, &dev)?;
+    if gw.require_member(&world, &dev).is_err() {
+        let (uuid, _) = gw.device_player(&dev)?.ok_or(ApiErr::Unauthorized)?;
+        if !gw.is_sso_superadmin(&uuid) || !gw.world_exists(&world) {
+            return Err(ApiErr::Domain(Error::NotMember));
+        }
+    }
     let owner = gw.world_owner(&world)?.and_then(|u| gw.db.query_row("SELECT name FROM players WHERE uuid=?", params![u], |r| r.get::<_, String>(0)).ok());
     Ok(Json(json!({ "policy": gw.host_policy(&world)?, "owner": owner, "allow": gw.host_allowlist(&world)?, "require_signed": gw.world_requires_signed(&world), "handover_vote": gw.vote_enabled(&world) })))
 }
@@ -760,7 +789,48 @@ async fn admin_usage(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
     Ok(Json(json!({
         "month": month.trim_start_matches("relay_month_"),
         "total_worlds": total_worlds, "worlds": worlds, "users": users,
+        "defaults": {
+            "world": limit_json(&gw.limits(Scope::World, "*")?),
+            "user": limit_json(&gw.limits(Scope::User, "*")?),
+        },
     })))
+}
+
+#[derive(Deserialize)]
+struct QuotaReq {
+    scope: String,
+    id: String,
+    storage_bytes: Option<u64>,
+    world_count: Option<u64>,
+    keep_revisions: Option<u64>,
+    keep_days: Option<u64>,
+    max_guests: Option<u64>,
+    relay_bytes_month: Option<u64>,
+}
+
+async fn put_quotas(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): Json<QuotaReq>) -> R {
+    use crate::quota::{Limits, Scope};
+    let mut gw = s.gw();
+    let actor = admin_or_key(&s, &gw, &h, "op:lifecycle")?;
+    let scope = match b.scope.as_str() {
+        "user" => Scope::User,
+        "world" => Scope::World,
+        _ => return Err(ApiErr::BadRequest("BAD_SCOPE")),
+    };
+    if b.id.is_empty() || b.id.len() > 128 {
+        return Err(ApiErr::BadRequest("BAD_ID"));
+    }
+    let l = Limits {
+        storage_bytes: b.storage_bytes,
+        world_count: b.world_count,
+        keep_revisions: b.keep_revisions,
+        keep_days: b.keep_days,
+        max_guests: b.max_guests,
+        relay_bytes_month: b.relay_bytes_month,
+    };
+    gw.set_limits(scope, &b.id, &l)?;
+    actor.record(&gw, "quota.set", if b.scope == "world" { &b.id } else { "" }, &b.id, limit_json(&l));
+    Ok(Json(json!({ "ok": true, "limits": limit_json(&gw.limits(scope, &b.id)?) })))
 }
 
 #[derive(Deserialize)]
@@ -927,6 +997,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/worlds/:id/handover-vote", get(get_handover_vote).post(cast_handover_vote))
         .route("/v1/worlds/:id/handover-vote/propose", post(propose_handover))
         .route("/v1/admin/usage", get(admin_usage))
+        .route("/v1/admin/quotas", put(put_quotas))
         .route("/v1/anchors/register", post(anchor_register))
         .route("/v1/admin/anchors", get(admin_anchors))
         .route("/v1/worlds/:id/transfer", post(post_transfer))
@@ -1254,6 +1325,10 @@ async fn aux_put(State(s): State<Arc<AppState>>, h: HeaderMap, Path((world, ns, 
         return Err(ApiErr::BadRequest("VALUE_TOO_LARGE"));
     }
     let db = |e: rusqlite::Error| ApiErr::Domain(Error::Db(e));
+    if ns == "settings" && key == "motd" && body.is_empty() {
+        gw.db.execute("DELETE FROM world_aux WHERE world_id=? AND ns=? AND key=?", params![world, ns, key]).map_err(db)?;
+        return Ok(Json(json!({ "ok": true })));
+    }
     let exists = gw.db.query_row("SELECT 1 FROM world_aux WHERE world_id=? AND ns=? AND key=?", params![world, ns, key], |_| Ok(())).optional().map_err(db)?.is_some();
     if !exists {
         let n: i64 = gw.db.query_row("SELECT COUNT(*) FROM world_aux WHERE world_id=?", params![world], |r| r.get(0)).map_err(db)?;
@@ -1261,11 +1336,19 @@ async fn aux_put(State(s): State<Arc<AppState>>, h: HeaderMap, Path((world, ns, 
             return Err(ApiErr::Conflict("TOO_MANY_KEYS"));
         }
     }
+    let bytes = if ns == "settings" && key == "motd" {
+        match std::str::from_utf8(&body) {
+            Ok(t) => format_codes(t).into_bytes(),
+            Err(_) => body.to_vec(),
+        }
+    } else {
+        body.to_vec()
+    };
     let (uuid, _) = gw.device_player(&dev)?.ok_or(ApiErr::Unauthorized)?;
     gw.db
         .execute(
             "INSERT OR REPLACE INTO world_aux(world_id, ns, key, value, updated_by, updated_at) VALUES(?,?,?,?,?,?)",
-            params![world, ns, key, body.to_vec(), uuid, wall_s()],
+            params![world, ns, key, bytes, uuid, wall_s()],
         )
         .map_err(db)?;
     Ok(Json(json!({ "ok": true })))

@@ -131,12 +131,16 @@ fn client_level(h: &HeaderMap) -> u32 {
     h.get("x-mesh-client").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse().ok()).unwrap_or(0)
 }
 
-/// Routes that stay open to builds below the minimum: the public status, operators (admin and panel) and API keys.
+/// Routes that stay open to builds below the minimum: the public status, operators (admin, panel, SSO) and API keys.
 fn exempt_from_client_gate(path: &str, h: &HeaderMap) -> bool {
     !path.starts_with("/v1/")
         || path == "/v1/status"
+        || path == "/v1/motd"
         || path.starts_with("/v1/admin/")
         || path.starts_with("/v1/panel/")
+        || path.starts_with("/v1/sso/")
+        || path.starts_with("/v1/auth/sso/")
+        || h.get(axum::http::header::COOKIE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.contains("mcmesh_sso="))
         || h.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).is_some_and(|v| v.trim_start_matches("Bearer ").starts_with(crate::apikeys::PREFIX))
 }
 
@@ -274,13 +278,21 @@ pub(crate) fn req_pack_version(h: &HeaderMap) -> Option<String> {
     ok.then(|| v.to_string())
 }
 
-pub(crate) fn auth(gw: &Gateway, h: &HeaderMap) -> Result<String, ApiErr> {
+pub(crate) fn auth_bearer(gw: &Gateway, h: &HeaderMap) -> Result<String, ApiErr> {
     let tok = h
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(ApiErr::Unauthorized)?;
     gw.device_for_token(tok)?.ok_or(ApiErr::Unauthorized)
+}
+
+pub(crate) fn auth(gw: &Gateway, h: &HeaderMap) -> Result<String, ApiErr> {
+    if let Ok(dev) = auth_bearer(gw, h) {
+        return Ok(dev);
+    }
+    let user = crate::sso::sso_auth(gw, h)?;
+    Ok(gw.sso_device(&user)?)
 }
 
 fn own_lease(gw: &Gateway, device: &str, lease: &str) -> Result<(), ApiErr> {
@@ -367,11 +379,13 @@ async fn list_worlds(
     let dev = auth(&gw, &h)?;
     let now = s.now();
     let pack = req_pack(&h)?;
+    let all = q.get("all").is_some_and(|v| v == "1");
+    let is_admin = gw.device_player(&dev).ok().flatten().is_some_and(|(u, _)| gw.is_admin(&u, &s.auth.admins));
     let hw = q.get("score").and_then(|v| v.parse::<f64>().ok()).map(|sc| (q.get("tier").and_then(|v| v.parse::<u8>().ok()).unwrap_or(1), sc));
-    let worlds: Vec<Value> = gw
-        .worlds_of(&dev)?
+    let raw = if all && is_admin { gw.all_worlds()? } else { gw.worlds_of(&dev)? };
+    let worlds: Vec<Value> = raw
         .into_iter()
-        .filter(|w| gw.pack_of(&w.0).map(|p| p == pack).unwrap_or(false))
+        .filter(|w| all || gw.pack_of(&w.0).map(|p| p == pack).unwrap_or(false))
         .map(|(id, name, mc, role, state, host)| {
             let pack_version = gw.pack_version_of(&id);
             let ready = host.is_none() || s.live_worlds.lock().unwrap_or_else(|e| e.into_inner()).contains(&id);
@@ -383,7 +397,12 @@ async fn list_worlds(
                     .filter(|(_, t, at)| *t > 0 && at.elapsed().as_secs() < 30)
                     .map(|(d, t, _)| json!({ "done": d, "total": t }))
             };
-            json!({ "id": id, "name": name, "mc_version": mc, "role": role, "state": state, "host": host, "takeover_in_s": takeover, "host_ready": ready, "sync": sync, "pack_version": pack_version, "host_load": gw.lease_load(&id).ok().flatten(), "host_players": gw.lease_players(&id).ok().flatten() })
+            let mut v = json!({ "id": id, "name": name, "mc_version": mc, "role": role, "state": state, "host": host, "takeover_in_s": takeover, "host_ready": ready, "sync": sync, "pack_version": pack_version, "host_load": gw.lease_load(&id).ok().flatten(), "host_players": gw.lease_players(&id).ok().flatten() });
+            if all {
+                v["pack"] = json!(gw.pack_of(&id).ok());
+                v["owner"] = json!(gw.world_owner(&id).ok().flatten().and_then(|u| gw.player_name(&u).ok()));
+            }
+            v
         })
         .collect();
     Ok(Json(json!({ "worlds": worlds, "relay": s.auth.advertise, "tunnel_proof": true })))

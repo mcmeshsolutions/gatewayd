@@ -212,27 +212,42 @@ impl Gateway {
     }
 }
 
+fn require_member_or_admin(s: &AppState, gw: &Gateway, dev: &str, world: &str) -> Result<(), ApiErr> {
+    if gw.require_member(world, dev).is_ok() {
+        return Ok(());
+    }
+    crate::admin::require_owner_or_admin(s, gw, dev, world).map(|_| ())
+}
+
+fn require_world_or_gw_admin(s: &AppState, gw: &Gateway, dev: &str, world: &str) -> Result<(), ApiErr> {
+    if gw.role(world, dev).ok() == Some(Role::Admin) {
+        return Ok(());
+    }
+    crate::admin::require_owner_or_admin(s, gw, dev, world).map(|_| ())
+}
+
 async fn get_mods(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> R {
     let gw = s.gw();
     let dev = auth(&gw, &h)?;
-    gw.require_member(&world, &dev)?;
+    require_member_or_admin(&s, &gw, &dev, &world)?;
     Ok(Json(gw.world_mods(&world)?))
 }
 
 async fn put_mods(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(doc): Json<Value>) -> R {
-    let mut gw = s.gw();
+    let gw = s.gw();
     let dev = auth(&gw, &h)?;
     if !doc.is_object() {
         return Err(ApiErr::BadRequest("BAD_DOC"));
     }
-    gw.set_world_mods(&dev, &world, &doc)?;
+    require_world_or_gw_admin(&s, &gw, &dev, &world)?;
+    gw.db.execute("UPDATE worlds SET mods_json=? WHERE id=?", params![doc.to_string(), world]).map_err(Error::Db)?;
     Ok(Json(json!({ "ok": true })))
 }
 
 async fn get_members(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> R {
     let gw = s.gw();
     let dev = auth(&gw, &h)?;
-    gw.require_member(&world, &dev)?;
+    require_member_or_admin(&s, &gw, &dev, &world)?;
     Ok(Json(json!({ "members": gw.members_hw(&world)? })))
 }
 
@@ -297,7 +312,7 @@ async fn post_mod_requests(State(s): State<Arc<AppState>>, h: HeaderMap, Path(wo
 async fn get_mod_requests(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> R {
     let gw = s.gw();
     let dev = auth(&gw, &h)?;
-    gw.require_member(&world, &dev)?;
+    require_member_or_admin(&s, &gw, &dev, &world)?;
     Ok(Json(json!({ "requests": gw.mod_requests(&world)? })))
 }
 
@@ -309,9 +324,29 @@ struct ResolveReq {
 }
 
 async fn post_mod_resolve(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<ResolveReq>) -> R {
-    let mut gw = s.gw();
+    let gw = s.gw();
     let dev = auth(&gw, &h)?;
-    if gw.resolve_mod_request(&dev, &world, &b.id, &b.hash, b.approve)? {
+    if gw.role(&world, &dev).ok() != Some(Role::Admin) {
+        crate::admin::require_owner_or_admin(&s, &gw, &dev, &world)?;
+    }
+    let ok = if b.approve {
+        let mut doc = gw.world_mods(&world)?;
+        let allow = doc.get("allow").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+        if allow.is_empty() {
+            false
+        } else {
+            let mut allow: Vec<Value> = allow.into_iter().filter(|e| e.get("id").and_then(|v| v.as_str()) != Some(&b.id)).collect();
+            allow.push(json!({ "id": b.id, "hash": b.hash }));
+            doc["allow"] = Value::Array(allow);
+            gw.db.execute("UPDATE worlds SET mods_json=? WHERE id=?", params![doc.to_string(), world]).map_err(Error::Db)?;
+            gw.db.execute("DELETE FROM mod_requests WHERE world_id=? AND mod_id=?", params![world, b.id]).map_err(Error::Db)?;
+            true
+        }
+    } else {
+        gw.db.execute("DELETE FROM mod_requests WHERE world_id=? AND mod_id=? AND hash=?", params![world, b.id, b.hash]).map_err(Error::Db)?;
+        true
+    };
+    if ok {
         Ok(Json(json!({ "ok": true })))
     } else {
         Err(ApiErr::Conflict("NO_ALLOWLIST"))
@@ -321,7 +356,7 @@ async fn post_mod_resolve(State(s): State<Arc<AppState>>, h: HeaderMap, Path(wor
 async fn get_revisions(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> R {
     let gw = s.gw();
     let dev = auth(&gw, &h)?;
-    gw.require_member(&world, &dev)?;
+    require_member_or_admin(&s, &gw, &dev, &world)?;
     Ok(Json(json!({ "head": gw.head(&world)?, "revisions": gw.revisions(&world, 100)? })))
 }
 
@@ -333,10 +368,15 @@ struct RevertReq {
 async fn post_revert(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<RevertReq>) -> R {
     let mut gw = s.gw();
     let dev = auth(&gw, &h)?;
-    match gw.revert(&dev, &world, &b.rev)? {
-        Ok(id) => Ok(Json(json!({ "ok": true, "revision": id }))),
-        Err(code) => Err(ApiErr::Conflict(code)),
+    require_world_or_gw_admin(&s, &gw, &dev, &world)?;
+    if gw.revision_world(&b.rev)?.as_deref() != Some(world.as_str()) {
+        return Err(ApiErr::Conflict("NO_SUCH_REVISION"));
     }
+    if gw.world_state(&world)?.0 != "IDLE" {
+        return Err(ApiErr::Conflict("WORLD_RUNNING"));
+    }
+    let id = gw.rollback_to(&world, &b.rev)?;
+    Ok(Json(json!({ "ok": true, "revision": id })))
 }
 
 async fn panel_code(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
