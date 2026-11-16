@@ -45,6 +45,12 @@ CREATE TABLE IF NOT EXISTS identities(
   pubkey BLOB);
 CREATE UNIQUE INDEX IF NOT EXISTS players_name_ci ON players(name COLLATE NOCASE);
 
+-- Every key-mode device a player has ever logged in with (the first one too, see login_identity). A machine whose
+-- key is here resolves straight to its owner on login instead of racing another machine for the name.
+CREATE TABLE IF NOT EXISTS identity_keys(
+  player_uuid TEXT NOT NULL REFERENCES players(uuid), pubkey BLOB NOT NULL UNIQUE, added_at INTEGER NOT NULL,
+  PRIMARY KEY(player_uuid, pubkey));
+
 CREATE TABLE IF NOT EXISTS blob_world(
   hash BLOB NOT NULL, world_id TEXT NOT NULL REFERENCES worlds(id), PRIMARY KEY(hash, world_id));
 CREATE TABLE IF NOT EXISTS invites(

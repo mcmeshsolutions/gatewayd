@@ -22,6 +22,9 @@ pub struct AppState {
     pub(crate) challenges: Mutex<std::collections::HashMap<String, Instant>>,
     pub(crate) tickets: Mutex<std::collections::HashMap<String, crate::auth::Ticket>>,
     pub(crate) panel_codes: Mutex<std::collections::HashMap<String, (String, Instant)>>,
+    /// Device-link codes: one-time code -> the player uuid to link a second machine's key to. A different id space
+    /// from panel_codes (device id, not player uuid), kept separate so the two can never be confused.
+    pub(crate) link_codes: Mutex<std::collections::HashMap<String, (String, Instant)>>,
     /// Worlds whose host has a live relay tunnel, i.e. guests can actually get in.
     pub(crate) live_worlds: Mutex<std::collections::HashSet<String>>,
     /// Host's world download progress by lease id: (done, total, when reported).
@@ -44,7 +47,7 @@ impl AppState {
             eprintln!("ops init failed: {e:?}");
         }
         let hooks = crate::ops::Hooks::new(&auth.webhooks, auth.webhook_secret.clone());
-        Arc::new(AppState { gw: Mutex::new(gw), start: Instant::now(), auth, challenges: Mutex::new(Default::default()), tickets: Mutex::new(Default::default()), panel_codes: Mutex::new(Default::default()), live_worlds: Mutex::new(Default::default()), sync: Mutex::new(Default::default()), wanted: Mutex::new(Default::default()), hooks, relay_bytes: Mutex::new(Default::default()), limiter: crate::ratelimit::Limiter::from_env() })
+        Arc::new(AppState { gw: Mutex::new(gw), start: Instant::now(), auth, challenges: Mutex::new(Default::default()), tickets: Mutex::new(Default::default()), panel_codes: Mutex::new(Default::default()), link_codes: Mutex::new(Default::default()), live_worlds: Mutex::new(Default::default()), sync: Mutex::new(Default::default()), wanted: Mutex::new(Default::default()), hooks, relay_bytes: Mutex::new(Default::default()), limiter: crate::ratelimit::Limiter::from_env() })
     }
     /// Seconds since this world was last asked for by someone who could not get in, or None if never.
     fn wanted_age_s(&self, world: &str) -> Option<u64> {
@@ -892,6 +895,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/auth/challenge", post(crate::auth::challenge))
         .route("/v1/auth/mojang", post(crate::auth::mojang))
         .route("/v1/auth/key", post(crate::auth::key))
+        .route("/v1/auth/link-code", post(crate::auth::link_code))
+        .route("/v1/auth/link", post(crate::auth::link_key))
         .route("/v1/revisions/:rev/files", get(revision_files))
         .route("/v1/worlds/:id/export.zip", get(world_export))
         .route("/v1/worlds/:id/ticket", post(crate::auth::ticket))

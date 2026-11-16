@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const CHALLENGE_TTL: Duration = Duration::from_secs(120);
+const LINK_CODE_TTL: Duration = Duration::from_secs(300);
 const CHALLENGE_CAP: usize = 4096;
 const SIG_DOMAIN: &[u8] = b"mcmesh-auth-v1\0";
 
@@ -157,6 +158,14 @@ impl Gateway {
             "INSERT OR IGNORE INTO identities(player_uuid,kind,pubkey) VALUES(?,?,?)",
             params![uuid, kind_s, pubkey],
         )?;
+        if kind == IdKind::Key {
+            if let Some(pk) = pubkey {
+                tx.execute(
+                    "INSERT OR IGNORE INTO identity_keys(player_uuid,pubkey,added_at) VALUES(?,?,strftime('%s','now'))",
+                    params![uuid, pk],
+                )?;
+            }
+        }
         let dev = format!("d_{}", &crate::cas::hex(&Sha256::digest(uuid.as_bytes()).into())[..16]);
         tx.execute("INSERT OR IGNORE INTO devices(id,player_uuid) VALUES(?,?)", params![dev, uuid])?;
         let token = rand_b64(32)?;
@@ -166,6 +175,31 @@ impl Gateway {
         )?;
         tx.commit()?;
         Ok(Ok(LoginOk { token, uuid: uuid.into(), name: name.into() }))
+    }
+
+    /// The player an already-linked key belongs to, so a second (or third...) machine logs in as that player
+    /// instead of racing it for the name.
+    pub fn key_owner(&self, pubkey: &[u8]) -> Result<Option<String>, Error> {
+        Ok(self.db.query_row("SELECT player_uuid FROM identity_keys WHERE pubkey=?", params![pubkey], |r| r.get(0)).optional()?)
+    }
+
+    /// The player a device belongs to, to mint a link code tied to the right player.
+    pub fn player_of_device(&self, device: &str) -> Result<Option<String>, Error> {
+        Ok(self.db.query_row("SELECT player_uuid FROM devices WHERE id=?", params![device], |r| r.get(0)).optional()?)
+    }
+
+    /// Links an additional key to an existing player (a second machine), from a one-time code minted by a device
+    /// that is already that player.
+    pub fn link_key(&mut self, player_uuid: &str, pubkey: &[u8]) -> Result<(), Error> {
+        self.db.execute(
+            "INSERT OR IGNORE INTO identity_keys(player_uuid,pubkey,added_at) VALUES(?,?,strftime('%s','now'))",
+            params![player_uuid, pubkey],
+        )?;
+        Ok(())
+    }
+
+    pub fn player_name(&self, player_uuid: &str) -> Result<String, Error> {
+        Ok(self.db.query_row("SELECT name FROM players WHERE uuid=?", params![player_uuid], |r| r.get(0))?)
     }
 
     pub fn grant_role(&mut self, world: &str, name: &str, role: Role) -> Result<bool, Error> {
@@ -281,9 +315,70 @@ pub(crate) async fn key(State(s): State<Arc<AppState>>, Json(req): Json<KeyReq>)
     let mut msg = SIG_DOMAIN.to_vec();
     msg.extend_from_slice(req.challenge.as_bytes());
     vk.verify_strict(&msg, &sig).map_err(|_| ApiErr::Unauthorized)?;
-    let uuid = key_uuid(&pk);
-    let r = s.gw().login_identity(IdKind::Key, &uuid, &req.name, Some(&pk));
+    let mut gw = s.gw();
+    // a key already linked to a player (this machine, or another one it was linked to) resolves straight to that
+    // player instead of deriving a fresh uuid from the key and racing an existing login for the name
+    let uuid = gw.key_owner(&pk)?.unwrap_or_else(|| key_uuid(&pk));
+    let r = gw.login_identity(IdKind::Key, &uuid, &req.name, Some(&pk));
+    drop(gw);
     finish(&s, "key", r)
+}
+
+#[derive(Deserialize)]
+pub(crate) struct LinkKeyReq {
+    challenge: String,
+    code: String,
+    pubkey: String,
+    sig: String,
+}
+
+/// One-time code for linking a second machine's key to this (already logged in) player. Call with the existing
+/// device's bearer token; the code is then given to the mod on the new machine.
+pub(crate) async fn link_code(State(s): State<Arc<AppState>>, h: axum::http::HeaderMap) -> Result<Json<Value>, ApiErr> {
+    let gw = s.gw();
+    let dev = crate::server::auth(&gw, &h)?;
+    let player = gw.player_of_device(&dev)?.ok_or(ApiErr::Unauthorized)?;
+    drop(gw);
+    let mut raw = [0u8; 6];
+    getrandom::getrandom(&mut raw).map_err(|_| ApiErr::Domain(Error::Rand))?;
+    let code: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+    let mut m = s.link_codes.lock().unwrap_or_else(|e| e.into_inner());
+    m.retain(|_, (_, t)| t.elapsed() < LINK_CODE_TTL);
+    m.insert(code.clone(), (player, Instant::now()));
+    Ok(Json(json!({ "code": code })))
+}
+
+/// Proves possession of a new key (same challenge/sig scheme as a normal key login) and, if the one-time code is
+/// still good, links that key to the code's player and logs in as them straight away.
+pub(crate) async fn link_key(State(s): State<Arc<AppState>>, Json(req): Json<LinkKeyReq>) -> Result<Json<Value>, ApiErr> {
+    if !s.auth.key {
+        return Err(ApiErr::Forbidden("AUTH_DISABLED"));
+    }
+    let pk: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(&req.pubkey)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or(ApiErr::BadRequest("BAD_KEY"))?;
+    let sig = URL_SAFE_NO_PAD.decode(&req.sig).ok().ok_or(ApiErr::BadRequest("BAD_SIG"))?;
+    take_challenge(&s, &req.challenge)?;
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk).map_err(|_| ApiErr::BadRequest("BAD_KEY"))?;
+    let sig = ed25519_dalek::Signature::from_slice(&sig).map_err(|_| ApiErr::BadRequest("BAD_SIG"))?;
+    let mut msg = SIG_DOMAIN.to_vec();
+    msg.extend_from_slice(req.challenge.as_bytes());
+    vk.verify_strict(&msg, &sig).map_err(|_| ApiErr::Unauthorized)?;
+    let player = {
+        let mut m = s.link_codes.lock().unwrap_or_else(|e| e.into_inner());
+        match m.remove(req.code.trim()) {
+            Some((p, t)) if t.elapsed() < LINK_CODE_TTL => p,
+            _ => return Err(ApiErr::Unauthorized),
+        }
+    };
+    let mut gw = s.gw();
+    gw.link_key(&player, &pk)?;
+    let name = gw.player_name(&player)?;
+    let r = gw.login_identity(IdKind::Key, &player, &name, Some(&pk));
+    drop(gw);
+    finish(&s, "link", r)
 }
 
 const TICKET_TTL: Duration = Duration::from_secs(60);
@@ -392,5 +487,20 @@ mod placeholder_tests {
         let mut g = gw();
         g.login_identity(IdKind::Key, "key-uuid-1", "bobby", Some(&[1u8; 32])).unwrap().unwrap();
         assert_eq!(g.login_identity(IdKind::Key, "key-uuid-9", "bobby", Some(&[2u8; 32])).unwrap().err(), Some("NAME_TAKEN"));
+    }
+
+    #[test]
+    fn a_linked_second_key_logs_in_as_the_same_player_instead_of_racing_for_the_name() {
+        let mut g = gw();
+        let first = g.login_identity(IdKind::Key, "key-uuid-1", "bobby", Some(&[1u8; 32])).unwrap().unwrap();
+        // the second machine's own key is a stranger until it is linked
+        assert_eq!(g.login_identity(IdKind::Key, "key-uuid-9", "bobby", Some(&[2u8; 32])).unwrap().err(), Some("NAME_TAKEN"));
+        assert_eq!(g.key_owner(&[2u8; 32]).unwrap(), None);
+        g.link_key(&first.uuid, &[2u8; 32]).unwrap();
+        assert_eq!(g.key_owner(&[2u8; 32]).unwrap(), Some(first.uuid.clone()));
+        // logging in with the now-linked key resolves straight to the same player, no collision
+        let ok = g.login_identity(IdKind::Key, &first.uuid, "bobby", Some(&[2u8; 32])).unwrap().expect("not refused");
+        assert_eq!(ok.uuid, first.uuid);
+        assert_eq!(ok.name, "bobby");
     }
 }
