@@ -923,6 +923,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(crate::panel::routes())
         .merge(crate::ops::routes())
         .merge(crate::admin::routes())
+        .merge(crate::sso::routes())
         .merge(crate::crash::routes())
         .merge(crate::worldgen::routes())
         .merge(crate::shard::routes())

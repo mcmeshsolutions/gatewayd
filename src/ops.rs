@@ -41,6 +41,7 @@ impl Gateway {
         self.crash_init()?;
         self.worldgen_init()?;
         self.apikeys_init()?;
+        self.sso_init()?;
         Ok(())
     }
 
