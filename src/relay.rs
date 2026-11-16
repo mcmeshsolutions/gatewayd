@@ -231,12 +231,25 @@ async fn agent_session(relay: Arc<Relay>, sock: TcpStream) {
         })
     };
     let reason;
+    let mut misses = 0u32;
     loop {
         let f = tokio::select! {
             f = tokio::time::timeout(KEEPALIVE * 4, read_frame(&mut rd)) => match f {
-                Ok(Ok(f)) => f,
+                Ok(Ok(f)) => { misses = 0; f }
                 Ok(Err(e)) => { reason = format!("read error: {e}"); break }
-                Err(_) => { reason = "keepalive timeout".to_string(); break }
+                Err(_) => {
+                    misses += 1;
+                    // a GC pause, autosave or worldgen spike can stall the host's single tunnel
+                    // thread well past one 40s window without the host (or its lease) actually
+                    // being dead, so give it a few more rounds as long as the lease heartbeat
+                    // says it's still alive before kicking every guest off the tunnel
+                    if misses < 3 && relay.state.lease_live(&t.lease, t.epoch) {
+                        eprintln!("tunnel stall: world={} host_device={host} epoch={} miss={misses}, lease still live", t.world, t.epoch);
+                        continue;
+                    }
+                    reason = "keepalive timeout".to_string();
+                    break;
+                }
             },
             _ = t.kill.notified() => { reason = "superseded or lease ended".to_string(); break }
         };
