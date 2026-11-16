@@ -859,3 +859,57 @@ fn dropping_an_own_lease_is_a_noop_for_other_devices_and_during_a_handover() {
     assert!(!g.drop_own_lease(W, "dev-a").unwrap(), "a grant being picked up during a handover stays");
     assert_eq!(g.lease_of_world(W).as_deref(), Some(a.lease_id.as_str()));
 }
+
+#[test]
+fn force_unlock_ends_the_lease_and_lets_a_waiting_candidate_take_over() {
+    let mut g = setup();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    g.join(W, "dev-b", hw(2, 5.0), 1_000).unwrap();
+    assert!(g.force_unlock(W, 2_000).unwrap());
+    assert!(matches!(g.heartbeat(&a.lease_id, a.epoch, 2_001), Err(Error::StaleEpoch)), "the old lease is fenced");
+    assert_eq!(g.state(W).unwrap(), ("MIGRATING".into(), Some("BOOTING".into())));
+    let b = host(g.join(W, "dev-b", hw(2, 5.0), 2_500).unwrap());
+    assert_ne!(b.lease_id, a.lease_id);
+}
+
+#[test]
+fn force_unlock_with_nobody_waiting_goes_idle_and_is_a_noop_with_nothing_to_unlock() {
+    let mut g = setup();
+    host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    assert!(g.force_unlock(W, 1_000).unwrap());
+    assert_eq!(g.state(W).unwrap().0, "IDLE");
+    assert!(!g.force_unlock(W, 2_000).unwrap(), "nothing left to unlock");
+}
+
+#[test]
+fn force_switch_host_moves_a_healthy_lease_to_an_online_candidate() {
+    let mut g = setup();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    g.join(W, "dev-b", hw(2, 5.0), 1_000).unwrap();
+    assert_eq!(g.force_switch_host(W, "dev-b", 2_000).unwrap(), ForceSwitchOutcome::Switched);
+    assert!(matches!(g.heartbeat(&a.lease_id, a.epoch, 2_001), Err(Error::StaleEpoch)), "the old host's lease is fenced");
+    assert_eq!(g.state(W).unwrap(), ("MIGRATING".into(), Some("BOOTING".into())));
+    let b = host(g.join(W, "dev-b", hw(2, 5.0), 2_500).unwrap());
+    assert_ne!(b.lease_id, a.lease_id);
+}
+
+#[test]
+fn force_switch_host_refuses_a_target_that_is_not_bidding_and_is_a_noop_on_the_current_host() {
+    let mut g = setup();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    assert_eq!(g.force_switch_host(W, "dev-b", 1_000).unwrap(), ForceSwitchOutcome::TargetNotBidding, "dev-b never bid");
+    assert_eq!(g.force_switch_host(W, "dev-a", 1_000).unwrap(), ForceSwitchOutcome::AlreadyHost);
+    assert_eq!(g.lease_of_world(W).as_deref(), Some(a.lease_id.as_str()), "neither case touched the lease");
+}
+
+#[test]
+fn candidates_lists_only_live_eligible_bids_for_the_right_world() {
+    let mut g = setup();
+    host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    g.join(W, "dev-b", hw(3, 1.0), 1_000).unwrap();
+    let cands = g.candidates(W, 2_000);
+    assert!(cands.iter().any(|(d, tier, score, _)| d == "dev-a" && *tier == 2 && *score == 5.0), "the host bid too: {cands:?}");
+    assert!(cands.iter().any(|(d, tier, score, _)| d == "dev-b" && *tier == 3 && *score == 1.0));
+    assert_eq!(cands.len(), 2, "{cands:?}");
+    assert!(g.candidates(W, 1_000 + EXPIRY_MS + 1).is_empty(), "a stale bid drops off");
+}

@@ -524,6 +524,66 @@ async fn world_activity(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world
     })))
 }
 
+/// Who is live and bidding to host this world right now - what a "force switch host" target has to be.
+async fn world_candidates(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_owner_or_admin(&s, &gw, &dev, &world)?;
+    let now = s.now();
+    let mut rows: Vec<_> = gw
+        .candidates(&world, now)
+        .into_iter()
+        .map(|(device, tier, score, seen)| {
+            let (uuid, name) = gw.device_player(&device).ok().flatten().unwrap_or_default();
+            json!({ "device": device, "player_uuid": uuid, "player_name": name, "tier": tier, "score": score, "age_s": now.saturating_sub(seen) / 1000 })
+        })
+        .collect();
+    rows.sort_by(|a, b| a["tier"].as_u64().cmp(&b["tier"].as_u64()).then(b["score"].as_f64().partial_cmp(&a["score"].as_f64()).unwrap_or(std::cmp::Ordering::Equal)));
+    Ok(Json(json!({ "candidates": rows })))
+}
+
+/// Superadmin override: ends whatever lease is held on this world right now, as if it had just expired,
+/// and lets the normal recovery path re-elect a host. For a world that is stuck LOCKED with a host that
+/// looks dead but hasn't yet missed enough heartbeats to expire on its own.
+async fn force_unlock_world(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> R {
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_admin(&s, &gw, &dev)?;
+    if !gw.world_exists(&world) {
+        return Err(ApiErr::Domain(Error::NoSuchWorld));
+    }
+    let now = s.now();
+    let unlocked = gw.force_unlock(&world, now)?;
+    gw.audit(&dev, "world.force_unlock", &world, "", json!({ "unlocked": unlocked }));
+    Ok(Json(json!({ "unlocked": unlocked })))
+}
+
+#[derive(Deserialize)]
+struct ForceSwitchReq {
+    device: String,
+}
+
+/// Superadmin override: ends whatever lease is held - even a healthy one - and hands hosting to `device`
+/// instead, provided it is actually online and bidding to host (see world_candidates). Lets an operator
+/// move hosting off a machine that is about to go down for maintenance without waiting for a vote.
+async fn force_switch_host(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<ForceSwitchReq>) -> R {
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_admin(&s, &gw, &dev)?;
+    if !gw.world_exists(&world) {
+        return Err(ApiErr::Domain(Error::NoSuchWorld));
+    }
+    let now = s.now();
+    let outcome = gw.force_switch_host(&world, &b.device, now)?;
+    let code = match outcome {
+        crate::lease::ForceSwitchOutcome::Switched => "SWITCHED",
+        crate::lease::ForceSwitchOutcome::AlreadyHost => "ALREADY_HOST",
+        crate::lease::ForceSwitchOutcome::TargetNotBidding => return Err(ApiErr::Conflict("TARGET_NOT_BIDDING")),
+    };
+    gw.audit(&dev, "world.force_switch_host", &world, &b.device, json!({ "outcome": code }));
+    Ok(Json(json!({ "outcome": code })))
+}
+
 async fn get_user(State(s): State<Arc<AppState>>, h: HeaderMap, Path(name): Path<String>) -> R {
     let gw = s.gw();
     let dev = auth(&gw, &h)?;
@@ -763,12 +823,24 @@ async fn admin_usage(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
         if let Some(u) = owner_uuid {
             owner_set.insert(u);
         }
+        let (state, phase, _) = gw.world_state(&id)?;
+        let host: Option<String> = gw
+            .db
+            .query_row(
+                "SELECT p.name FROM leases l JOIN devices d ON d.id=l.device_id JOIN players p ON p.uuid=d.player_uuid \
+                 WHERE l.world_id=? AND l.status IN('ACTIVE','HANDOFF')",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db)?;
         worlds.push(json!({
             "id": id, "name": name, "owner": owner,
             "storage_bytes": gw.world_usage(&id)?, "revisions": revisions,
             "relay_bytes_month": gw.meter_value(&id, &month),
             "commits": gw.meter_value(&id, "commits"),
             "limits": limit_json(&gw.limits(Scope::World, &id)?),
+            "state": state, "phase": phase, "host": host, "candidates": gw.candidates(&id, s.now()).len(),
         }));
     }
     worlds.sort_by_key(|w| std::cmp::Reverse(w["storage_bytes"].as_u64().unwrap_or(0)));
@@ -1028,6 +1100,9 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/admin/users/:name/role", put(put_gateway_role))
         .route("/v1/worlds/:id/audit", get(world_audit))
         .route("/v1/worlds/:id/activity", get(world_activity))
+        .route("/v1/worlds/:id/candidates", get(world_candidates))
+        .route("/v1/admin/worlds/:id/force-unlock", post(force_unlock_world))
+        .route("/v1/admin/worlds/:id/force-switch-host", post(force_switch_host))
         .route("/v1/worlds/:id/policy", get(get_policy).put(put_policy))
 }
 

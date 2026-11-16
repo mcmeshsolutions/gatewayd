@@ -52,3 +52,25 @@ async fn admins_see_usage_next_to_limits_and_others_are_refused() {
     assert_eq!((c, v["error"].as_str()), (403, Some("ADMIN_ONLY")));
     assert_eq!(get(&app, None).await.0, 401);
 }
+
+#[tokio::test]
+async fn usage_reports_live_lease_state_host_and_candidates() {
+    let app = app();
+    let join = Request::post("/v1/worlds/w1/join")
+        .header("authorization", "Bearer tok-a")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&serde_json::json!({ "hw": { "tier": 2, "score": 5.0 } })).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(join).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let (c, v) = get(&app, Some("tok-a")).await;
+    assert_eq!(c, 200);
+    let w1 = v["worlds"].as_array().unwrap().iter().find(|w| w["id"] == "w1").unwrap();
+    assert_eq!(w1["state"], "LOCKED");
+    assert_eq!(w1["host"], "alice");
+    assert!(w1["candidates"].as_u64().unwrap() >= 1);
+    let w2 = v["worlds"].as_array().unwrap().iter().find(|w| w["id"] == "w2").unwrap();
+    assert_eq!(w2["state"], "IDLE");
+    assert_eq!(w2["host"], Value::Null);
+}

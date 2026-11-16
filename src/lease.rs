@@ -26,6 +26,13 @@ const STRUGGLE_LEVEL: u32 = 2;
 const STRUGGLE_MARGIN: f64 = 1.05;
 const STRUGGLE_MIN_HOLD_MS: u64 = 30_000;
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ForceSwitchOutcome {
+    Switched,
+    AlreadyHost,
+    TargetNotBidding,
+}
+
 #[derive(Debug)]
 pub enum Error {
     Db(rusqlite::Error),
@@ -537,6 +544,16 @@ impl Gateway {
         }
     }
 
+    /// Devices currently bidding to host `world` with a heartbeat no older than the usual expiry window;
+    /// what an admin's "force switch host" picks from, and useful on its own to show who could take over.
+    pub fn candidates(&self, world: &str, now: u64) -> Vec<(String, u8, f64, u64)> {
+        self.cands
+            .iter()
+            .filter(|((w, _), c)| w == world && now.saturating_sub(c.seen) <= EXPIRY_MS)
+            .map(|((_, d), c)| (d.clone(), c.tier, c.score, c.seen))
+            .collect()
+    }
+
     pub fn join(&mut self, world: &str, device: &str, hw: Hw, now: u64) -> Result<Join> {
         let role = self.role(world, device)?;
         let eligible = role.can_host() && hw.wants_host;
@@ -782,6 +799,45 @@ impl Gateway {
         self.end_lease(&lid, "EXPIRED", "host restarted")?;
         self.set_state(world, "IDLE", None)?;
         Ok(true)
+    }
+
+    /// Superadmin override: treats the live lease as dead right now instead of waiting for the usual
+    /// missed-heartbeat timeout, and lets the normal recovery path re-elect - the same machinery `tick()`
+    /// uses for a host that silently expired, just triggered on demand for unsticking a frozen world.
+    /// Returns false when there was no lease to unlock.
+    pub fn force_unlock(&mut self, world: &str, now: u64) -> Result<bool> {
+        let Some((lid, dev, _, _)) = self.active_lease(world)? else { return Ok(false) };
+        self.promote(&lid, world)?;
+        self.end_lease(&lid, "EXPIRED", "admin forced unlock")?;
+        self.failed.entry(world.to_string()).or_default().insert(dev.clone());
+        self.set_state(world, "MIGRATING", Some("RECOVERING"))?;
+        self.elect(world, &dev, now)?;
+        Ok(true)
+    }
+
+    /// Superadmin override: ends whatever lease is live - even a healthy one - and hands hosting straight
+    /// to `device`, provided it is currently online and bidding to host this world. A target that is not
+    /// actually there to receive the grant would just expire again a few seconds later, so that case is
+    /// refused up front with a clear outcome instead.
+    pub fn force_switch_host(&mut self, world: &str, device: &str, now: u64) -> Result<ForceSwitchOutcome> {
+        let (tier, score, seen) = match self.cands.get(&(world.to_string(), device.to_string())) {
+            Some(c) => (c.tier, c.score, c.seen),
+            None => return Ok(ForceSwitchOutcome::TargetNotBidding),
+        };
+        if now.saturating_sub(seen) > EXPIRY_MS {
+            return Ok(ForceSwitchOutcome::TargetNotBidding);
+        }
+        if let Some((lid, dev, _, _)) = self.active_lease(world)? {
+            if dev == device {
+                return Ok(ForceSwitchOutcome::AlreadyHost);
+            }
+            self.promote(&lid, world)?;
+            self.end_lease(&lid, "EXPIRED", "admin forced host switch")?;
+        }
+        self.failed.remove(world);
+        self.grant(world, device, tier, score, now)?;
+        self.set_state(world, "MIGRATING", Some("BOOTING"))?;
+        Ok(ForceSwitchOutcome::Switched)
     }
 
     /// Host is leaving. With guests present the world migrates; the host still sends its final commit.
