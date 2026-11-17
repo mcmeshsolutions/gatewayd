@@ -39,6 +39,9 @@ struct Tunnel {
     next: AtomicU32,
     peers: Mutex<Peers>,
     kill: Notify,
+    /// consecutive failed answers to the health probe below; reset to 0 on a fresh tunnel (a reconnect
+    /// deserves a clean slate) and on every successful probe
+    probe_misses: AtomicU32,
 }
 
 pub struct Relay {
@@ -179,6 +182,7 @@ async fn agent_session(relay: Arc<Relay>, sock: TcpStream) {
         next: AtomicU32::new(1),
         peers: Mutex::new(Peers::default()),
         kill: Notify::new(),
+        probe_misses: AtomicU32::new(0),
     });
     let superseded = if t.shard {
         if let Some(old) = lock(&relay.shards).insert(t.lease.clone(), t.clone()) {
@@ -603,4 +607,89 @@ pub async fn serve_channel_udp(relay: Arc<Relay>, chan: u8, sock: Arc<UdpSocket>
         data.extend_from_slice(&buf[..n]);
         let _ = t.up.try_send(Frame::new(CUDP, id, data));
     }
+}
+
+const PROBE_INTERVAL: Duration = Duration::from_secs(60);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+/// Consecutive failed answers before the lease gets revoked. The heartbeat already tolerates a few
+/// missed rounds for a GC pause or autosave spike (see `misses` in `agent_session`), so this needs its
+/// own count rather than reusing that one - a probe only fails when the tunnel genuinely cannot reach
+/// the host's local server, which a stalled-but-alive heartbeat does not explain.
+const PROBE_FAILS_BEFORE_UNLOCK: u32 = 3;
+
+/// Periodically checks that each hosted world's tunnel can actually answer a plain status request -
+/// the same ping every launcher sends for the server list - end to end through the relay and the
+/// host's tunnel agent to its local server. A healthy lease heartbeat only proves the host's mod is
+/// still running; it says nothing about whether the tunnel between here and the host's machine is
+/// still carrying real traffic, which is exactly the gap that let guests retry against a dead tunnel
+/// indefinitely while the host's own already-open session looked completely fine.
+pub async fn serve_probe(relay: Arc<Relay>) {
+    let mut iv = tokio::time::interval(PROBE_INTERVAL);
+    loop {
+        iv.tick().await;
+        for t in relay.all() {
+            if t.shard || !relay.live(&t) {
+                continue;
+            }
+            // skip a host that is still loading the world: `host_ready()` only moves the world to
+            // LOCKED once the integrated server is actually accepting connections, so probing during
+            // MIGRATING/BOOTING would just be measuring how long startup takes and churn out false misses
+            let locked = matches!(relay.state.gw().world_state(&t.world), Ok((state, _, _)) if state == "LOCKED");
+            if !locked {
+                continue;
+            }
+            if probe_one(&t).await {
+                t.probe_misses.store(0, Ordering::Relaxed);
+                continue;
+            }
+            let misses = t.probe_misses.fetch_add(1, Ordering::Relaxed) + 1;
+            eprintln!("relay probe: world={} tunnel did not answer a status check (miss {misses}/{PROBE_FAILS_BEFORE_UNLOCK})", t.world);
+            if misses < PROBE_FAILS_BEFORE_UNLOCK {
+                continue;
+            }
+            let now = crate::lease::wall_s() as u64;
+            // bind the outcome before matching on it: a match scrutinee that calls straight through a
+            // MutexGuard temporary keeps that guard alive for the whole match (including its arms), so
+            // the second relay.state.gw() call below would try to lock the same non-reentrant Mutex this
+            // thread is still holding - a guaranteed deadlock that freezes every other request needing
+            // the same Gateway lock, which is effectively the whole service. Confirmed live on 2026-11-16.
+            let outcome = relay.state.gw().auto_unlock_unreachable(&t.world, now);
+            match outcome {
+                Ok(true) => {
+                    eprintln!(
+                        "relay probe: world={} lease revoked after {misses} status checks in a row with no answer - host should contact an administrator",
+                        t.world
+                    );
+                    relay.state.gw().audit_as("", "system", "world.auto_unlock_unreachable", &t.world, "", serde_json::json!({ "misses": misses }));
+                }
+                Ok(false) => {} // lease already ended on its own between the probe and now
+                Err(e) => eprintln!("relay probe: auto-unlock failed for world={}: {e:?}", t.world),
+            }
+        }
+    }
+}
+
+/// One health check: opens a stream over the tunnel exactly like a real guest would, sends a status
+/// handshake + request, and waits for any bytes back. Always cleans up the stream itself.
+async fn probe_one(t: &Arc<Tunnel>) -> bool {
+    let id = t.next.fetch_add(1, Ordering::Relaxed);
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+    lock(&t.streams).insert(id, tx);
+    let answered = probe_roundtrip(t, id, &mut rx).await;
+    lock(&t.streams).remove(&id);
+    let _ = t.up.send(Frame::new(CLOSE, id, Vec::new())).await;
+    answered
+}
+
+async fn probe_roundtrip(t: &Arc<Tunnel>, id: u32, rx: &mut mpsc::Receiver<Vec<u8>>) -> bool {
+    use crate::mcproto::{build_handshake, status_request, Handshake};
+    if t.up.send(Frame::new(OPEN, id, Vec::new())).await.is_err() {
+        return false;
+    }
+    let mut payload = build_handshake(&Handshake { protocol: 0, address: String::new(), port: 0, next: 1 });
+    payload.extend_from_slice(&status_request());
+    if t.up.send(Frame::new(DATA, id, payload)).await.is_err() {
+        return false;
+    }
+    matches!(tokio::time::timeout(PROBE_TIMEOUT, rx.recv()).await, Ok(Some(_)))
 }
