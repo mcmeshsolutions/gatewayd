@@ -752,7 +752,7 @@ async fn wal_append(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): P
     Ok(Json(json!({ "next_seq": next })))
 }
 
-const MAX_BLOB: usize = 16 << 20;
+pub(crate) const MAX_BLOB: usize = 16 << 20;
 /// Everything that is not a blob, a WAL batch or a log chunk is a small JSON document.
 const MAX_JSON: usize = 64 << 10;
 const MAX_WAL: usize = 4 << 20;

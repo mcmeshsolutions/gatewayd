@@ -1,5 +1,5 @@
-use gatewayd::blobstream::{serve, BLOB_BEGIN, BLOB_DATA, ERR, HELLO, HELLO_OK, MISSING, PONG, WANT};
-use gatewayd::lease::{Gateway, Role};
+use gatewayd::blobstream::{serve, BLOB_BEGIN, BLOB_DATA, ERR, HELLO, HELLO_OK, MISSING, PONG, PUT_BEGIN, PUT_DATA, PUT_ERR, PUT_OK, WANT};
+use gatewayd::lease::{Gateway, Hw, Role};
 use gatewayd::server::AppState;
 use gatewayd::tunnel::{read_frame, write_frame, Frame};
 use rusqlite::Connection;
@@ -26,6 +26,21 @@ async fn env() -> (std::net::SocketAddr, [u8; 32], Vec<u8>, String) {
     let addr = l.local_addr().unwrap();
     tokio::spawn(serve(state, l));
     (addr, hash, data, "tok-a".to_string())
+}
+
+/// A world with dev-a holding the active lease, for tests that upload (only the lease holder, a shard
+/// host, or a worldgen worker may).
+async fn env_hosting() -> (std::net::SocketAddr, String) {
+    let mut g = Gateway::open(Connection::open_in_memory().unwrap(), gatewayd::cas::Cas::open(cas_dir()).unwrap(), 0).unwrap();
+    g.create_world("w1", "w", "1.21.1", "neoforge").unwrap();
+    g.add_member("w1", "u-a", "alice", "dev-a", Role::HostEligible).unwrap();
+    g.add_token("dev-a", "tok-a").unwrap();
+    g.join("w1", "dev-a", Hw { tier: 1, score: 1.0, wants_host: true, takeover: false }, 0).unwrap();
+    let state = AppState::new(g);
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(serve(state, l));
+    (addr, "tok-a".to_string())
 }
 
 async fn connect_and_hello(addr: std::net::SocketAddr, token: &str) -> (BufReader<tokio::net::tcp::OwnedReadHalf>, tokio::net::tcp::OwnedWriteHalf, Frame) {
@@ -147,5 +162,48 @@ async fn relay_agent_listener_also_serves_blob_streams() {
     assert_eq!((begin.ty, begin.id), (BLOB_BEGIN, 7));
     let f = read_frame(&mut rd).await.unwrap();
     assert_eq!((f.ty, f.id, f.data), (BLOB_DATA, 7, data));
+}
+
+#[tokio::test]
+async fn a_put_is_stored_and_echoes_back_its_hash() {
+    let (addr, token) = env_hosting().await;
+    let (mut rd, mut wr, hello_reply) = connect_and_hello(addr, &token).await;
+    assert_eq!(hello_reply.ty, HELLO_OK);
+
+    let data = b"uploaded region bytes from the lease holder".to_vec();
+    write_frame(&mut wr, &Frame::new(PUT_BEGIN, 5, (data.len() as u64).to_be_bytes().to_vec())).await.unwrap();
+    write_frame(&mut wr, &Frame::new(PUT_DATA, 5, data.clone())).await.unwrap();
+    let reply = read_frame(&mut rd).await.unwrap();
+    assert_eq!((reply.ty, reply.id), (PUT_OK, 5));
+    assert_eq!(reply.data, gatewayd::cas::sha256(&data).to_vec());
+}
+
+#[tokio::test]
+async fn a_put_split_across_several_data_frames_still_assembles_correctly() {
+    let (addr, token) = env_hosting().await;
+    let (mut rd, mut wr, hello_reply) = connect_and_hello(addr, &token).await;
+    assert_eq!(hello_reply.ty, HELLO_OK);
+
+    let data = b"this one arrives in three separate frames instead of one".to_vec();
+    write_frame(&mut wr, &Frame::new(PUT_BEGIN, 1, (data.len() as u64).to_be_bytes().to_vec())).await.unwrap();
+    for chunk in data.chunks(7) {
+        write_frame(&mut wr, &Frame::new(PUT_DATA, 1, chunk.to_vec())).await.unwrap();
+    }
+    let reply = read_frame(&mut rd).await.unwrap();
+    assert_eq!((reply.ty, reply.id), (PUT_OK, 1));
+    assert_eq!(reply.data, gatewayd::cas::sha256(&data).to_vec());
+}
+
+#[tokio::test]
+async fn a_put_from_a_device_with_no_lease_is_rejected() {
+    let (addr, _, _, token) = env().await;
+    let (mut rd, mut wr, hello_reply) = connect_and_hello(addr, &token).await;
+    assert_eq!(hello_reply.ty, HELLO_OK);
+
+    let data = b"not allowed, dev-a never took this world's lease".to_vec();
+    write_frame(&mut wr, &Frame::new(PUT_BEGIN, 1, (data.len() as u64).to_be_bytes().to_vec())).await.unwrap();
+    write_frame(&mut wr, &Frame::new(PUT_DATA, 1, data)).await.unwrap();
+    let reply = read_frame(&mut rd).await.unwrap();
+    assert_eq!((reply.ty, reply.id), (PUT_ERR, 1));
 }
 
