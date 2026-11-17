@@ -815,6 +815,22 @@ impl Gateway {
         Ok(true)
     }
 
+    /// Automatic counterpart of `force_unlock`, triggered by the relay's own status-ping health check
+    /// (see `relay::serve_probe`) instead of an admin: the heartbeat says the host is fine, but the
+    /// tunnel repeatedly failed to answer a plain status request, so nobody outside the host's own
+    /// machine can actually reach the world. Marks the host failed for this world the same way, so it
+    /// cannot just re-win the next election with the same broken tunnel - the host is expected to sort
+    /// out their connectivity and ask an administrator to clear the failed mark if it was a fluke.
+    pub fn auto_unlock_unreachable(&mut self, world: &str, now: u64) -> Result<bool> {
+        let Some((lid, dev, _, _)) = self.active_lease(world)? else { return Ok(false) };
+        self.promote(&lid, world)?;
+        self.end_lease(&lid, "EXPIRED", "tunnel unreachable from outside - contact an administrator")?;
+        self.failed.entry(world.to_string()).or_default().insert(dev.clone());
+        self.set_state(world, "MIGRATING", Some("RECOVERING"))?;
+        self.elect(world, &dev, now)?;
+        Ok(true)
+    }
+
     /// Superadmin override: ends whatever lease is live - even a healthy one - and hands hosting straight
     /// to `device`, provided it is currently online and bidding to host this world. A target that is not
     /// actually there to receive the grant would just expire again a few seconds later, so that case is

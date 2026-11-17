@@ -1,7 +1,7 @@
 use gatewayd::lease::{Gateway, Role};
 use gatewayd::server::{router, AppState};
 use rusqlite::Connection;
-use gatewayd::relay::{serve_agents, serve_guests, serve_voice, Relay};
+use gatewayd::relay::{serve_agents, serve_guests, serve_probe, serve_voice, Relay};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
@@ -217,6 +217,7 @@ async fn main() {
                         _ => panic!("unknown channel protocol {proto}"),
                     }
                 }
+                tokio::spawn(serve_probe(relay.clone()));
                 tokio::spawn(serve_voice(relay, udp));
             }
             let t = state.clone();

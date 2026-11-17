@@ -103,6 +103,19 @@ pub fn parse_login_start(body: &[u8]) -> Option<String> {
     read_string(&body[o..], 16).map(|(s, _)| s)
 }
 
+/// Status-state request packet (id 0, no fields) - the same thing every server-list ping sends. Used by
+/// the relay's tunnel health probe: a real answer to this proves the full path (tunnel, host agent,
+/// local server socket) can actually serve an outside connection, not just that the lease heartbeat
+/// is still arriving.
+pub fn status_request() -> Vec<u8> {
+    let mut body = Vec::new();
+    write_varint(&mut body, 0);
+    let mut out = Vec::new();
+    write_varint(&mut out, body.len() as i32);
+    out.extend_from_slice(&body);
+    out
+}
+
 /// Status-state response packet (id 0) for the server list.
 pub fn status_response(protocol: i32, motd: &str) -> Vec<u8> {
     let json = serde_json::json!({
