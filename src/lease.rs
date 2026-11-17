@@ -823,6 +823,15 @@ impl Gateway {
     /// out their connectivity and ask an administrator to clear the failed mark if it was a fluke.
     pub fn auto_unlock_unreachable(&mut self, world: &str, now: u64) -> Result<bool> {
         let Some((lid, dev, _, _)) = self.active_lease(world)? else { return Ok(false) };
+        let failed = self.failed.get(world).cloned().unwrap_or_default();
+        let other_cand = self
+            .cands
+            .iter()
+            .any(|((w, d), c)| w == world && d != &dev && !failed.contains(d) && now.saturating_sub(c.seen) <= EXPIRY_MS);
+        if !other_cand {
+            // nobody else can take over this world; do not kill the host's session for nothing
+            return Ok(false);
+        }
         self.promote(&lid, world)?;
         self.end_lease(&lid, "EXPIRED", "tunnel unreachable from outside - contact an administrator")?;
         self.failed.entry(world.to_string()).or_default().insert(dev.clone());

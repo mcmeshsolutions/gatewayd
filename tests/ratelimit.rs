@@ -51,7 +51,7 @@ async fn unauthenticated_public_routes_are_limited_too() {
 #[tokio::test]
 async fn one_token_hitting_the_limit_does_not_block_another() {
     let app = app();
-    for _ in 0..100 {
+    for _ in 0..120 {
         hit(&app, "GET", "/v1/worlds", Some("tok-a")).await;
     }
     assert_eq!(hit(&app, "GET", "/v1/worlds", Some("tok-a")).await.0, 429);

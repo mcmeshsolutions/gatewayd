@@ -618,12 +618,12 @@ pub async fn serve_channel_udp(relay: Arc<Relay>, chan: u8, sock: Arc<UdpSocket>
 }
 
 const PROBE_INTERVAL: Duration = Duration::from_secs(60);
-const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Consecutive failed answers before the lease gets revoked. The heartbeat already tolerates a few
 /// missed rounds for a GC pause or autosave spike (see `misses` in `agent_session`), so this needs its
 /// own count rather than reusing that one - a probe only fails when the tunnel genuinely cannot reach
 /// the host's local server, which a stalled-but-alive heartbeat does not explain.
-const PROBE_FAILS_BEFORE_UNLOCK: u32 = 3;
+const PROBE_FAILS_BEFORE_UNLOCK: u32 = 5;
 
 /// Periodically checks that each hosted world's tunnel can actually answer a plain status request -
 /// the same ping every launcher sends for the server list - end to end through the relay and the

@@ -913,3 +913,24 @@ fn candidates_lists_only_live_eligible_bids_for_the_right_world() {
     assert_eq!(cands.len(), 2, "{cands:?}");
     assert!(g.candidates(W, 1_000 + EXPIRY_MS + 1).is_empty(), "a stale bid drops off");
 }
+
+#[test]
+fn auto_unlock_unreachable_fails_over_when_another_candidate_is_waiting() {
+    let mut g = setup();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    g.join(W, "dev-b", hw(2, 5.0), 1_000).unwrap();
+    assert!(g.auto_unlock_unreachable(W, 2_000).unwrap());
+    assert!(matches!(g.heartbeat(&a.lease_id, a.epoch, 2_001), Err(Error::StaleEpoch)), "the old lease is fenced");
+    assert_eq!(g.state(W).unwrap(), ("MIGRATING".into(), Some("BOOTING".into())));
+    let b = host(g.join(W, "dev-b", hw(2, 5.0), 2_500).unwrap());
+    assert_ne!(b.lease_id, a.lease_id);
+}
+
+#[test]
+fn auto_unlock_unreachable_is_noop_when_no_other_candidate_exists() {
+    let mut g = setup();
+    let a = host(g.join(W, "dev-a", hw(2, 5.0), 0).unwrap());
+    assert!(!g.auto_unlock_unreachable(W, 1_000).unwrap(), "nobody else waiting, keep host alive");
+    assert_eq!(g.state(W).unwrap().0, "LOCKED");
+    assert!(g.heartbeat(&a.lease_id, a.epoch, 1_001).is_ok());
+}
