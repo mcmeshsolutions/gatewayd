@@ -47,7 +47,7 @@ const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 const IDLE_DEADLINE: Duration = Duration::from_secs(120);
 /// Bounded so one client cannot have unlimited blob reads running at once; matches WorldDownloader's own
 /// default client-side worker count, since that is the number of WANTs a default client has in flight.
-const MAX_INFLIGHT: usize = 16;
+const MAX_INFLIGHT: usize = 128;
 
 #[derive(Deserialize)]
 struct Hello {
