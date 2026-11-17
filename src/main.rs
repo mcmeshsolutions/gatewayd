@@ -234,6 +234,12 @@ async fn main() {
                 eprintln!("scheduled scrub and backup to {backup_dir} every {secs} s");
                 tokio::spawn(gatewayd::schedule::serve(db.clone(), cas_dir, backup_dir, std::env::var("MCMESH_AUTO_RECOVER").is_ok_and(|v| v == "1"), Duration::from_secs(600), Duration::from_secs(secs)));
             }
+            {
+                let blob_addr = std::env::var("MCMESH_BLOBSTREAM_ADDR").unwrap_or_else(|_| "0.0.0.0:9100".into());
+                let blob_listener = TcpListener::bind(&blob_addr).await.expect("bind blobstream");
+                eprintln!("blob stream listening on {blob_addr}");
+                tokio::spawn(gatewayd::blobstream::serve(state.clone(), blob_listener));
+            }
             let l = tokio::net::TcpListener::bind(&addr).await.expect("bind");
             eprintln!("gatewayd listening on {addr}");
             axum::serve(l, router(state).into_make_service_with_connect_info::<std::net::SocketAddr>())

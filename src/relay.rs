@@ -158,10 +158,18 @@ async fn agent_session(relay: Arc<Relay>, sock: TcpStream) {
     let _ = sock.set_nodelay(true);
     let (rd, mut wr) = sock.into_split();
     let mut rd = BufReader::new(rd);
-    let hello = match tokio::time::timeout(Duration::from_secs(10), read_frame(&mut rd)).await {
-        Ok(Ok(f)) if f.ty == HELLO => serde_json::from_slice::<Hello>(&f.data).ok(),
-        _ => None,
+    let first = match tokio::time::timeout(Duration::from_secs(10), read_frame(&mut rd)).await {
+        Ok(Ok(f)) if f.ty == HELLO => f,
+        _ => {
+            let _ = write_frame(&mut wr, &Frame::new(ERR, 0, b"unauthorized".to_vec())).await;
+            return;
+        }
     };
+    let hello = serde_json::from_slice::<Hello>(&first.data).ok();
+    if hello.is_none() {
+        crate::blobstream::session_after_hello(relay.state.clone(), rd, wr, &first.data).await;
+        return;
+    }
     let world = hello.as_ref().and_then(|h| match (&h.proof, h.ts) {
         (Some(p), Some(ts)) => relay.state.tunnel_auth_proof(&h.lease, h.epoch, ts, p),
         _ => relay.state.tunnel_auth(&h.token, &h.lease, h.epoch),
