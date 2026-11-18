@@ -1118,6 +1118,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/admin/security/bans", post(post_security_ban))
         .route("/v1/admin/security/bans/:id", axum::routing::delete(delete_security_ban))
         .route("/v1/admin/security/clear-jail", post(post_security_clear_jail))
+        .route("/v1/admin/tailscale/status", get(get_tailscale_status))
+        .route("/v1/admin/tailscale/up", post(post_tailscale_up))
 }
 
 #[derive(Deserialize)]
@@ -2078,6 +2080,56 @@ async fn post_security_clear_jail(State(s): State<Arc<AppState>>, h: HeaderMap) 
 
     gw.audit(&dev, "security.clear_jail", "global", "", json!({ "cleared": cleared }));
     Ok(Json(json!({ "ok": true, "cleared": cleared })))
+}
+
+#[derive(Deserialize)]
+struct TailscaleUpReq {
+    #[serde(default)]
+    hostname: Option<String>,
+    #[serde(default)]
+    magic_dns: Option<String>,
+    #[serde(default)]
+    tailnet_ip: Option<String>,
+    #[serde(default)]
+    funnel: Option<bool>,
+}
+
+async fn get_tailscale_status(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_admin(&s, &gw, &dev)?;
+    let status = s.tailscale.status();
+    Ok(Json(json!({
+        "ok": true,
+        "status": status,
+    })))
+}
+
+async fn post_tailscale_up(
+    State(s): State<Arc<AppState>>,
+    h: HeaderMap,
+    Json(b): Json<TailscaleUpReq>,
+) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_admin(&s, &gw, &dev)?;
+
+    let status = s
+        .tailscale
+        .up(b.hostname, b.magic_dns, b.tailnet_ip, b.funnel);
+
+    gw.audit(
+        &dev,
+        "tailscale.up",
+        "global",
+        &status.hostname,
+        json!({ "magic_dns": status.magic_dns, "tailnet_ip": status.tailnet_ip, "funnel": status.funnel_enabled }),
+    );
+
+    Ok(Json(json!({
+        "ok": true,
+        "status": status,
+    })))
 }
 
 #[cfg(test)]

@@ -38,6 +38,7 @@ pub struct AppState {
     pub limbo: Arc<crate::hotreload::VirtualLimbo>,
     pub s3: Arc<crate::s3::S3Replicator>,
     pub shield: Arc<crate::shield::SecurityShield>,
+    pub tailscale: Arc<crate::tailscale::TailscaleManager>,
 }
 
 impl AppState {
@@ -45,7 +46,7 @@ impl AppState {
         Self::with_auth(gw, crate::auth::AuthCfg::default())
     }
 
-    pub fn with_auth(gw: Gateway, auth: crate::auth::AuthCfg) -> Arc<Self> {
+    pub fn with_auth(gw: Gateway, mut auth: crate::auth::AuthCfg) -> Arc<Self> {
         if let Err(e) = gw.ops_init() {
             eprintln!("ops init failed: {e:?}");
         }
@@ -53,6 +54,12 @@ impl AppState {
         let s3 = Arc::new(crate::s3::S3Replicator::from_env());
         let shield = Arc::new(crate::shield::SecurityShield::from_env());
         shield.load_from_db(gw.db());
+        let tailscale = Arc::new(crate::tailscale::TailscaleManager::from_env());
+        if auth.advertise.is_empty() {
+            if let Some(ts_adv) = tailscale.status().advertise_addr {
+                auth.advertise = ts_adv;
+            }
+        }
         Arc::new(AppState {
             gw: Mutex::new(gw),
             start: Instant::now(),
@@ -70,6 +77,7 @@ impl AppState {
             limbo: crate::hotreload::VirtualLimbo::new(),
             s3,
             shield,
+            tailscale,
         })
     }
     /// Seconds since this world was last asked for by someone who could not get in, or None if never.
