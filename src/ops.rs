@@ -743,6 +743,24 @@ async fn timeline_viewer(Path(_id): Path<String>) -> Response {
     Html(include_str!("../web/timeline.html")).into_response()
 }
 
+#[derive(Deserialize)]
+pub struct DigestQuery {
+    pub player: Option<String>,
+    pub since: Option<i64>,
+}
+
+async fn world_digest(
+    Path(world): Path<String>,
+    Query(q): Query<DigestQuery>,
+) -> Json<crate::digest::WorldDigest> {
+    let player_ref = q.player.as_deref();
+    Json(crate::digest::generate_digest(&world, player_ref, player_ref, q.since))
+}
+
+async fn digest_viewer(Path(_id): Path<String>) -> Response {
+    Html(include_str!("../web/digest.html")).into_response()
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/status", get(status_page))
@@ -754,6 +772,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/contraption", get(contraption_viewer))
         .route("/isomap/:id", get(isomap_viewer))
         .route("/timeline/:id", get(timeline_viewer))
+        .route("/digest/:id", get(digest_viewer))
         .route("/v1/contraptions/inspect", post(contraption_inspect))
         .route("/v1/contraptions/demo", get(contraption_demo))
         .route("/v1/worlds/:id/voxels", get(world_voxels))
@@ -761,6 +780,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/worlds/:id/isomap", get(world_isomap))
         .route("/v1/worlds/:id/heatmap", get(world_heatmap))
         .route("/v1/worlds/:id/hall-of-fame", get(world_hall_of_fame))
+        .route("/v1/worlds/:id/digest", get(world_digest))
         .route("/v1/worlds/:id/events", get(world_events))
         .route("/v1/worlds/:id/events/stream", get(world_event_stream))
 }
