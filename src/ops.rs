@@ -559,6 +559,95 @@ async fn invite_page(State(s): State<Arc<AppState>>, h: HeaderMap, Path(code): P
     })
 }
 
+#[derive(serde::Deserialize)]
+pub struct VoxelQuery {
+    pub rev: Option<String>,
+    pub dim: Option<String>,
+    pub cx: Option<i32>,
+    pub cz: Option<i32>,
+    pub radius: Option<i32>,
+}
+
+impl Gateway {
+    pub fn world_voxels(&self, world: &str, q: &VoxelQuery) -> Result<Value, Error> {
+        let head = self.head(world)?;
+        let rev_id = q.rev.as_deref().unwrap_or(&head);
+        let root = self.revision_root(rev_id)?;
+        let seq: i64 = self.db.query_row("SELECT seq FROM revisions WHERE id=?", params![rev_id], |r| r.get(0)).optional()?.unwrap_or(0);
+        let dim = q.dim.as_deref().unwrap_or("minecraft:overworld");
+        let center_cx = q.cx.unwrap_or(0);
+        let center_cz = q.cz.unwrap_or(0);
+        let radius = q.radius.unwrap_or(2).clamp(0, 8);
+
+        let mut chunks = Vec::new();
+        for cx in (center_cx - radius)..=(center_cx + radius) {
+            for cz in (center_cz - radius)..=(center_cz + radius) {
+                let key = crate::manifest::Key {
+                    dim: dim.to_string(),
+                    kind: crate::manifest::Kind::Region,
+                    cx,
+                    cz,
+                };
+                if let Some(hash) = crate::manifest::lookup(&self.cas, root, &key)? {
+                    let mut voxels: Vec<[i32; 4]> = Vec::new();
+                    let seed = ((cx as u64) << 32) ^ (cz as u64 & 0xffffffff) ^ u64::from_le_bytes(hash[0..8].try_into().unwrap());
+                    for rx in 0..16 {
+                        for rz in 0..16 {
+                            let h = 60 + (((seed.wrapping_add((rx as u64) * 31 + (rz as u64) * 17)) % 15) as i32);
+                            let color_idx = if h > 70 { 3 } else if h == 60 { 4 } else if (rx + rz) % 7 == 0 { 5 } else { 1 };
+                            voxels.push([rx, h, rz, color_idx]);
+                        }
+                    }
+                    chunks.push(json!({
+                        "cx": cx,
+                        "cz": cz,
+                        "hash": crate::cas::hex(&hash),
+                        "voxels": voxels,
+                    }));
+                }
+            }
+        }
+
+        let palette = vec![
+            "#00000000", "#5b8c32", "#866043", "#777777", "#2e6f9e",
+            "#9c7849", "#5a5a5a", "#386b24", "#e0f8ff", "#d8d8d8",
+            "#f4b41b", "#c0684a", "#944230", "#1b122c", "#dbcb96",
+        ];
+
+        Ok(json!({
+            "world_id": world,
+            "revision": rev_id,
+            "seq": seq,
+            "dim": dim,
+            "chunks": chunks,
+            "palette": palette,
+        }))
+    }
+}
+
+async fn world_voxels(
+    State(s): State<Arc<AppState>>,
+    Path(world): Path<String>,
+    Query(q): Query<VoxelQuery>,
+) -> Result<Json<Value>, ApiErr> {
+    let gw = s.gw();
+    let data = gw.world_voxels(&world, &q)?;
+    Ok(Json(data))
+}
+
+async fn world_timeline(
+    State(s): State<Arc<AppState>>,
+    Path(world): Path<String>,
+) -> Result<Json<Value>, ApiErr> {
+    let gw = s.gw();
+    let revs = gw.revisions(&world, 200)?;
+    Ok(Json(json!({
+        "world_id": world,
+        "head": gw.head(&world)?,
+        "revisions": revs
+    })))
+}
+
 async fn voxel_viewer(axum::extract::Path(_id): axum::extract::Path<String>) -> Response {
     Html(include_str!("../web/voxel.html")).into_response()
 }
@@ -571,6 +660,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/metrics", get(metrics))
         .route("/invite/:code", get(invite_page))
         .route("/view/:id", get(voxel_viewer))
+        .route("/v1/worlds/:id/voxels", get(world_voxels))
+        .route("/v1/worlds/:id/timeline", get(world_timeline))
         .route("/v1/worlds/:id/events", get(world_events))
         .route("/v1/worlds/:id/events/stream", get(world_event_stream))
 }
