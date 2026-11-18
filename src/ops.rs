@@ -777,10 +777,16 @@ async fn quests_viewer(Path(_id): Path<String>) -> Response {
     Html(include_str!("../web/quests.html")).into_response()
 }
 
+async fn doctor_json(State(s): State<Arc<AppState>>) -> Json<crate::doctor::DoctorReport> {
+    let gw = s.gw();
+    Json(crate::doctor::run_doctor(&gw))
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/status", get(status_page))
         .route("/v1/status", get(status_json))
+        .route("/v1/doctor", get(doctor_json))
         .route("/.well-known/mcmesh-gateway.json", get(well_known))
         .route("/metrics", get(metrics))
         .route("/invite/:code", get(invite_page))

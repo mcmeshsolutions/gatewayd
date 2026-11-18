@@ -1021,8 +1021,7 @@ impl Gateway {
         )?)
     }
 
-    #[cfg(test)]
-    pub(crate) fn db(&self) -> &Connection {
+    pub fn db(&self) -> &Connection {
         &self.db
     }
 }

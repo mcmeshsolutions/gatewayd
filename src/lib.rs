@@ -5,6 +5,7 @@ pub mod auth;
 pub mod cas;
 pub mod crash;
 pub mod contraption;
+pub mod doctor;
 pub mod maintenance;
 pub mod manifest;
 pub mod mcproto;
