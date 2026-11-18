@@ -1,7 +1,7 @@
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-const PAGES: [&str; 5] = ["/", "/panel", "/status", "/invite/{code}", "/view/{id}"];
+const PAGES: [&str; 6] = ["/", "/panel", "/status", "/invite/{code}", "/view/{id}", "/contraption"];
 
 fn registered() -> BTreeMap<String, BTreeSet<String>> {
     let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();

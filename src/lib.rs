@@ -4,6 +4,7 @@ pub mod apikeys;
 pub mod auth;
 pub mod cas;
 pub mod crash;
+pub mod contraption;
 pub mod maintenance;
 pub mod manifest;
 pub mod mcproto;

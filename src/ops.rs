@@ -5,10 +5,11 @@ use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use rusqlite::{params, OptionalExtension};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::fmt::Write as _;
 use std::sync::mpsc::{sync_channel, SyncSender};
@@ -652,6 +653,30 @@ async fn voxel_viewer(axum::extract::Path(_id): axum::extract::Path<String>) -> 
     Html(include_str!("../web/voxel.html")).into_response()
 }
 
+#[derive(Deserialize)]
+pub struct ContraptionQuery {
+    pub rpm: Option<f64>,
+}
+
+async fn contraption_inspect(
+    Query(q): Query<ContraptionQuery>,
+    body: axum::body::Bytes,
+) -> Json<crate::contraption::ContraptionInspection> {
+    let rpm = q.rpm.unwrap_or(64.0);
+    Json(crate::contraption::inspect_bytes(&body, rpm))
+}
+
+async fn contraption_demo(
+    Query(q): Query<ContraptionQuery>,
+) -> Json<crate::contraption::ContraptionInspection> {
+    let rpm = q.rpm.unwrap_or(64.0);
+    Json(crate::contraption::demo_contraption(rpm))
+}
+
+async fn contraption_viewer() -> Response {
+    Html(include_str!("../web/contraption.html")).into_response()
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/status", get(status_page))
@@ -660,6 +685,9 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/metrics", get(metrics))
         .route("/invite/:code", get(invite_page))
         .route("/view/:id", get(voxel_viewer))
+        .route("/contraption", get(contraption_viewer))
+        .route("/v1/contraptions/inspect", post(contraption_inspect))
+        .route("/v1/contraptions/demo", get(contraption_demo))
         .route("/v1/worlds/:id/voxels", get(world_voxels))
         .route("/v1/worlds/:id/timeline", get(world_timeline))
         .route("/v1/worlds/:id/events", get(world_events))
