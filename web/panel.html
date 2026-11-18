@@ -1298,6 +1298,91 @@ async function renderAdminTab(){
   modGrid.append(usrCard,mntCard);
   box.append(modGrid);
 
+  // Security Shield & Automated Threat Jail
+  const shCard=el('div',{className:'card'},el('h2',{textContent:'Security Shield & Automated Threat Jail'}));
+  const shStats=el('p',{textContent:'Loading security telemetry...'});
+  const bTarget=el('input',{placeholder:'IP (1.2.3.4), CIDR (1.2.3.0/24), or Key'});
+  const bKind=el('select',{},['ip','cidr','key'].map(k=>el('option',{value:k,textContent:k.toUpperCase()})));
+  const bReason=el('input',{placeholder:'Reason (optional)'});
+  const bDur=el('input',{type:'number',placeholder:'Duration s (empty=permanent)',min:'10'});
+  const bAddBtn=el('button',{className:'x',textContent:'Ban Target'});
+  const bClearBtn=el('button',{textContent:'Clear Fail2Ban Auto-Jail'});
+  const bansTb=el('tbody');
+  const failTb=el('tbody');
+
+  const loadShield=async()=>{
+    bansTb.replaceChildren();
+    failTb.replaceChildren();
+    try{
+      const s=await api('/v1/admin/security/shield');
+      shStats.textContent=`Blocked requests: ${s.stats.total_blocked} | Active bans: ${s.stats.active_bans} | Fail2Ban threshold: ${s.config.max_failures} failures / ${s.config.findtime_s}s (jail ${s.config.bantime_s}s)`;
+      for(const b of (s.bans||[])){
+        const unBtn=el('button',{textContent:'Unban'});
+        unBtn.onclick=()=>api(`/v1/admin/security/bans/${encodeURIComponent(b.id)}`,send('DELETE',{})).then(()=>{note('Removed ban '+b.target);loadShield();}).catch(e=>err(e.message));
+        bansTb.append(el('tr',{},
+          el('td',{},el('code',{textContent:b.target})),
+          el('td',{textContent:b.kind.toUpperCase()}),
+          el('td',{textContent:b.reason}),
+          el('td',{textContent:b.created_by}),
+          el('td',{textContent:b.expires_at?new Date(b.expires_at*1000).toLocaleString():'Permanent'}),
+          el('td',{},unBtn)
+        ));
+      }
+      if(!(s.bans||[]).length){
+        bansTb.append(el('tr',{},el('td',{colSpan:6,textContent:'No active bans or jailed IPs.'})));
+      }
+      for(const f of (s.failed_auth_log||[]).slice(0,25)){
+        const qBan=el('button',{className:'x',textContent:'1-Click Ban IP'});
+        qBan.onclick=()=>api('/v1/admin/security/bans',send('POST',{target:f.ip,kind:'ip',reason:'Manual ban from failed auth log'})).then(()=>{note('Banned IP '+f.ip);loadShield();}).catch(e=>err(e.message));
+        failTb.append(el('tr',{},
+          el('td',{textContent:new Date(f.ts*1000).toLocaleTimeString()}),
+          el('td',{},el('code',{textContent:f.ip})),
+          el('td',{textContent:f.path}),
+          el('td',{textContent:f.detail+(f.auto_jailed?' [AUTO-JAILED]':'')}),
+          el('td',{},f.ip&&f.ip!=='unknown'?qBan:'')
+        ));
+      }
+      if(!(s.failed_auth_log||[]).length){
+        failTb.append(el('tr',{},el('td',{colSpan:5,textContent:'No recent failed authentication attempts.'})));
+      }
+    }catch(e){
+      shStats.textContent='Failed to load Security Shield: '+e.message;
+    }
+  };
+
+  bAddBtn.onclick=async()=>{
+    err();
+    const t=bTarget.value.trim();
+    if(!t)return err('Enter an IP, CIDR, or token key to ban.');
+    const dur=bDur.value?parseInt(bDur.value,10):null;
+    try{
+      await api('/v1/admin/security/bans',send('POST',{target:t,kind:bKind.value,reason:bReason.value,duration_s:dur}));
+      bTarget.value='';bReason.value='';bDur.value='';
+      note('Added security ban for '+t);
+      loadShield();
+    }catch(e){err(e.message);}
+  };
+
+  bClearBtn.onclick=async()=>{
+    err();
+    try{
+      const r=await api('/v1/admin/security/clear-jail',send('POST',{}));
+      note(`Cleared ${r.cleared} auto-jailed entries.`);
+      loadShield();
+    }catch(e){err(e.message);}
+  };
+
+  loadShield();
+  shCard.append(
+    shStats,
+    el('div',{className:'row'},bKind,bTarget,bReason,bDur,bAddBtn,bClearBtn),
+    el('h3',{textContent:'Active Bans & Threat Jail'}),
+    el('table',{},el('thead',{},el('tr',{},el('th',{textContent:'Target'}),el('th',{textContent:'Type'}),el('th',{textContent:'Reason'}),el('th',{textContent:'By'}),el('th',{textContent:'Expires'}),el('th',{textContent:''}))),bansTb),
+    el('h3',{textContent:'Live Failed Auth Log'}),
+    el('table',{},el('thead',{},el('tr',{},el('th',{textContent:'Time'}),el('th',{textContent:'IP'}),el('th',{textContent:'Route'}),el('th',{textContent:'Detail'}),el('th',{textContent:''}))),failTb)
+  );
+  box.append(shCard);
+
   // Gateway Audit Log
   const audCard=el('div',{className:'card'},el('h2',{textContent:'Gateway Audit Log'}));
   const atb=el('tbody');

@@ -62,7 +62,10 @@ impl Gateway {
              CREATE TABLE IF NOT EXISTS world_templates(
                world_id TEXT PRIMARY KEY, description TEXT NOT NULL DEFAULT '', set_by TEXT NOT NULL, set_at INTEGER NOT NULL) WITHOUT ROWID;
              CREATE TABLE IF NOT EXISTS world_host_allow(
-               world_id TEXT NOT NULL, player_uuid TEXT NOT NULL, PRIMARY KEY(world_id, player_uuid)) WITHOUT ROWID;",
+               world_id TEXT NOT NULL, player_uuid TEXT NOT NULL, PRIMARY KEY(world_id, player_uuid)) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS security_bans(
+               id TEXT PRIMARY KEY, target TEXT NOT NULL, kind TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '',
+               created_by TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER) WITHOUT ROWID;",
         )?;
         let _ = self.db.execute("ALTER TABLE world_reports ADD COLUMN evidence TEXT NOT NULL DEFAULT ''", []);
         let _ = self.db.execute("ALTER TABLE devices ADD COLUMN anchor_ram_mb INTEGER", []);
@@ -1111,6 +1114,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/admin/s3/status", get(get_s3_status))
         .route("/v1/admin/s3/sync", post(post_s3_sync))
         .route("/v1/admin/s3/test", post(post_s3_test))
+        .route("/v1/admin/security/shield", get(get_security_shield))
+        .route("/v1/admin/security/bans", post(post_security_ban))
+        .route("/v1/admin/security/bans/:id", axum::routing::delete(delete_security_ban))
+        .route("/v1/admin/security/clear-jail", post(post_security_clear_jail))
 }
 
 #[derive(Deserialize)]
@@ -1956,6 +1963,121 @@ async fn post_s3_test(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
         }
         Err(e) => Err(ApiErr::Domain(Error::Store(format!("S3 test failed: {e}")))),
     }
+}
+
+#[derive(Deserialize)]
+struct SecurityBanReq {
+    target: String,
+    kind: String,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    duration_s: Option<u64>,
+}
+
+async fn get_security_shield(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_admin(&s, &gw, &dev)?;
+
+    let bans = s.shield.active_bans();
+    let failed_log = s.shield.recent_failed_log(100);
+    let cfg = s.shield.config();
+
+    Ok(Json(json!({
+        "ok": true,
+        "config": cfg,
+        "stats": {
+            "total_blocked": s.shield.total_blocked(),
+            "active_bans": bans.len(),
+            "recent_failures": failed_log.len(),
+        },
+        "bans": bans,
+        "failed_auth_log": failed_log,
+    })))
+}
+
+async fn post_security_ban(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): Json<SecurityBanReq>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_admin(&s, &gw, &dev)?;
+
+    let actor = gw
+        .device_player(&dev)
+        .ok()
+        .flatten()
+        .map(|(_, name)| name)
+        .unwrap_or_else(|| dev.clone());
+
+    let ban = s
+        .shield
+        .add_ban(
+            &b.target,
+            &b.kind,
+            b.reason.as_deref().unwrap_or(""),
+            &actor,
+            b.duration_s,
+        )
+        .map_err(ApiErr::BadRequest)?;
+
+    let _ = gw.db.execute(
+        "INSERT OR REPLACE INTO security_bans(id, target, kind, reason, created_by, created_at, expires_at) VALUES(?,?,?,?,?,?,?)",
+        params![
+            ban.id,
+            ban.target,
+            ban.kind,
+            ban.reason,
+            ban.created_by,
+            ban.created_at as i64,
+            ban.expires_at.map(|v| v as i64),
+        ],
+    );
+
+    gw.audit(
+        &dev,
+        "security.ban",
+        "global",
+        &ban.target,
+        json!({ "id": ban.id, "kind": ban.kind, "reason": ban.reason, "expires_at": ban.expires_at }),
+    );
+
+    Ok(Json(json!({
+        "ok": true,
+        "ban": ban,
+    })))
+}
+
+async fn delete_security_ban(State(s): State<Arc<AppState>>, h: HeaderMap, Path(id): Path<String>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_admin(&s, &gw, &dev)?;
+
+    let removed_mem = s.shield.remove_ban(&id);
+    let removed_db = gw
+        .db
+        .execute("DELETE FROM security_bans WHERE id=?", params![id])
+        .unwrap_or(0);
+
+    if !removed_mem && removed_db == 0 {
+        return Err(ApiErr::NotFound("NO_SUCH_BAN"));
+    }
+
+    gw.audit(&dev, "security.unban", "global", &id, json!({}));
+    Ok(Json(json!({ "ok": true, "deleted": id })))
+}
+
+async fn post_security_clear_jail(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_admin(&s, &gw, &dev)?;
+
+    let cleared = s.shield.clear_jail();
+    let _ = gw
+        .db
+        .execute("DELETE FROM security_bans WHERE created_by='fail2ban'", []);
+
+    gw.audit(&dev, "security.clear_jail", "global", "", json!({ "cleared": cleared }));
+    Ok(Json(json!({ "ok": true, "cleared": cleared })))
 }
 
 #[cfg(test)]

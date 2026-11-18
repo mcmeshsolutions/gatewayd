@@ -32,6 +32,7 @@ pub mod schedule;
 pub mod sanity;
 pub mod server;
 pub mod shard;
+pub mod shield;
 pub mod skin;
 pub mod s3;
 pub mod sso;

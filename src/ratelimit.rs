@@ -160,19 +160,44 @@ fn refuse(retry: u64) -> Response {
 /// Outermost layer: runs before auth, body parsing and every handler, so no route can opt out.
 pub async fn layer(State(s): State<Arc<AppState>>, req: Request, next: Next) -> Response {
     let lim = &s.limiter;
-    if !lim.enabled {
-        return next.run(req).await;
-    }
     let ip = client_ip(&req, lim.trust_proxy);
-    if let Err(retry) = lim.allow(Class::Ip, &ip) {
-        return refuse(retry);
+    let tkey = token_key(&req, &ip);
+    let raw_bearer = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.strip_prefix("Bearer ").unwrap_or(v).trim().to_string());
+
+    if let Some(ban) = s.shield.check_request(&ip, Some(&tkey), raw_bearer.as_deref()) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "SHIELD_BANNED",
+                "reason": ban.reason,
+                "ban_id": ban.id,
+                "expires_at": ban.expires_at,
+            })),
+        )
+            .into_response();
     }
-    let class = classify(req.method(), req.uri().path());
-    let key = if class == Class::Auth { ip } else { token_key(&req, &ip) };
-    if let Err(retry) = lim.allow(class, &key) {
-        return refuse(retry);
+
+    if lim.enabled {
+        if let Err(retry) = lim.allow(Class::Ip, &ip) {
+            return refuse(retry);
+        }
+        let class = classify(req.method(), req.uri().path());
+        let key = if class == Class::Auth { ip.clone() } else { tkey };
+        if let Err(retry) = lim.allow(class, &key) {
+            return refuse(retry);
+        }
     }
-    next.run(req).await
+
+    let path = req.uri().path().to_string();
+    let resp = next.run(req).await;
+    if lim.enabled && resp.status() == StatusCode::UNAUTHORIZED {
+        s.shield.record_failed_auth(&ip, &path, "HTTP 401 UNAUTHORIZED");
+    }
+    resp
 }
 
 #[cfg(test)]

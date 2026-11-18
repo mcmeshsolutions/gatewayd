@@ -37,6 +37,7 @@ pub struct AppState {
     pub(crate) limiter: crate::ratelimit::Limiter,
     pub limbo: Arc<crate::hotreload::VirtualLimbo>,
     pub s3: Arc<crate::s3::S3Replicator>,
+    pub shield: Arc<crate::shield::SecurityShield>,
 }
 
 impl AppState {
@@ -50,6 +51,8 @@ impl AppState {
         }
         let hooks = crate::ops::Hooks::new(&auth.webhooks, auth.webhook_secret.clone());
         let s3 = Arc::new(crate::s3::S3Replicator::from_env());
+        let shield = Arc::new(crate::shield::SecurityShield::from_env());
+        shield.load_from_db(gw.db());
         Arc::new(AppState {
             gw: Mutex::new(gw),
             start: Instant::now(),
@@ -66,6 +69,7 @@ impl AppState {
             limiter: crate::ratelimit::Limiter::from_env(),
             limbo: crate::hotreload::VirtualLimbo::new(),
             s3,
+            shield,
         })
     }
     /// Seconds since this world was last asked for by someone who could not get in, or None if never.
