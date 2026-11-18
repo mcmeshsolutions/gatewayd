@@ -1105,6 +1105,9 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/admin/worlds/:id/force-unlock", post(force_unlock_world))
         .route("/v1/admin/worlds/:id/force-switch-host", post(force_switch_host))
         .route("/v1/worlds/:id/policy", get(get_policy).put(put_policy))
+        .route("/v1/admin/hot-reload", post(post_hot_reload))
+        .route("/v1/admin/hot-reload/status", get(get_hot_reload_status))
+        .route("/v1/admin/hot-reload/drain", post(post_hot_reload_drain))
 }
 
 #[derive(Deserialize)]
@@ -1820,6 +1823,57 @@ async fn resolve_report(State(s): State<Arc<AppState>>, h: HeaderMap, Path((worl
     }
     gw.audit(&dev, "world.report.resolve", &world, &id.to_string(), json!({}));
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct HotReloadReq {
+    #[serde(default)]
+    grace_period_s: Option<u64>,
+    #[serde(default)]
+    engage_limbo: Option<bool>,
+}
+
+async fn post_hot_reload(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): Json<HotReloadReq>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_admin(&s, &gw, &dev)?;
+    let grace = b.grace_period_s.unwrap_or(30).clamp(5, 300);
+    let engage = b.engage_limbo.unwrap_or(true);
+    if engage {
+        s.limbo.engage(grace);
+    }
+    gw.audit(&dev, "gateway.hot_reload", "global", "", json!({ "grace_period_s": grace, "engage_limbo": engage }));
+    let stats = s.limbo.stats();
+    Ok(Json(json!({
+        "ok": true,
+        "status": "RELOAD_READY",
+        "grace_period_s": grace,
+        "limbo_engaged": stats.active,
+        "stats": stats,
+    })))
+}
+
+async fn get_hot_reload_status(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_admin(&s, &gw, &dev)?;
+    let stats = s.limbo.stats();
+    Ok(Json(json!({
+        "ok": true,
+        "uptime_s": s.uptime_s(),
+        "stats": stats,
+        "reuseport_supported": cfg!(unix),
+    })))
+}
+
+async fn post_hot_reload_drain(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_admin(&s, &gw, &dev)?;
+    s.limbo.set_drain(true);
+    gw.audit(&dev, "gateway.drain", "global", "", json!({}));
+    let stats = s.limbo.stats();
+    Ok(Json(json!({ "ok": true, "draining": true, "stats": stats })))
 }
 
 #[cfg(test)]

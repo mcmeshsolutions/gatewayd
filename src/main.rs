@@ -110,6 +110,28 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        ["reload", rest @ ..] => {
+            let addr = std::env::var("MCMESH_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
+            let timeout: u64 = rest.first().and_then(|v| v.parse().ok()).unwrap_or(30);
+            println!("Requesting hot reload with {timeout}s Virtual Limbo grace period via {addr}...");
+            let client = ureq::builder().timeout(Duration::from_secs(5)).build();
+            let url = format!("http://{addr}/v1/admin/hot-reload");
+            let tok = std::env::var("MCMESH_ADMIN_TOKEN").unwrap_or_default();
+            let mut req = client.post(&url);
+            if !tok.is_empty() {
+                req = req.set("authorization", &format!("Bearer {tok}"));
+            }
+            match req.send_json(serde_json::json!({ "grace_period_s": timeout, "engage_limbo": true })) {
+                Ok(resp) => {
+                    let v: serde_json::Value = resp.into_json().unwrap_or_default();
+                    println!("Hot reload triggered successfully: {}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                }
+                Err(e) => {
+                    eprintln!("Hot reload request failed: {e}. Note: Set MCMESH_ADMIN_TOKEN if required.");
+                    std::process::exit(1);
+                }
+            }
+        }
         ["pack", "init", dir, rest @ ..] => {
             let id = rest.first().copied();
             let res = gatewayd::pack::init(std::path::Path::new(dir), id, None).expect("pack init");
@@ -244,12 +266,23 @@ async fn main() {
             };
             let state = AppState::with_auth(gw, auth);
             let default_world = std::env::var("MCMESH_WORLD").ok();
+
+            let bind_listener = |addr_str: &str| -> TcpListener {
+                match addr_str.parse::<std::net::SocketAddr>() {
+                    Ok(sa) => gatewayd::hotreload::bind_reuseport(sa).unwrap_or_else(|e| {
+                        eprintln!("reuseport bind failed on {addr_str}: {e}, falling back to standard bind");
+                        std::net::TcpListener::bind(addr_str).expect("bind").try_into().expect("tokio listener")
+                    }),
+                    Err(_) => std::net::TcpListener::bind(addr_str).expect("bind").try_into().expect("tokio listener"),
+                }
+            };
+
             if default_world.is_some() || std::env::var("MCMESH_RELAY").is_ok_and(|v| v == "all") {
                 let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.into());
                 let udp = Arc::new(UdpSocket::bind(env("MCMESH_VOICE_ADDR", "0.0.0.0:24454")).await.expect("bind voice"));
                 let relay = Relay::new(state.clone(), default_world.as_deref(), Some(udp.clone()));
-                let agents = TcpListener::bind(env("MCMESH_RELAY_ADDR", "127.0.0.1:9000")).await.expect("bind relay");
-                let guests = TcpListener::bind(env("MCMESH_PUBLIC_ADDR", "0.0.0.0:25565")).await.expect("bind public");
+                let agents = bind_listener(&env("MCMESH_RELAY_ADDR", "127.0.0.1:9000"));
+                let guests = bind_listener(&env("MCMESH_PUBLIC_ADDR", "0.0.0.0:25565"));
                 tokio::spawn(serve_agents(relay.clone(), agents));
                 tokio::spawn(serve_guests(relay.clone(), guests));
                 // MCMESH_CHANNELS="udp:24455,tcp:25580": public ports of extra channels, numbered in order from 1.
@@ -260,7 +293,7 @@ async fn main() {
                     let chan = (i + 1) as u8;
                     match proto {
                         "udp" => { tokio::spawn(gatewayd::relay::serve_channel_udp(relay.clone(), chan, Arc::new(UdpSocket::bind(&bind).await.expect("bind channel")))); }
-                        "tcp" => { tokio::spawn(gatewayd::relay::serve_channel_tcp(relay.clone(), chan, TcpListener::bind(&bind).await.expect("bind channel"))); }
+                        "tcp" => { tokio::spawn(gatewayd::relay::serve_channel_tcp(relay.clone(), chan, bind_listener(&bind))); }
                         _ => panic!("unknown channel protocol {proto}"),
                     }
                 }
@@ -283,12 +316,29 @@ async fn main() {
             }
             {
                 let blob_addr = std::env::var("MCMESH_BLOBSTREAM_ADDR").unwrap_or_else(|_| "0.0.0.0:9100".into());
-                let blob_listener = TcpListener::bind(&blob_addr).await.expect("bind blobstream");
+                let blob_listener = bind_listener(&blob_addr);
                 eprintln!("blob stream listening on {blob_addr}");
                 tokio::spawn(gatewayd::blobstream::serve(state.clone(), blob_listener));
             }
-            let l = tokio::net::TcpListener::bind(&addr).await.expect("bind");
-            eprintln!("gatewayd listening on {addr}");
+
+            // Listen for SIGUSR1 for zero-downtime hot reload on Unix
+            let sig_limbo = state.limbo.clone();
+            tokio::spawn(async move {
+                #[cfg(unix)]
+                {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    if let Ok(mut sig) = signal(SignalKind::user_defined1()) {
+                        loop {
+                            sig.recv().await;
+                            eprintln!("gatewayd: SIGUSR1 received, engaging Virtual Limbo for 30s for rolling hot reload");
+                            sig_limbo.engage(30);
+                        }
+                    }
+                }
+            });
+
+            let l = bind_listener(&addr);
+            eprintln!("gatewayd listening on {addr} (SO_REUSEPORT enabled)");
             axum::serve(l, router(state).into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; })
                 .await

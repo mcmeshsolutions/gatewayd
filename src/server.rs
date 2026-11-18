@@ -35,6 +35,7 @@ pub struct AppState {
     /// Relayed bytes by world since the last tick: (to host, to guests).
     relay_bytes: Mutex<std::collections::HashMap<String, (u64, u64)>>,
     pub(crate) limiter: crate::ratelimit::Limiter,
+    pub limbo: Arc<crate::hotreload::VirtualLimbo>,
 }
 
 impl AppState {
@@ -47,7 +48,22 @@ impl AppState {
             eprintln!("ops init failed: {e:?}");
         }
         let hooks = crate::ops::Hooks::new(&auth.webhooks, auth.webhook_secret.clone());
-        Arc::new(AppState { gw: Mutex::new(gw), start: Instant::now(), auth, challenges: Mutex::new(Default::default()), tickets: Mutex::new(Default::default()), panel_codes: Mutex::new(Default::default()), link_codes: Mutex::new(Default::default()), live_worlds: Mutex::new(Default::default()), sync: Mutex::new(Default::default()), wanted: Mutex::new(Default::default()), hooks, relay_bytes: Mutex::new(Default::default()), limiter: crate::ratelimit::Limiter::from_env() })
+        Arc::new(AppState {
+            gw: Mutex::new(gw),
+            start: Instant::now(),
+            auth,
+            challenges: Mutex::new(Default::default()),
+            tickets: Mutex::new(Default::default()),
+            panel_codes: Mutex::new(Default::default()),
+            link_codes: Mutex::new(Default::default()),
+            live_worlds: Mutex::new(Default::default()),
+            sync: Mutex::new(Default::default()),
+            wanted: Mutex::new(Default::default()),
+            hooks,
+            relay_bytes: Mutex::new(Default::default()),
+            limiter: crate::ratelimit::Limiter::from_env(),
+            limbo: crate::hotreload::VirtualLimbo::new(),
+        })
     }
     /// Seconds since this world was last asked for by someone who could not get in, or None if never.
     fn wanted_age_s(&self, world: &str) -> Option<u64> {
