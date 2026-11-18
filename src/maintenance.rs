@@ -56,7 +56,7 @@ fn verify_tree(cas: &Cas, root: Hash) -> (u64, Vec<String>, Vec<String>) {
     (reach.len() as u64, missing, corrupt)
 }
 
-fn blob_files(cas: &Path) -> std::io::Result<Vec<PathBuf>> {
+pub fn blob_files(cas: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for a in fs::read_dir(cas)? {
         let a = a?.path();

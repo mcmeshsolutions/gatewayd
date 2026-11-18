@@ -9,7 +9,7 @@ use tokio::net::{TcpListener, UdpSocket};
 fn usage() -> ! {
     eprintln!(
         "usage: gatewayd serve\n       gatewayd create-world <id> <name> <mc_version> <loader>\n       \
-         gatewayd add-member <world> <mc_uuid> <name> <device> <ADMIN|HOST_ELIGIBLE|CLIENT_ONLY> <token>\n         gatewayd grant <world> <name> <ADMIN|HOST_ELIGIBLE|CLIENT_ONLY>\n         gatewayd drop-token <token>\n         gatewayd revisions <world>\n         gatewayd init\n         gatewayd leaves <revision>\n         gatewayd diff <revision> <revision> [<chunk lines, default 20>]\n         gatewayd recover <world> [--apply]\n         gatewayd status\n         gatewayd scrub\n         gatewayd backup <dir>\n         gatewayd set-pack <world> <pack_id>\n         gatewayd set-admin <name> <admin|user>\n         gatewayd set-limit <user|world> <id|*> <storage_bytes> <world_count> <keep_revisions> <keep_days> [<max_guests> <relay_bytes_month>]   (- = unlimited, replaces the row)\n         gatewayd set-anchor <device> <on|off>\n         gatewayd set-motd [<text>]   (empty clears it)\n         gatewayd set-superadmin <email> <on|off>\n         gatewayd revert <world> <revision>\n         gatewayd doctor\n         gatewayd pack init <dir> [<pack_id>]\n         gatewayd pack sign <dir> [<pack_id>] [<version>] [<out_dir>]\n         gatewayd pack check <dir_or_manifest>\n\
+         gatewayd add-member <world> <mc_uuid> <name> <device> <ADMIN|HOST_ELIGIBLE|CLIENT_ONLY> <token>\n         gatewayd grant <world> <name> <ADMIN|HOST_ELIGIBLE|CLIENT_ONLY>\n         gatewayd drop-token <token>\n         gatewayd revisions <world>\n         gatewayd init\n         gatewayd leaves <revision>\n         gatewayd diff <revision> <revision> [<chunk lines, default 20>]\n         gatewayd recover <world> [--apply]\n         gatewayd status\n         gatewayd scrub\n         gatewayd backup <dir>\n         gatewayd s3 sync\n         gatewayd s3 status\n         gatewayd s3 test\n         gatewayd s3 restore <dir> [<snapshot>]\n         gatewayd set-pack <world> <pack_id>\n         gatewayd set-admin <name> <admin|user>\n         gatewayd set-limit <user|world> <id|*> <storage_bytes> <world_count> <keep_revisions> <keep_days> [<max_guests> <relay_bytes_month>]   (- = unlimited, replaces the row)\n         gatewayd set-anchor <device> <on|off>\n         gatewayd set-motd [<text>]   (empty clears it)\n         gatewayd set-superadmin <email> <on|off>\n         gatewayd revert <world> <revision>\n         gatewayd doctor\n         gatewayd pack init <dir> [<pack_id>]\n         gatewayd pack sign <dir> [<pack_id>] [<version>] [<out_dir>]\n         gatewayd pack check <dir_or_manifest>\n\
          env: MCMESH_DB (default mcmesh.db), MCMESH_CAS (default ./cas),\n         relay (needs MCMESH_WORLD, or MCMESH_RELAY=all to serve every world; MCMESH_WORLD then only picks the UDP and ticketless default): MCMESH_RELAY_ADDR (127.0.0.1:9000), MCMESH_PUBLIC_ADDR (0.0.0.0:25565), MCMESH_VOICE_ADDR (0.0.0.0:24454)\n          MCMESH_ADDR (default 127.0.0.1:8080)\n          MCMESH_CREATE=open lets any logged-in player create worlds\n          MCMESH_ADVERTISE=host:port tells clients where guests connect (with MCMESH_WORLD)\n          MCMESH_METRICS_TOKEN=secret enables GET /metrics (Prometheus) behind that bearer token\n          MCMESH_ADMINS=uuid,uuid are gateway admins on top of `set-admin`; MCMESH_BAN_GRACE_S (120) is how long a banned host may wind down\n          MCMESH_WEBHOOKS=url,url posts gateway events as JSON; MCMESH_WEBHOOK_SECRET signs them\n          MCMESH_MIN_CLIENT=N refuses mods below client protocol level N with 426 CLIENT_TOO_OLD (current mods send level 1, older ones send nothing); MCMESH_REQUIRE_SIGNED=1 refuses commits without a valid host signature (403 SIGNATURE_REQUIRED); MCMESH_STRICT_DATA=1 makes `serve` refuse to start when the database or cas directory is missing (create them with `gatewayd init`); MCMESH_BACKUP_DIR=dir turns on a scheduled scrub plus incremental backup every MCMESH_MAINT_INTERVAL_S (86400, minimum 60), and MCMESH_AUTO_RECOVER=1 lets it move a damaged world head to the newest intact revision; MCMESH_RATE=off disables rate limits; MCMESH_RATE_SCALE=2 doubles every limit; MCMESH_RELAY_RATE_SCALE=10 loosens only the relay limits; MCMESH_PROXY_PROTOCOL=1 expects a PROXY protocol v1 or v2 header on every relay TCP connection (only when the listeners are reachable through the forwarder alone); MCMESH_TRUST_PROXY=1 reads the client address from the last X-Forwarded-For entry (only behind a proxy you control)"
     );
     std::process::exit(2)
@@ -60,6 +60,77 @@ async fn main() {
             let cas = std::env::var("MCMESH_CAS").unwrap_or_else(|_| "cas".into());
             let (copied, skipped) = gw.backup(std::path::Path::new(&cas), std::path::Path::new(dest)).expect("backup");
             println!("backup ok: {copied} blobs copied, {skipped} already present");
+        }
+        ["s3", "sync"] => {
+            let s3 = gatewayd::s3::S3Replicator::from_env();
+            if !s3.is_enabled() {
+                eprintln!("s3 replication not enabled (set MCMESH_S3_BUCKET)");
+                std::process::exit(1);
+            }
+            let cas = std::env::var("MCMESH_CAS").unwrap_or_else(|_| "cas".into());
+            let (db_bytes, db_hash) = gatewayd::s3::S3Replicator::take_snapshot(gw.db()).expect("snapshot");
+            match s3.sync_snapshot_and_blobs(&db_bytes, &db_hash, std::path::Path::new(&cas)) {
+                Ok(r) => {
+                    println!("s3 sync ok: {} blobs uploaded ({} bytes), {} skipped, snapshot {}", r.uploaded_blobs, r.uploaded_bytes, r.skipped_blobs, r.snapshot);
+                }
+                Err(e) => {
+                    eprintln!("s3 sync failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        ["s3", "status"] => {
+            let s3 = gatewayd::s3::S3Replicator::from_env();
+            let st = s3.status();
+            println!("{}", serde_json::to_string_pretty(&st).unwrap());
+        }
+        ["s3", "test"] => {
+            let s3 = gatewayd::s3::S3Replicator::from_env();
+            if !s3.is_enabled() {
+                eprintln!("s3 replication not enabled (set MCMESH_S3_BUCKET)");
+                std::process::exit(1);
+            }
+            match s3.test_connection() {
+                Ok(ms) => {
+                    println!("s3 test ok: bucket {} reachable in {ms}ms", s3.config().map(|c| c.bucket).unwrap_or_default());
+                }
+                Err(e) => {
+                    eprintln!("s3 test failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        ["s3", "restore", dest] => {
+            let s3 = gatewayd::s3::S3Replicator::from_env();
+            if !s3.is_enabled() {
+                eprintln!("s3 replication not enabled (set MCMESH_S3_BUCKET)");
+                std::process::exit(1);
+            }
+            match s3.restore_fresh(std::path::Path::new(dest), None) {
+                Ok(r) => {
+                    println!("s3 restore ok: restored db snapshot {} and {} blobs ({} bytes) to {dest}", r.db_snapshot, r.restored_blobs, r.restored_bytes);
+                }
+                Err(e) => {
+                    eprintln!("s3 restore failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        ["s3", "restore", dest, snap] => {
+            let s3 = gatewayd::s3::S3Replicator::from_env();
+            if !s3.is_enabled() {
+                eprintln!("s3 replication not enabled (set MCMESH_S3_BUCKET)");
+                std::process::exit(1);
+            }
+            match s3.restore_fresh(std::path::Path::new(dest), Some(snap)) {
+                Ok(r) => {
+                    println!("s3 restore ok: restored db snapshot {} and {} blobs ({} bytes) to {dest}", r.db_snapshot, r.restored_blobs, r.restored_bytes);
+                }
+                Err(e) => {
+                    eprintln!("s3 restore failed: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
         ["set-pack", world, pack] => gw.set_pack(world, pack).expect("set pack"),
         ["set-admin", name, role] => {
@@ -313,6 +384,45 @@ async fn main() {
                 let cas_dir = std::env::var("MCMESH_CAS").unwrap_or_else(|_| "cas".into());
                 eprintln!("scheduled scrub and backup to {backup_dir} every {secs} s");
                 tokio::spawn(gatewayd::schedule::serve(db.clone(), cas_dir, backup_dir, std::env::var("MCMESH_AUTO_RECOVER").is_ok_and(|v| v == "1"), Duration::from_secs(600), Duration::from_secs(secs)));
+            }
+            if state.s3.is_enabled() {
+                let s3_state = state.clone();
+                let s3_cas = std::path::PathBuf::from(std::env::var("MCMESH_CAS").unwrap_or_else(|_| "cas".into()));
+                let interval = state.s3.config().map(|c| c.sync_interval_s).unwrap_or(300);
+                eprintln!("scheduled background S3 disaster replication every {interval} s");
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    loop {
+                        let snap = {
+                            let gw = s3_state.gw();
+                            gatewayd::s3::S3Replicator::take_snapshot(gw.db())
+                        };
+                        match snap {
+                            Ok((bytes, hash)) => {
+                                let s3 = s3_state.s3.clone();
+                                let cas_p = s3_cas.clone();
+                                let res = tokio::task::spawn_blocking(move || {
+                                    s3.sync_snapshot_and_blobs(&bytes, &hash, &cas_p)
+                                }).await;
+                                match res {
+                                    Ok(Ok(report)) => {
+                                        eprintln!("s3 sync ok: {} uploaded blobs ({} bytes), snapshot {}", report.uploaded_blobs, report.uploaded_bytes, report.snapshot);
+                                    }
+                                    Ok(Err(e)) => {
+                                        eprintln!("s3 sync error: {e}");
+                                    }
+                                    Err(e) => {
+                                        eprintln!("s3 sync task panicked: {e}");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("s3 snapshot error: {e}");
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_secs(interval)).await;
+                    }
+                });
             }
             {
                 let blob_addr = std::env::var("MCMESH_BLOBSTREAM_ADDR").unwrap_or_else(|_| "0.0.0.0:9100".into());

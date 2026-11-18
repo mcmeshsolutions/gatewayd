@@ -1108,6 +1108,9 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/admin/hot-reload", post(post_hot_reload))
         .route("/v1/admin/hot-reload/status", get(get_hot_reload_status))
         .route("/v1/admin/hot-reload/drain", post(post_hot_reload_drain))
+        .route("/v1/admin/s3/status", get(get_s3_status))
+        .route("/v1/admin/s3/sync", post(post_s3_sync))
+        .route("/v1/admin/s3/test", post(post_s3_test))
 }
 
 #[derive(Deserialize)]
@@ -1874,6 +1877,85 @@ async fn post_hot_reload_drain(State(s): State<Arc<AppState>>, h: HeaderMap) -> 
     gw.audit(&dev, "gateway.drain", "global", "", json!({}));
     let stats = s.limbo.stats();
     Ok(Json(json!({ "ok": true, "draining": true, "stats": stats })))
+}
+
+async fn get_s3_status(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_admin(&s, &gw, &dev)?;
+    let status = s.s3.status();
+    Ok(Json(json!({ "ok": true, "status": status })))
+}
+
+async fn post_s3_sync(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
+    let dev = {
+        let gw = s.gw();
+        let dev = auth(&gw, &h)?;
+        require_admin(&s, &gw, &dev)?;
+        dev
+    };
+    if !s.s3.is_enabled() {
+        return Err(ApiErr::BadRequest("S3_NOT_CONFIGURED"));
+    }
+
+    let (db_bytes, db_hash, cas_dir): (Vec<u8>, String, std::path::PathBuf) = {
+        let gw = s.gw();
+        let (bytes, hash) = crate::s3::S3Replicator::take_snapshot(&gw.db)
+            .map_err(|e| ApiErr::Domain(Error::Store(format!("snapshot failed: {e}"))))?;
+        let cas_root = gw.cas.root().to_path_buf();
+        (bytes, hash, cas_root)
+    };
+
+    let s3 = s.s3.clone();
+    let dev_clone = dev.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        s3.sync_snapshot_and_blobs(&db_bytes, &db_hash, &cas_dir)
+    }).await.map_err(|e| ApiErr::Domain(Error::Store(format!("task join error: {e}"))))?;
+
+    match res {
+        Ok(report) => {
+            let gw = s.gw();
+            gw.audit(&dev_clone, "s3.sync", "global", "", json!({
+                "uploaded_blobs": report.uploaded_blobs,
+                "uploaded_bytes": report.uploaded_bytes,
+                "snapshot": report.snapshot
+            }));
+            Ok(Json(json!({
+                "ok": true,
+                "status": "SYNC_COMPLETE",
+                "report": report
+            })))
+        }
+        Err(e) => Err(ApiErr::Domain(Error::Store(format!("s3 sync failed: {e}")))),
+    }
+}
+
+async fn post_s3_test(State(s): State<Arc<AppState>>, h: HeaderMap) -> R {
+    {
+        let gw = s.gw();
+        let dev = auth(&gw, &h)?;
+        require_admin(&s, &gw, &dev)?;
+    }
+    if !s.s3.is_enabled() {
+        return Err(ApiErr::BadRequest("S3_NOT_CONFIGURED"));
+    }
+    let s3 = s.s3.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        s3.test_connection()
+    }).await.map_err(|e| ApiErr::Domain(Error::Store(format!("task join error: {e}"))))?;
+
+    match res {
+        Ok(latency_ms) => {
+            let bucket = s.s3.config().map(|c| c.bucket).unwrap_or_default();
+            Ok(Json(json!({
+                "ok": true,
+                "latency_ms": latency_ms,
+                "bucket": bucket,
+                "message": "S3 connection and read/write verified"
+            })))
+        }
+        Err(e) => Err(ApiErr::Domain(Error::Store(format!("S3 test failed: {e}")))),
+    }
 }
 
 #[cfg(test)]

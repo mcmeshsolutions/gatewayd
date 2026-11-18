@@ -36,6 +36,7 @@ pub struct AppState {
     relay_bytes: Mutex<std::collections::HashMap<String, (u64, u64)>>,
     pub(crate) limiter: crate::ratelimit::Limiter,
     pub limbo: Arc<crate::hotreload::VirtualLimbo>,
+    pub s3: Arc<crate::s3::S3Replicator>,
 }
 
 impl AppState {
@@ -48,6 +49,7 @@ impl AppState {
             eprintln!("ops init failed: {e:?}");
         }
         let hooks = crate::ops::Hooks::new(&auth.webhooks, auth.webhook_secret.clone());
+        let s3 = Arc::new(crate::s3::S3Replicator::from_env());
         Arc::new(AppState {
             gw: Mutex::new(gw),
             start: Instant::now(),
@@ -63,6 +65,7 @@ impl AppState {
             relay_bytes: Mutex::new(Default::default()),
             limiter: crate::ratelimit::Limiter::from_env(),
             limbo: crate::hotreload::VirtualLimbo::new(),
+            s3,
         })
     }
     /// Seconds since this world was last asked for by someone who could not get in, or None if never.
@@ -95,7 +98,7 @@ impl AppState {
     pub(crate) fn now(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
     }
-    pub(crate) fn gw(&self) -> MutexGuard<'_, Gateway> {
+    pub fn gw(&self) -> MutexGuard<'_, Gateway> {
         self.gw.lock().unwrap_or_else(|e| e.into_inner())
     }
     /// World name when the token's device holds this live lease epoch.

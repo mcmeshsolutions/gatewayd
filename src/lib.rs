@@ -33,6 +33,7 @@ pub mod sanity;
 pub mod server;
 pub mod shard;
 pub mod skin;
+pub mod s3;
 pub mod sso;
 pub mod timeline;
 pub mod tunnel;
