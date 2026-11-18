@@ -136,6 +136,7 @@ fn exempt_from_client_gate(path: &str, h: &HeaderMap) -> bool {
     !path.starts_with("/v1/")
         || path == "/v1/status"
         || path == "/v1/motd"
+        || path == "/v1/proxy/test"
         || path.starts_with("/v1/admin/")
         || path.starts_with("/v1/panel/")
         || path.starts_with("/v1/sso/")

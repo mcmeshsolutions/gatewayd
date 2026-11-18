@@ -805,6 +805,116 @@ async fn quests_viewer(Path(_id): Path<String>) -> Response {
     Html(include_str!("../web/quests.html")).into_response()
 }
 
+#[derive(serde::Serialize)]
+pub struct ProxyTestResponse {
+    pub ok: bool,
+    pub client_ip: String,
+    pub proto: String,
+    pub host: String,
+    pub proxy_type: String,
+    pub websocket_ready: bool,
+    pub warnings: Vec<String>,
+    pub headers_detected: std::collections::HashMap<String, String>,
+}
+
+async fn proxy_test(h: HeaderMap) -> Json<ProxyTestResponse> {
+    use std::collections::HashMap;
+    let mut detected = HashMap::new();
+    let interesting = [
+        "x-forwarded-for",
+        "x-forwarded-proto",
+        "x-forwarded-host",
+        "x-forwarded-port",
+        "x-forwarded-server",
+        "x-real-ip",
+        "cf-connecting-ip",
+        "cf-ray",
+        "cf-visitor",
+        "true-client-ip",
+        "forwarded",
+        "host",
+        "upgrade",
+        "connection",
+    ];
+    for name in &interesting {
+        if let Some(val) = h.get(*name).and_then(|v| v.to_str().ok()) {
+            detected.insert(name.to_string(), val.to_string());
+        }
+    }
+
+    let client_ip = if let Some(cf_ip) = detected.get("cf-connecting-ip") {
+        cf_ip.clone()
+    } else if let Some(t_ip) = detected.get("true-client-ip") {
+        t_ip.clone()
+    } else if let Some(xff) = detected.get("x-forwarded-for") {
+        xff.split(',').next().unwrap_or("").trim().to_string()
+    } else if let Some(real_ip) = detected.get("x-real-ip") {
+        real_ip.clone()
+    } else {
+        "direct".to_string()
+    };
+
+    let proto = if let Some(p) = detected.get("x-forwarded-proto") {
+        p.to_ascii_lowercase()
+    } else if let Some(vis) = detected.get("cf-visitor") {
+        if vis.contains("\"scheme\":\"https\"") {
+            "https".to_string()
+        } else {
+            "http".to_string()
+        }
+    } else if h.get("x-forwarded-ssl").and_then(|v| v.to_str().ok()).is_some_and(|v| v.eq_ignore_ascii_case("on")) {
+        "https".to_string()
+    } else {
+        "http".to_string()
+    };
+
+    let host = detected.get("host").cloned().unwrap_or_default();
+
+    let proxy_type = if detected.contains_key("cf-ray") || detected.contains_key("cf-connecting-ip") {
+        "cloudflare"
+    } else if detected.contains_key("x-forwarded-server") || h.contains_key("x-traefik-router") {
+        "traefik"
+    } else if h.contains_key("x-caddy-upstream") || (detected.contains_key("x-forwarded-proto") && !detected.contains_key("x-real-ip")) {
+        "caddy"
+    } else if detected.contains_key("x-real-ip") {
+        "nginx"
+    } else if detected.contains_key("x-forwarded-for") {
+        "generic_proxy"
+    } else {
+        "direct"
+    }.to_string();
+
+    let ws_upgrade = detected.get("upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket"));
+    let ws_conn = detected.get("connection").is_some_and(|c| c.to_ascii_lowercase().contains("upgrade"));
+    let websocket_ready = ws_upgrade && ws_conn;
+
+    let mut warnings = Vec::new();
+    if proto != "https" && client_ip != "direct" && client_ip != "127.0.0.1" && client_ip != "::1" {
+        warnings.push("Traffic is using plaintext HTTP or missing X-Forwarded-Proto header. HTTPS is strongly recommended for production.".to_string());
+    }
+    if !detected.contains_key("x-forwarded-for") && !detected.contains_key("cf-connecting-ip") && !detected.contains_key("x-real-ip") {
+        warnings.push("No client IP forwarding headers detected (X-Forwarded-For, X-Real-IP, or CF-Connecting-IP). Gateway will see proxy's local address instead of real player IPs.".to_string());
+    }
+    if host.is_empty() || host.starts_with("localhost") || host.starts_with("127.0.0.1") {
+        if !detected.contains_key("x-forwarded-host") && proxy_type != "direct" {
+            warnings.push("Host header appears to be localhost; consider passing Host or X-Forwarded-Host from the reverse proxy.".to_string());
+        }
+    }
+
+    let ok = warnings.is_empty();
+
+    Json(ProxyTestResponse {
+        ok,
+        client_ip,
+        proto,
+        host,
+        proxy_type,
+        websocket_ready,
+        warnings,
+        headers_detected: detected,
+    })
+}
+
 async fn doctor_json(State(s): State<Arc<AppState>>) -> Json<crate::doctor::DoctorReport> {
     let gw = s.gw();
     Json(crate::doctor::run_doctor(&gw))
@@ -815,6 +925,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/status", get(status_page))
         .route("/v1/status", get(status_json))
         .route("/v1/doctor", get(doctor_json))
+        .route("/v1/proxy/test", get(proxy_test))
         .route("/.well-known/mcmesh-gateway.json", get(well_known))
         .route("/metrics", get(metrics))
         .route("/invite/:code", get(invite_page))
