@@ -949,6 +949,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(crate::crash::routes())
         .merge(crate::worldgen::routes())
         .merge(crate::shard::routes())
+        .merge(crate::skin::routes())
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::admin::gate))
         .layer(DefaultBodyLimit::max(MAX_JSON))
         .layer(axum::middleware::from_fn_with_state(state.clone(), client_gate))

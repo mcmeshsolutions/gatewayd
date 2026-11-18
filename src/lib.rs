@@ -25,6 +25,7 @@ pub mod schedule;
 pub mod sanity;
 pub mod server;
 pub mod shard;
+pub mod skin;
 pub mod sso;
 pub mod tunnel;
 pub mod wal;

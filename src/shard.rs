@@ -535,6 +535,7 @@ mod tests {
     }
 
     /// A WAL writer that keeps the chain state, for either kind of lease.
+    #[allow(dead_code)]
     struct Wal {
         lease: String,
         epoch: i64,

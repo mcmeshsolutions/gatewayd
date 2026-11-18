@@ -77,3 +77,8 @@ CREATE TABLE IF NOT EXISTS shard_offers(
   players TEXT NOT NULL DEFAULT '[]');
 CREATE TABLE IF NOT EXISTS shard_homes(
   world_id TEXT NOT NULL, uuid TEXT NOT NULL, lease_id TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY(world_id, uuid)) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS skins(
+  player_uuid TEXT PRIMARY KEY REFERENCES players(uuid),
+  skin_hash TEXT NOT NULL,
+  updated_at INTEGER NOT NULL);
