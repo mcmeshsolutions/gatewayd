@@ -35,6 +35,25 @@ pub fn validate_png(bytes: &[u8]) -> Result<(u32, u32), &'static str> {
     Ok((width, height))
 }
 
+/// Validates raw cape PNG bytes (supports standard 64x32, HD 64x64, 128x64, or OptiFine 22x17)
+pub fn validate_cape_png(bytes: &[u8]) -> Result<(u32, u32), &'static str> {
+    if bytes.len() < 33 {
+        return Err("NOT_PNG");
+    }
+    if &bytes[0..8] != b"\x89PNG\r\n\x1a\n" {
+        return Err("NOT_PNG");
+    }
+    if &bytes[12..16] != b"IHDR" {
+        return Err("NOT_PNG");
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+    let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+    if width < 16 || height < 16 || width > 256 || height > 256 {
+        return Err("BAD_DIMENSIONS");
+    }
+    Ok((width, height))
+}
+
 impl Gateway {
     pub fn set_player_skin(&mut self, player_uuid: &str, skin_bytes: &[u8]) -> Result<String, Error> {
         let hash = sha256(skin_bytes);
@@ -69,10 +88,37 @@ impl Gateway {
         let data = self.cas().get(&hash)?;
         Ok(Some(data))
     }
+
+    pub fn set_player_cape(&mut self, player_uuid: &str, cape_bytes: &[u8]) -> Result<String, Error> {
+        let hash = sha256(cape_bytes);
+        self.cas().put(cape_bytes)?;
+        let hash_hex = hex(&hash);
+        let now = wall_s();
+        self.db.execute(
+            "INSERT INTO capes(player_uuid, cape_hash, updated_at) VALUES(?1, ?2, ?3)
+             ON CONFLICT(player_uuid) DO UPDATE SET cape_hash=?2, updated_at=?3",
+            params![player_uuid, hash_hex, now],
+        )?;
+        Ok(hash_hex)
+    }
+
+    pub fn get_player_cape(&self, player_uuid: &str) -> Result<Option<(String, i64)>, Error> {
+        let mut st = self.db.prepare("SELECT cape_hash, updated_at FROM capes WHERE player_uuid=?")?;
+        let mut rows = st.query(params![player_uuid])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((row.get(0)?, row.get(1)?)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_cape_bytes(&self, hash_hex: &str) -> Result<Option<Vec<u8>>, Error> {
+        self.get_skin_bytes(hash_hex)
+    }
 }
 
 #[derive(Deserialize)]
-struct SkinJson {
+struct TextureJson {
     #[serde(default)]
     png_base64: Option<String>,
 }
@@ -99,21 +145,7 @@ async fn post_skin(
     let dev = auth(&gw, &h)?;
     let (player_uuid, _) = gw.device_player(&dev)?.ok_or(ApiErr::Unauthorized)?;
 
-    let png_bytes = if body.starts_with(b"\x89PNG\r\n\x1a\n") {
-        body.to_vec()
-    } else if let Ok(j) = serde_json::from_slice::<SkinJson>(&body) {
-        if let Some(b64) = j.png_base64 {
-            use base64::Engine;
-            base64::engine::general_purpose::STANDARD
-                .decode(b64.trim())
-                .map_err(|_| ApiErr::BadRequest("BAD_BASE64"))?
-        } else {
-            return Err(ApiErr::BadRequest("MISSING_PNG"));
-        }
-    } else {
-        return Err(ApiErr::BadRequest("BAD_BODY"));
-    };
-
+    let png_bytes = extract_png_bytes(body)?;
     if png_bytes.len() > MAX_SKIN_SIZE {
         return Err(ApiErr::BadRequest("SKIN_TOO_LARGE"));
     }
@@ -139,11 +171,79 @@ async fn get_user_skin(
     })))
 }
 
+async fn get_cape(State(s): State<Arc<AppState>>, Path(hash): Path<String>) -> Result<Response, ApiErr> {
+    let gw = s.gw();
+    let bytes = gw.get_cape_bytes(&hash)?.ok_or(ApiErr::NotFound("NO_SUCH_CAPE"))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, "public, max-age=604800, immutable"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+async fn post_cape(
+    State(s): State<Arc<AppState>>,
+    h: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiErr> {
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    let (player_uuid, _) = gw.device_player(&dev)?.ok_or(ApiErr::Unauthorized)?;
+
+    let png_bytes = extract_png_bytes(body)?;
+    if png_bytes.len() > MAX_SKIN_SIZE {
+        return Err(ApiErr::BadRequest("CAPE_TOO_LARGE"));
+    }
+    validate_cape_png(&png_bytes).map_err(ApiErr::BadRequest)?;
+    let hash = gw.set_player_cape(&player_uuid, &png_bytes)?;
+    Ok(Json(json!({
+        "hash": hash,
+        "url": format!("/v1/capes/{hash}")
+    })))
+}
+
+async fn get_user_cape(
+    State(s): State<Arc<AppState>>,
+    Path(uuid): Path<String>,
+) -> Result<Json<Value>, ApiErr> {
+    let gw = s.gw();
+    let (hash, updated_at) = gw.get_player_cape(&uuid)?.ok_or(ApiErr::NotFound("NO_SUCH_CAPE"))?;
+    Ok(Json(json!({
+        "player_uuid": uuid,
+        "cape_hash": hash,
+        "cape_url": format!("/v1/capes/{hash}"),
+        "updated_at": updated_at
+    })))
+}
+
+fn extract_png_bytes(body: Bytes) -> Result<Vec<u8>, ApiErr> {
+    if body.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Ok(body.to_vec())
+    } else if let Ok(j) = serde_json::from_slice::<TextureJson>(&body) {
+        if let Some(b64) = j.png_base64 {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(b64.trim())
+                .map_err(|_| ApiErr::BadRequest("BAD_BASE64"))
+        } else {
+            Err(ApiErr::BadRequest("MISSING_PNG"))
+        }
+    } else {
+        Err(ApiErr::BadRequest("BAD_BODY"))
+    }
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/v1/skins/:hash", get(get_skin))
         .route("/v1/skins", post(post_skin).layer(DefaultBodyLimit::max(MAX_SKIN_SIZE)))
         .route("/v1/users/:uuid/skin", get(get_user_skin))
+        .route("/v1/capes/:hash", get(get_cape))
+        .route("/v1/capes", post(post_cape).layer(DefaultBodyLimit::max(MAX_SKIN_SIZE)))
+        .route("/v1/users/:uuid/cape", get(get_user_cape))
 }
 
 #[cfg(test)]
@@ -153,16 +253,12 @@ mod tests {
     fn dummy_png(w: u32, h: u32) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(b"\x89PNG\r\n\x1a\n");
-        // IHDR chunk length = 13
         b.extend_from_slice(&13u32.to_be_bytes());
         b.extend_from_slice(b"IHDR");
         b.extend_from_slice(&w.to_be_bytes());
         b.extend_from_slice(&h.to_be_bytes());
-        // bit depth, color type, compression, filter, interlace
         b.extend_from_slice(&[8, 6, 0, 0, 0]);
-        // CRC 4 bytes
         b.extend_from_slice(&[0, 0, 0, 0]);
-        // IEND chunk
         b.extend_from_slice(&0u32.to_be_bytes());
         b.extend_from_slice(b"IEND");
         b.extend_from_slice(&[0xae, 0x42, 0x60, 0x82]);
@@ -182,5 +278,17 @@ mod tests {
 
         let not_png = b"not a png image at all";
         assert_eq!(validate_png(not_png), Err("NOT_PNG"));
+    }
+
+    #[test]
+    fn test_validate_cape_png() {
+        let c64_32 = dummy_png(64, 32);
+        assert_eq!(validate_cape_png(&c64_32), Ok((64, 32)));
+
+        let c22_17 = dummy_png(22, 17);
+        assert_eq!(validate_cape_png(&c22_17), Ok((22, 17)));
+
+        let c_too_small = dummy_png(8, 8);
+        assert_eq!(validate_cape_png(&c_too_small), Err("BAD_DIMENSIONS"));
     }
 }

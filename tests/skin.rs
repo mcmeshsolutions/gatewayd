@@ -101,4 +101,32 @@ async fn skin_upload_and_fetch_flow() {
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status().as_u16(), 404);
+
+    // 7. Cape upload and fetch
+    let cape_png = dummy_png(64, 32);
+    let req = Request::post("/v1/capes")
+        .header("content-type", "image/png")
+        .header("authorization", "Bearer tok-alice")
+        .body(Body::from(cape_png.clone()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    let cape_hash = v["hash"].as_str().unwrap();
+
+    let req = Request::get(format!("/v1/capes/{cape_hash}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let req = Request::get("/v1/users/u-alice/cape")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["cape_hash"].as_str().unwrap(), cape_hash);
 }

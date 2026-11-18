@@ -82,3 +82,8 @@ CREATE TABLE IF NOT EXISTS skins(
   player_uuid TEXT PRIMARY KEY REFERENCES players(uuid),
   skin_hash TEXT NOT NULL,
   updated_at INTEGER NOT NULL);
+
+CREATE TABLE IF NOT EXISTS capes(
+  player_uuid TEXT PRIMARY KEY REFERENCES players(uuid),
+  cape_hash TEXT NOT NULL,
+  updated_at INTEGER NOT NULL);
