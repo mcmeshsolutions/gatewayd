@@ -164,7 +164,11 @@ fn exempt_from_client_gate(path: &str, h: &HeaderMap) -> bool {
         || path.starts_with("/v1/panel/")
         || path.starts_with("/v1/sso/")
         || path.starts_with("/v1/auth/sso/")
+        || path.starts_with("/v1/auth/oidc/")
         || h.get(axum::http::header::COOKIE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.contains("mcmesh_sso="))
+        || h.contains_key("remote-user")
+        || h.contains_key("remote-email")
+        || h.contains_key("x-forwarded-user")
         || h.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).is_some_and(|v| v.trim_start_matches("Bearer ").starts_with(crate::apikeys::PREFIX))
 }
 

@@ -860,6 +860,9 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/worlds/:id/tokens/:token_id", delete(delete_world_token))
         .route("/v1/panel/code", post(panel_code))
         .route("/v1/panel/login", post(panel_login))
+        .route("/v1/auth/sso/providers", get(crate::sso::providers))
+        .route("/v1/auth/oidc/login", get(crate::sso::oidc_login))
+        .route("/v1/auth/oidc/callback", get(crate::sso::oidc_callback))
 }
 
 /// What a region rollback changed.

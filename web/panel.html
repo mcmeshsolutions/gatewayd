@@ -81,6 +81,7 @@ textarea{width:100%;min-height:8rem}
       <div class=row>
         <button class=go id=sso-login>Sign in</button>
         <button id=sso-reg>Create account</button>
+        <button class=go id=oidc-login hidden>Sign in with Homelab OIDC / SSO</button>
       </div>
     </section>
     <section class=card>
@@ -209,6 +210,7 @@ $('#sso-reg').onclick=async()=>{
     await boot();
   }catch(e){err(e.message==='EMAIL_TAKEN'?'That email is already registered.':e.message);}
 };
+$('#oidc-login').onclick=()=>{location.href='/v1/auth/oidc/login';};
 $('#out').onclick=async()=>{
   err();note();
   await api('/v1/auth/sso/logout',send('POST',{})).catch(()=>{});
@@ -221,6 +223,9 @@ function showLoggedOut(){
   $('#app').hidden=true;
   $('#user-bar').hidden=true;
   $('#role-badge').hidden=true;
+  api('/v1/auth/sso/providers').then(p=>{
+    if(p&&p.oidc_enabled)$('#oidc-login').hidden=false;
+  }).catch(()=>{});
 }
 
 async function boot(){

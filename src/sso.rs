@@ -216,19 +216,135 @@ impl Gateway {
         )?;
         Ok(())
     }
+
+    /// Finds an existing SSO user by email or provisions a new federated account (Forward-Auth / OIDC).
+    pub fn sso_find_or_provision(&self, email: &str, grant_superadmin: bool) -> Result<SsoUser, Error> {
+        let row: Option<(String, String, i64)> = self
+            .db
+            .query_row(
+                "SELECT id, email, is_superadmin FROM sso_users WHERE email=? COLLATE NOCASE",
+                rusqlite::params![email],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+
+        if let Some((id, em, sup)) = row {
+            let mut is_superadmin = sup != 0;
+            if grant_superadmin && !is_superadmin {
+                self.db.execute(
+                    "UPDATE sso_users SET is_superadmin=1 WHERE id=?",
+                    rusqlite::params![id],
+                )?;
+                is_superadmin = true;
+            }
+            return Ok(SsoUser {
+                id,
+                email: em,
+                is_superadmin,
+            });
+        }
+
+        let first = self
+            .db
+            .query_row("SELECT COUNT(*) FROM sso_users", [], |r| r.get::<_, i64>(0))?
+            == 0;
+        let is_superadmin = first || grant_superadmin;
+        let random_pw = rand_token()?;
+        let id = self.sso_create(email, &random_pw, is_superadmin)?;
+        Ok(SsoUser {
+            id,
+            email: email.to_string(),
+            is_superadmin,
+        })
+    }
 }
 
 use rusqlite::OptionalExtension;
 
-/// Reads the session cookie and resolves it to an SSO user; used by every dashboard route.
+fn forward_auth_enabled() -> bool {
+    std::env::var("MCMESH_FORWARD_AUTH")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+fn header_first<'a>(h: &'a HeaderMap, names: &[&str]) -> Option<&'a str> {
+    for &name in names {
+        if let Some(val) = h.get(name).and_then(|v| v.to_str().ok()) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+    }
+    None
+}
+
+fn groups_match_admin(raw_groups: &str, env_var: &str, default_groups: &str) -> bool {
+    let wanted = std::env::var(env_var).unwrap_or_else(|_| default_groups.to_string());
+    let wanted_set: Vec<&str> = wanted
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    raw_groups
+        .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .any(|g| wanted_set.iter().any(|w| w.eq_ignore_ascii_case(g)))
+}
+
+/// Reads the session cookie (or Forward-Auth headers when `MCMESH_FORWARD_AUTH=1`) and resolves it to an SSO user.
 pub(crate) fn sso_auth(gw: &Gateway, h: &HeaderMap) -> Result<SsoUser, ApiErr> {
     let raw = h.get(header::COOKIE).and_then(|v| v.to_str().ok()).unwrap_or("");
-    let token = raw
+    if let Some(token) = raw
         .split(';')
         .map(|p| p.trim())
         .find_map(|p| p.strip_prefix(&format!("{SESSION_COOKIE}=")))
-        .ok_or(ApiErr::Unauthorized)?;
-    Ok(gw.sso_session(token)?.ok_or(ApiErr::Unauthorized)?)
+    {
+        if let Some(user) = gw.sso_session(token)? {
+            return Ok(user);
+        }
+    }
+
+    if forward_auth_enabled() {
+        let email_or_user = header_first(
+            h,
+            &[
+                "remote-email",
+                "x-forwarded-email",
+                "x-auth-request-email",
+                "remote-user",
+                "x-forwarded-user",
+                "x-auth-request-user",
+            ],
+        );
+        if let Some(ident) = email_or_user {
+            let email = if ident.contains('@') {
+                ident.to_string()
+            } else {
+                format!("{ident}@forward-auth.local")
+            };
+            if valid_email(&email) {
+                let raw_groups = header_first(
+                    h,
+                    &[
+                        "remote-groups",
+                        "x-forwarded-groups",
+                        "x-auth-request-groups",
+                    ],
+                )
+                .unwrap_or("");
+                let grant_admin = groups_match_admin(
+                    raw_groups,
+                    "MCMESH_FORWARD_AUTH_ADMIN_GROUP",
+                    "admins,mcmesh-admins",
+                );
+                let user = gw.sso_find_or_provision(&email, grant_admin)?;
+                return Ok(user);
+            }
+        }
+    }
+
+    Err(ApiErr::Unauthorized)
 }
 
 fn session_cookie(token: &str, max_age_s: i64) -> String {
@@ -342,6 +458,233 @@ async fn link(State(s): State<Arc<AppState>>, h: HeaderMap, Json(b): Json<LinkRe
     gw.sso_link(&user.id, &player)?;
     let name = gw.player_name(&player).ok();
     Ok(Json(json!({ "ok": true, "player": name, "uuid": player })))
+}
+
+#[derive(Clone, Debug)]
+pub struct OidcConfig {
+    pub issuer: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub auth_url: String,
+    pub token_url: String,
+    pub userinfo_url: String,
+}
+
+impl OidcConfig {
+    pub fn from_env() -> Option<Self> {
+        let issuer = std::env::var("MCMESH_OIDC_ISSUER")
+            .ok()?
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+        let client_id = std::env::var("MCMESH_OIDC_CLIENT_ID")
+            .ok()?
+            .trim()
+            .to_string();
+        if issuer.is_empty() || client_id.is_empty() {
+            return None;
+        }
+        let client_secret = std::env::var("MCMESH_OIDC_CLIENT_SECRET")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let redirect_uri = std::env::var("MCMESH_OIDC_REDIRECT_URI")
+            .unwrap_or_else(|_| "/v1/auth/oidc/callback".to_string())
+            .trim()
+            .to_string();
+        let auth_url = std::env::var("MCMESH_OIDC_AUTH_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("{issuer}/authorize"));
+        let token_url = std::env::var("MCMESH_OIDC_TOKEN_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("{issuer}/token"));
+        let userinfo_url = std::env::var("MCMESH_OIDC_USERINFO_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("{issuer}/userinfo"));
+
+        Some(Self {
+            issuer,
+            client_id,
+            client_secret,
+            redirect_uri,
+            auth_url,
+            token_url,
+            userinfo_url,
+        })
+    }
+}
+
+fn oidc_states() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static STATES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    STATES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub(crate) async fn providers() -> Json<serde_json::Value> {
+    let oidc = OidcConfig::from_env();
+    Json(json!({
+        "ok": true,
+        "forward_auth": forward_auth_enabled(),
+        "oidc_enabled": oidc.is_some(),
+        "oidc_issuer": oidc.as_ref().map(|c| c.issuer.clone()),
+        "oidc_authorize_url": oidc.as_ref().map(|c| c.auth_url.clone()),
+    }))
+}
+
+pub(crate) async fn oidc_login() -> Result<impl IntoResponse, ApiErr> {
+    let Some(cfg) = OidcConfig::from_env() else {
+        return Err(ApiErr::BadRequest("OIDC_NOT_CONFIGURED"));
+    };
+    let state = rand_token()?;
+    {
+        let mut map = oidc_states().lock().unwrap_or_else(|e| e.into_inner());
+        let ttl = std::time::Duration::from_secs(600);
+        map.retain(|_, t| t.elapsed() < ttl);
+        map.insert(state.clone(), std::time::Instant::now());
+    }
+    let loc = format!(
+        "{}?response_type=code&client_id={}&redirect_uri={}&scope=openid%20email%20profile%20groups&state={}",
+        cfg.auth_url,
+        crate::s3::url_encode(&cfg.client_id),
+        crate::s3::url_encode(&cfg.redirect_uri),
+        crate::s3::url_encode(&state),
+    );
+    Ok((
+        axum::http::StatusCode::FOUND,
+        [(header::LOCATION, loc)],
+    ))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct OidcCallbackQ {
+    code: String,
+    #[serde(default)]
+    state: Option<String>,
+}
+
+fn decode_jwt_claims(jwt: &str) -> Option<serde_json::Value> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let payload_b64 = jwt.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(payload_b64.trim_end_matches('='))
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+pub(crate) async fn oidc_callback(
+    State(s): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<OidcCallbackQ>,
+) -> Result<impl IntoResponse, ApiErr> {
+    let Some(cfg) = OidcConfig::from_env() else {
+        return Err(ApiErr::BadRequest("OIDC_NOT_CONFIGURED"));
+    };
+
+    if let Some(ref st) = q.state {
+        let mut map = oidc_states().lock().unwrap_or_else(|e| e.into_inner());
+        let ttl = std::time::Duration::from_secs(600);
+        if let Some(t) = map.remove(st) {
+            if t.elapsed() >= ttl {
+                return Err(ApiErr::Unauthorized);
+            }
+        } else {
+            return Err(ApiErr::Unauthorized);
+        }
+    }
+
+    let code = q.code.clone();
+    let cfg_clone = cfg.clone();
+
+    let (email, is_admin_group) = tokio::task::spawn_blocking(move || -> Result<(String, bool), String> {
+        let form = format!(
+            "grant_type=authorization_code&code={}&client_id={}&client_secret={}&redirect_uri={}",
+            crate::s3::url_encode(&code),
+            crate::s3::url_encode(&cfg_clone.client_id),
+            crate::s3::url_encode(&cfg_clone.client_secret),
+            crate::s3::url_encode(&cfg_clone.redirect_uri),
+        );
+        let agent = ureq::builder().timeout(std::time::Duration::from_secs(15)).build();
+        let resp = agent
+            .post(&cfg_clone.token_url)
+            .set("content-type", "application/x-www-form-urlencoded")
+            .set("accept", "application/json")
+            .send_string(&form)
+            .map_err(|e| format!("OIDC token exchange failed: {e}"))?;
+
+        let tok_json: serde_json::Value = resp
+            .into_json()
+            .map_err(|e| format!("Invalid OIDC token JSON: {e}"))?;
+
+        let mut claims = tok_json
+            .get("id_token")
+            .and_then(|v| v.as_str())
+            .and_then(decode_jwt_claims)
+            .unwrap_or_else(|| json!({}));
+
+        if claims.get("email").is_none() {
+            if let Some(access_token) = tok_json.get("access_token").and_then(|v| v.as_str()) {
+                if let Ok(u_resp) = agent
+                    .get(&cfg_clone.userinfo_url)
+                    .set("authorization", &format!("Bearer {access_token}"))
+                    .call()
+                {
+                    if let Ok(u_json) = u_resp.into_json::<serde_json::Value>() {
+                        claims = u_json;
+                    }
+                }
+            }
+        }
+
+        let raw_ident = claims
+            .get("email")
+            .and_then(|v| v.as_str())
+            .or_else(|| claims.get("preferred_username").and_then(|v| v.as_str()))
+            .or_else(|| claims.get("sub").and_then(|v| v.as_str()))
+            .ok_or_else(|| "OIDC response missing email/sub claim".to_string())?;
+
+        let email = if raw_ident.contains('@') {
+            raw_ident.to_string()
+        } else {
+            format!("{raw_ident}@oidc.local")
+        };
+
+        let groups_str = match claims.get("groups") {
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            Some(serde_json::Value::String(s)) => s.clone(),
+            _ => String::new(),
+        };
+
+        let grant_admin = groups_match_admin(
+            &groups_str,
+            "MCMESH_OIDC_ADMIN_GROUP",
+            "admins,mcmesh-admins",
+        );
+        Ok((email, grant_admin))
+    })
+    .await
+    .map_err(|e| ApiErr::Domain(Error::Store(format!("OIDC task error: {e}"))))?
+    .map_err(|_| ApiErr::Unauthorized)?;
+
+    let token = {
+        let gw = s.gw();
+        let user = gw.sso_find_or_provision(&email, is_admin_group)?;
+        gw.sso_new_session(&user.id)?
+    };
+
+    Ok((
+        axum::http::StatusCode::FOUND,
+        [
+            (header::SET_COOKIE, session_cookie(&token, SESSION_MAX_AGE_S)),
+            (header::LOCATION, "/panel".to_string()),
+        ],
+    ))
 }
 
 pub fn routes() -> Router<Arc<AppState>> {
