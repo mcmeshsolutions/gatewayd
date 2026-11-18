@@ -9,7 +9,7 @@ use tokio::net::{TcpListener, UdpSocket};
 fn usage() -> ! {
     eprintln!(
         "usage: gatewayd serve\n       gatewayd create-world <id> <name> <mc_version> <loader>\n       \
-         gatewayd add-member <world> <mc_uuid> <name> <device> <ADMIN|HOST_ELIGIBLE|CLIENT_ONLY> <token>\n         gatewayd grant <world> <name> <ADMIN|HOST_ELIGIBLE|CLIENT_ONLY>\n         gatewayd drop-token <token>\n         gatewayd revisions <world>\n         gatewayd init\n         gatewayd leaves <revision>\n         gatewayd diff <revision> <revision> [<chunk lines, default 20>]\n         gatewayd recover <world> [--apply]\n         gatewayd status\n         gatewayd scrub\n         gatewayd backup <dir>\n         gatewayd set-pack <world> <pack_id>\n         gatewayd set-admin <name> <admin|user>\n         gatewayd set-limit <user|world> <id|*> <storage_bytes> <world_count> <keep_revisions> <keep_days> [<max_guests> <relay_bytes_month>]   (- = unlimited, replaces the row)\n         gatewayd set-anchor <device> <on|off>\n         gatewayd set-motd [<text>]   (empty clears it)\n         gatewayd set-superadmin <email> <on|off>\n         gatewayd revert <world> <revision>\n         gatewayd doctor\n\
+         gatewayd add-member <world> <mc_uuid> <name> <device> <ADMIN|HOST_ELIGIBLE|CLIENT_ONLY> <token>\n         gatewayd grant <world> <name> <ADMIN|HOST_ELIGIBLE|CLIENT_ONLY>\n         gatewayd drop-token <token>\n         gatewayd revisions <world>\n         gatewayd init\n         gatewayd leaves <revision>\n         gatewayd diff <revision> <revision> [<chunk lines, default 20>]\n         gatewayd recover <world> [--apply]\n         gatewayd status\n         gatewayd scrub\n         gatewayd backup <dir>\n         gatewayd set-pack <world> <pack_id>\n         gatewayd set-admin <name> <admin|user>\n         gatewayd set-limit <user|world> <id|*> <storage_bytes> <world_count> <keep_revisions> <keep_days> [<max_guests> <relay_bytes_month>]   (- = unlimited, replaces the row)\n         gatewayd set-anchor <device> <on|off>\n         gatewayd set-motd [<text>]   (empty clears it)\n         gatewayd set-superadmin <email> <on|off>\n         gatewayd revert <world> <revision>\n         gatewayd doctor\n         gatewayd pack init <dir> [<pack_id>]\n         gatewayd pack sign <dir> [<pack_id>] [<version>] [<out_dir>]\n         gatewayd pack check <dir_or_manifest>\n\
          env: MCMESH_DB (default mcmesh.db), MCMESH_CAS (default ./cas),\n         relay (needs MCMESH_WORLD, or MCMESH_RELAY=all to serve every world; MCMESH_WORLD then only picks the UDP and ticketless default): MCMESH_RELAY_ADDR (127.0.0.1:9000), MCMESH_PUBLIC_ADDR (0.0.0.0:25565), MCMESH_VOICE_ADDR (0.0.0.0:24454)\n          MCMESH_ADDR (default 127.0.0.1:8080)\n          MCMESH_CREATE=open lets any logged-in player create worlds\n          MCMESH_ADVERTISE=host:port tells clients where guests connect (with MCMESH_WORLD)\n          MCMESH_METRICS_TOKEN=secret enables GET /metrics (Prometheus) behind that bearer token\n          MCMESH_ADMINS=uuid,uuid are gateway admins on top of `set-admin`; MCMESH_BAN_GRACE_S (120) is how long a banned host may wind down\n          MCMESH_WEBHOOKS=url,url posts gateway events as JSON; MCMESH_WEBHOOK_SECRET signs them\n          MCMESH_MIN_CLIENT=N refuses mods below client protocol level N with 426 CLIENT_TOO_OLD (current mods send level 1, older ones send nothing); MCMESH_REQUIRE_SIGNED=1 refuses commits without a valid host signature (403 SIGNATURE_REQUIRED); MCMESH_STRICT_DATA=1 makes `serve` refuse to start when the database or cas directory is missing (create them with `gatewayd init`); MCMESH_BACKUP_DIR=dir turns on a scheduled scrub plus incremental backup every MCMESH_MAINT_INTERVAL_S (86400, minimum 60), and MCMESH_AUTO_RECOVER=1 lets it move a damaged world head to the newest intact revision; MCMESH_RATE=off disables rate limits; MCMESH_RATE_SCALE=2 doubles every limit; MCMESH_RELAY_RATE_SCALE=10 loosens only the relay limits; MCMESH_PROXY_PROTOCOL=1 expects a PROXY protocol v1 or v2 header on every relay TCP connection (only when the listeners are reachable through the forwarder alone); MCMESH_TRUST_PROXY=1 reads the client address from the last X-Forwarded-For entry (only behind a proxy you control)"
     );
     std::process::exit(2)
@@ -109,6 +109,46 @@ async fn main() {
             if !gatewayd::doctor::print_cli_report(&report) {
                 std::process::exit(1);
             }
+        }
+        ["pack", "init", dir, rest @ ..] => {
+            let id = rest.first().copied();
+            let res = gatewayd::pack::init(std::path::Path::new(dir), id, None).expect("pack init");
+            println!("Pack initialized successfully!");
+            println!("  Pack ID:        {}", res.pack_id);
+            println!("  Author Key:     {}", res.key_path.display());
+            println!("  Public Key:     {}", res.public_key);
+            println!("  Config:         {}", res.config_path.display());
+        }
+        ["pack", "sign", dir, rest @ ..] => {
+            let id = rest.first().copied();
+            let ver = rest.get(1).copied();
+            let out = rest.get(2).map(|s| std::path::Path::new(s));
+            let res = gatewayd::pack::sign(std::path::Path::new(dir), id, ver, out, None).expect("pack sign");
+            println!("Pack signed successfully!");
+            println!("  Pack ID:        {}", res.pack_id);
+            println!("  Version:        {}", res.version);
+            println!("  Files:          {} ({} bytes)", res.file_count, res.total_bytes);
+            println!("  Manifest:       {}", res.manifest_path.display());
+            println!("  Signature:      {}", res.signature_path.display());
+            println!("  Public Key:     {}", res.public_key);
+        }
+        ["pack", "check", target] => {
+            let res = gatewayd::pack::check(std::path::Path::new(target)).expect("pack check");
+            println!("Pack Check Report: {} (v{})", res.pack_id, res.version);
+            println!("  Files inspected: {}", res.file_count);
+            if let Some(valid) = res.valid_signature {
+                println!("  Signature valid: {}", if valid { "YES (Ed25519 verified)" } else { "NO (signature mismatch)" });
+            }
+            for w in &res.warnings {
+                println!("  [WARN] {w}");
+            }
+            for e in &res.errors {
+                println!("  [FAIL] {e}");
+            }
+            if !res.errors.is_empty() {
+                std::process::exit(1);
+            }
+            println!("Verdict: PASSED");
         }
         ["revert", world, rev] => {
             let admin: String = gw.first_admin_device(world).expect("no admin");

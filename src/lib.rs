@@ -20,6 +20,7 @@ pub mod locks;
 mod chaos_tests;
 #[cfg(test)]
 mod lease_tests;
+pub mod pack;
 pub mod panel;
 pub mod proxyproto;
 pub mod quests;
