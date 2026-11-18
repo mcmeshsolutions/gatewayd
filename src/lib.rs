@@ -21,6 +21,7 @@ mod chaos_tests;
 mod lease_tests;
 pub mod panel;
 pub mod proxyproto;
+pub mod quests;
 pub mod quota;
 pub mod ratelimit;
 pub mod relay;

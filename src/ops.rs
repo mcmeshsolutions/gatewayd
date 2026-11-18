@@ -761,6 +761,22 @@ async fn digest_viewer(Path(_id): Path<String>) -> Response {
     Html(include_str!("../web/digest.html")).into_response()
 }
 
+#[derive(Deserialize)]
+pub struct QuestsQuery {
+    pub team: Option<String>,
+}
+
+async fn world_quests(
+    Path(world): Path<String>,
+    Query(q): Query<QuestsQuery>,
+) -> Json<crate::quests::QuestTreeResponse> {
+    Json(crate::quests::generate_quest_tree(&world, q.team.as_deref()))
+}
+
+async fn quests_viewer(Path(_id): Path<String>) -> Response {
+    Html(include_str!("../web/quests.html")).into_response()
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/status", get(status_page))
@@ -773,6 +789,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/isomap/:id", get(isomap_viewer))
         .route("/timeline/:id", get(timeline_viewer))
         .route("/digest/:id", get(digest_viewer))
+        .route("/quests/:id", get(quests_viewer))
         .route("/v1/contraptions/inspect", post(contraption_inspect))
         .route("/v1/contraptions/demo", get(contraption_demo))
         .route("/v1/worlds/:id/voxels", get(world_voxels))
@@ -781,6 +798,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/worlds/:id/heatmap", get(world_heatmap))
         .route("/v1/worlds/:id/hall-of-fame", get(world_hall_of_fame))
         .route("/v1/worlds/:id/digest", get(world_digest))
+        .route("/v1/worlds/:id/quests", get(world_quests))
         .route("/v1/worlds/:id/events", get(world_events))
         .route("/v1/worlds/:id/events/stream", get(world_event_stream))
 }
