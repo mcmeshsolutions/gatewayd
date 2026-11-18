@@ -5,7 +5,7 @@ use axum::{
     extract::{Path, State},
     http::{header, HeaderMap},
     response::{Html, IntoResponse},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use rusqlite::{params, OptionalExtension};
@@ -685,6 +685,157 @@ async fn get_world_p2p_meter(State(s): State<Arc<AppState>>, h: HeaderMap, Path(
     Ok(Json(meter))
 }
 
+#[derive(Deserialize)]
+struct WorldQuotaReq {
+    storage_bytes: Option<u64>,
+    max_guests: Option<u64>,
+    keep_revisions: Option<u64>,
+    keep_days: Option<u64>,
+    relay_bytes_month: Option<u64>,
+}
+
+async fn get_world_quotas(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> R {
+    use crate::quota::{month_meter, Scope};
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_world_or_gw_admin(&s, &gw, &dev, &world)?;
+    let owner_uuid = gw.world_owner(&world)?;
+    let storage_bytes = gw.world_usage(&world)?;
+    let month = month_meter(crate::lease::wall_s());
+    let relay_bytes = gw.meter_value(&world, &month);
+    let revisions: i64 = gw.db.query_row("SELECT COUNT(*) FROM revisions WHERE world_id=? AND pruned=0", params![world], |r| r.get(0)).unwrap_or(0);
+    let limits = gw.limits(Scope::World, &world)?;
+    let user_ceiling = if let Some(ref u) = owner_uuid {
+        gw.limits(Scope::User, u).ok()
+    } else {
+        None
+    };
+    let global_ceiling = gw.limits(Scope::World, "*").ok();
+
+    Ok(Json(json!({
+        "world_id": world,
+        "owner_uuid": owner_uuid,
+        "current_usage": {
+            "storage_bytes": storage_bytes,
+            "revisions_count": revisions,
+            "relay_bytes_month": relay_bytes,
+        },
+        "limits": {
+            "storage_bytes": limits.storage_bytes,
+            "max_guests": limits.max_guests,
+            "keep_revisions": limits.keep_revisions,
+            "keep_days": limits.keep_days,
+            "relay_bytes_month": limits.relay_bytes_month,
+        },
+        "admin_ceiling": {
+            "storage_bytes": user_ceiling.as_ref().and_then(|c| c.storage_bytes).or_else(|| global_ceiling.as_ref().and_then(|c| c.storage_bytes)),
+            "max_guests": user_ceiling.as_ref().and_then(|c| c.max_guests).or_else(|| global_ceiling.as_ref().and_then(|c| c.max_guests)),
+            "relay_bytes_month": user_ceiling.as_ref().and_then(|c| c.relay_bytes_month).or_else(|| global_ceiling.as_ref().and_then(|c| c.relay_bytes_month)),
+        }
+    })))
+}
+
+async fn put_world_quotas(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<WorldQuotaReq>) -> R {
+    use crate::quota::{Limits, Scope};
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    let (uuid, _) = crate::admin::require_owner_or_admin(&s, &gw, &dev, &world)?;
+    let is_admin = gw.is_admin(&uuid, &s.auth.admins);
+
+    if !is_admin {
+        let global_ceil = gw.limits(Scope::World, "*").unwrap_or_default();
+        let user_ceil = gw.limits(Scope::User, &uuid).unwrap_or_default();
+        let max_storage = user_ceil.storage_bytes.or(global_ceil.storage_bytes);
+        if let (Some(req_s), Some(ceil_s)) = (b.storage_bytes, max_storage) {
+            if req_s > ceil_s {
+                return Err(ApiErr::BadRequest("EXCEEDS_STORAGE_CEILING"));
+            }
+        }
+        let max_g = user_ceil.max_guests.or(global_ceil.max_guests);
+        if let (Some(req_g), Some(ceil_g)) = (b.max_guests, max_g) {
+            if req_g > ceil_g {
+                return Err(ApiErr::BadRequest("EXCEEDS_GUESTS_CEILING"));
+            }
+        }
+        let max_relay = user_ceil.relay_bytes_month.or(global_ceil.relay_bytes_month);
+        if let (Some(req_r), Some(ceil_r)) = (b.relay_bytes_month, max_relay) {
+            if req_r > ceil_r {
+                return Err(ApiErr::BadRequest("EXCEEDS_RELAY_CEILING"));
+            }
+        }
+    }
+
+    let limits = Limits {
+        storage_bytes: b.storage_bytes,
+        world_count: None,
+        keep_revisions: b.keep_revisions,
+        keep_days: b.keep_days,
+        max_guests: b.max_guests,
+        relay_bytes_month: b.relay_bytes_month,
+    };
+    gw.set_limits(Scope::World, &world, &limits)?;
+    gw.audit(&dev, "quota.world_set", &world, "", json!({
+        "storage_bytes": limits.storage_bytes,
+        "max_guests": limits.max_guests,
+        "keep_revisions": limits.keep_revisions,
+        "keep_days": limits.keep_days,
+        "relay_bytes_month": limits.relay_bytes_month,
+    }));
+    Ok(Json(json!({ "ok": true, "limits": {
+        "storage_bytes": limits.storage_bytes,
+        "max_guests": limits.max_guests,
+        "keep_revisions": limits.keep_revisions,
+        "keep_days": limits.keep_days,
+        "relay_bytes_month": limits.relay_bytes_month,
+    } })))
+}
+
+#[derive(Deserialize)]
+struct CreateWorldTokenReq {
+    label: String,
+    #[serde(default)]
+    expiry_days: Option<u64>,
+}
+
+async fn post_world_token(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<CreateWorldTokenReq>) -> R {
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    crate::admin::require_owner_or_admin(&s, &gw, &dev, &world)?;
+    let label = b.label.trim();
+    if label.is_empty() {
+        return Err(ApiErr::BadRequest("LABEL_REQUIRED"));
+    }
+    let (token_id, raw_token) = gw.create_world_token(&world, &dev, label, b.expiry_days)?;
+    gw.audit(&dev, "token.world_create", &world, &token_id, json!({ "label": label, "expiry_days": b.expiry_days }));
+    Ok(Json(json!({
+        "ok": true,
+        "token_id": token_id,
+        "token": raw_token,
+        "world_id": world,
+        "label": label,
+    })))
+}
+
+async fn get_world_tokens(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    crate::admin::require_owner_or_admin(&s, &gw, &dev, &world)?;
+    let tokens = gw.list_world_tokens(&world)?;
+    Ok(Json(json!({ "world_id": world, "tokens": tokens })))
+}
+
+async fn delete_world_token(State(s): State<Arc<AppState>>, h: HeaderMap, Path((world, token_id)): Path<(String, String)>) -> R {
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    crate::admin::require_owner_or_admin(&s, &gw, &dev, &world)?;
+    let revoked = gw.revoke_world_token(&world, &token_id)?;
+    if !revoked {
+        return Err(ApiErr::NotFound("NO_SUCH_TOKEN"));
+    }
+    gw.audit(&dev, "token.world_revoke", &world, &token_id, json!({}));
+    Ok(Json(json!({ "ok": true, "revoked": token_id })))
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(landing))
@@ -704,6 +855,9 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/worlds/:id/pulse/flush", post(post_pulse_flush))
         .route("/v1/worlds/:id/pulse/freeze", post(post_pulse_freeze))
         .route("/v1/worlds/:id/p2p-meter", get(get_world_p2p_meter))
+        .route("/v1/worlds/:id/quotas", get(get_world_quotas).put(put_world_quotas))
+        .route("/v1/worlds/:id/tokens", get(get_world_tokens).post(post_world_token))
+        .route("/v1/worlds/:id/tokens/:token_id", delete(delete_world_token))
         .route("/v1/panel/code", post(panel_code))
         .route("/v1/panel/login", post(panel_login))
 }

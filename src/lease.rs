@@ -1154,6 +1154,60 @@ impl Gateway {
         Ok(self.db.execute("DELETE FROM sessions WHERE token_hash=?", params![token_hash(token).as_slice()])? > 0)
     }
 
+    pub fn create_world_token(&mut self, world: &str, device: &str, label: &str, expires_in_days: Option<u64>) -> Result<(String, String)> {
+        let mut raw = [0u8; 24];
+        getrandom::getrandom(&mut raw).map_err(|_| Error::Rand)?;
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let token = format!("mcmesh_wot_{}", URL_SAFE_NO_PAD.encode(raw));
+        let token_id = format!("wt_{}", &token[11..std::cmp::min(23, token.len())]);
+        let prefix = format!("{}...", &token[..std::cmp::min(15, token.len())]);
+        let now = wall_s();
+        let expires_at = expires_in_days.map(|d| now + (d as i64) * 86400);
+
+        self.db.execute(
+            "INSERT INTO world_tokens(id, world_id, device_id, token_hash, label, token_prefix, created_at, expires_at) VALUES(?,?,?,?,?,?,?,?)",
+            params![token_id, world, device, token_hash(&token).as_slice(), label, prefix, now, expires_at],
+        )?;
+        self.add_token(device, &token)?;
+        Ok((token_id, token))
+    }
+
+    pub fn list_world_tokens(&self, world: &str) -> Result<Vec<Value>> {
+        let mut st = self.db.prepare(
+            "SELECT id, label, token_prefix, created_at, expires_at FROM world_tokens WHERE world_id=? ORDER BY created_at DESC"
+        )?;
+        let rows = st.query_map(params![world], |r| {
+            Ok(json!({
+                "id": r.get::<_, String>(0)?,
+                "label": r.get::<_, String>(1)?,
+                "token_prefix": r.get::<_, String>(2)?,
+                "created_at": r.get::<_, i64>(3)?,
+                "expires_at": r.get::<_, Option<i64>>(4)?,
+            }))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn revoke_world_token(&mut self, world: &str, token_id: &str) -> Result<bool> {
+        let hash: Option<Vec<u8>> = self.db.query_row(
+            "SELECT token_hash FROM world_tokens WHERE id=? AND world_id=?",
+            params![token_id, world],
+            |r| r.get(0),
+        ).optional()?;
+
+        if let Some(h) = hash {
+            self.db.execute("DELETE FROM sessions WHERE token_hash=?", params![h.as_slice()])?;
+            self.db.execute("DELETE FROM world_tokens WHERE id=? AND world_id=?", params![token_id, world])?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     pub fn device_for_token(&self, token: &str) -> Result<Option<String>> {
         let h = token_hash(token);
         let now = unix_s();

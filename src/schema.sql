@@ -87,3 +87,13 @@ CREATE TABLE IF NOT EXISTS capes(
   player_uuid TEXT PRIMARY KEY REFERENCES players(uuid),
   cape_hash TEXT NOT NULL,
   updated_at INTEGER NOT NULL);
+
+CREATE TABLE IF NOT EXISTS world_tokens(
+  id TEXT PRIMARY KEY,
+  world_id TEXT NOT NULL REFERENCES worlds(id),
+  device_id TEXT NOT NULL REFERENCES devices(id),
+  token_hash BLOB NOT NULL UNIQUE,
+  label TEXT NOT NULL,
+  token_prefix TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER);

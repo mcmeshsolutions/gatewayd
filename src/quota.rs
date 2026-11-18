@@ -53,6 +53,10 @@ pub(crate) fn migrate(db: &Connection, cas: &Cas) -> rusqlite::Result<()> {
     let _ = db.execute("ALTER TABLE quotas ADD COLUMN max_guests INTEGER", []);
     let _ = db.execute("ALTER TABLE quotas ADD COLUMN relay_bytes_month INTEGER", []);
     let _ = db.execute("ALTER TABLE revisions ADD COLUMN pruned INTEGER NOT NULL DEFAULT 0", []);
+    let _ = db.execute(
+        "CREATE TABLE IF NOT EXISTS world_tokens(id TEXT PRIMARY KEY, world_id TEXT NOT NULL, device_id TEXT NOT NULL, token_hash BLOB NOT NULL UNIQUE, label TEXT NOT NULL, token_prefix TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER)",
+        [],
+    );
     db.execute(
         "UPDATE worlds SET owner_uuid=(SELECT player_uuid FROM members m WHERE m.world_id=worlds.id AND m.role='ADMIN' ORDER BY m.rowid LIMIT 1) \
          WHERE owner_uuid IS NULL",

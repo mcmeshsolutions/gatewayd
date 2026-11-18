@@ -751,6 +751,140 @@ async function renderWorldTab(){
   loadReqs();
   modCard.append(ta,el('div',{className:'row'},saveMods),el('h3',{textContent:'Mod requests'}),el('table',{className:'stack'},rq));
   box.append(modCard);
+
+  // Multi-Tenant Quotas & Retention Policy card
+  const quotaCard=el('div',{className:'card'},
+    el('h2',{textContent:'Multi-Tenant Quotas & Retention Policy'}),
+    el('p',{textContent:'Configure resource caps and revision retention within the gateway administrator limits.'})
+  );
+  const qInfo=el('p',{textContent:'Loading quotas...'});
+  const inStorage=el('input',{type:'number',placeholder:'Storage Cap (MB)',min:'0'});
+  const inGuests=el('input',{type:'number',placeholder:'Max Guests',min:'0'});
+  const inKeepRevs=el('input',{type:'number',placeholder:'Keep Revisions',min:'0'});
+  const inKeepDays=el('input',{type:'number',placeholder:'Retention Days',min:'0'});
+  const inRelay=el('input',{type:'number',placeholder:'Monthly Relay (MB)',min:'0'});
+  const saveQuotas=el('button',{className:'go',textContent:'Save Quotas'});
+
+  const loadQuotas=async()=>{
+    try{
+      const q=await api(`/v1/worlds/${w.id}/quotas`);
+      const u=q.current_usage||{};
+      const l=q.limits||{};
+      const c=q.admin_ceiling||{};
+      const curMb=(u.storage_bytes/(1024*1024)).toFixed(1);
+      const relayMb=(u.relay_bytes_month/(1024*1024)).toFixed(1);
+      let ceilText=[];
+      if(c.storage_bytes!=null)ceilText.push(`Max storage ceil: ${(c.storage_bytes/(1024*1024)).toFixed(0)} MB`);
+      if(c.max_guests!=null)ceilText.push(`Max guests ceil: ${c.max_guests}`);
+      if(c.relay_bytes_month!=null)ceilText.push(`Max relay ceil: ${(c.relay_bytes_month/(1024*1024)).toFixed(0)} MB`);
+      qInfo.textContent=`Current usage: ${curMb} MB storage · ${u.revisions_count||0} revisions · ${relayMb} MB relay this month.`+(ceilText.length?' (Admin ceiling: '+ceilText.join(', ')+')':'');
+
+      if(l.storage_bytes!=null)inStorage.value=Math.round(l.storage_bytes/(1024*1024));else inStorage.value='';
+      if(l.max_guests!=null)inGuests.value=l.max_guests;else inGuests.value='';
+      if(l.keep_revisions!=null)inKeepRevs.value=l.keep_revisions;else inKeepRevs.value='';
+      if(l.keep_days!=null)inKeepDays.value=l.keep_days;else inKeepDays.value='';
+      if(l.relay_bytes_month!=null)inRelay.value=Math.round(l.relay_bytes_month/(1024*1024));else inRelay.value='';
+    }catch(e){qInfo.textContent='Failed to load quotas: '+e.message;}
+  };
+  saveQuotas.onclick=async()=>{
+    err();
+    try{
+      const body={
+        storage_bytes:inStorage.value?parseInt(inStorage.value,10)*1024*1024:null,
+        max_guests:inGuests.value?parseInt(inGuests.value,10):null,
+        keep_revisions:inKeepRevs.value?parseInt(inKeepRevs.value,10):null,
+        keep_days:inKeepDays.value?parseInt(inKeepDays.value,10):null,
+        relay_bytes_month:inRelay.value?parseInt(inRelay.value,10)*1024*1024:null,
+      };
+      await api(`/v1/worlds/${w.id}/quotas`,send('PUT',body));
+      note('Quotas updated.');
+      loadQuotas();
+    }catch(e){err(e.message);}
+  };
+  loadQuotas();
+  quotaCard.append(
+    qInfo,
+    el('div',{className:'grid'},
+      el('label',{},'Storage Cap (MB)',inStorage),
+      el('label',{},'Max Guests',inGuests),
+      el('label',{},'Keep Revisions',inKeepRevs),
+      el('label',{},'Retention Days',inKeepDays),
+      el('label',{},'Monthly Relay (MB)',inRelay)
+    ),
+    el('div',{className:'row'},saveQuotas)
+  );
+  box.append(quotaCard);
+
+  // World Owner API Tokens card
+  const tokCard=el('div',{className:'card'},
+    el('h2',{textContent:'World Owner API Tokens'}),
+    el('p',{textContent:'Generate isolated API tokens scoped to this world for external tooling, webhooks, or automation.'})
+  );
+  const tokLabel=el('input',{placeholder:'Token label (e.g. backup-cron, discord-bot)'});
+  const tokExpiry=el('input',{type:'number',placeholder:'Expiry days (optional)',min:'1'});
+  const genTokBtn=el('button',{className:'go',textContent:'Generate World Token'});
+  const tokResult=el('code',{style:'word-break:break-all'});
+  const tokTableBody=el('tbody');
+
+  const loadTokens=async()=>{
+    tokTableBody.replaceChildren();
+    try{
+      const res=await api(`/v1/worlds/${w.id}/tokens`);
+      const tokens=res.tokens||[];
+      if(!tokens.length){
+        tokTableBody.append(el('tr',{},el('td',{colSpan:5,textContent:'No world tokens created yet.'})));
+        return;
+      }
+      for(const t of tokens){
+        const revBtn=el('button',{className:'x',textContent:'Revoke'});
+        revBtn.onclick=async()=>{
+          if(!confirm(`Revoke token "${t.label}" (${t.token_prefix}...)?`))return;
+          err();
+          try{
+            await api(`/v1/worlds/${w.id}/tokens/${t.id}`,send('DELETE',{}));
+            note('Token revoked.');
+            loadTokens();
+          }catch(e){err(e.message);}
+        };
+        const expStr=t.expires_at?new Date(t.expires_at*1000).toLocaleDateString():'Never';
+        tokTableBody.append(el('tr',{},
+          el('td',{textContent:t.label}),
+          el('td',{},el('code',{textContent:t.token_prefix+'...'})),
+          el('td',{textContent:new Date(t.created_at*1000).toLocaleDateString()}),
+          el('td',{textContent:expStr}),
+          el('td',{},revBtn)
+        ));
+      }
+    }catch(e){
+      tokTableBody.append(el('tr',{},el('td',{colSpan:5,textContent:'Failed to load tokens: '+e.message})));
+    }
+  };
+
+  genTokBtn.onclick=async()=>{
+    err();
+    const label=tokLabel.value.trim();
+    if(!label)return err('Please enter a token label.');
+    const exp=tokExpiry.value?parseInt(tokExpiry.value,10):null;
+    try{
+      const res=await api(`/v1/worlds/${w.id}/tokens`,send('POST',{label:label,expiry_days:exp}));
+      tokResult.textContent='New Token: '+res.token+' (Copy now, will not be shown again!)';
+      tokLabel.value='';
+      tokExpiry.value='';
+      note('World token created.');
+      loadTokens();
+    }catch(e){err(e.message);}
+  };
+
+  loadTokens();
+  tokCard.append(
+    el('div',{className:'row'},tokLabel,tokExpiry,genTokBtn),
+    tokResult,
+    el('table',{className:'stack'},
+      el('thead',{},el('tr',{},el('th',{textContent:'Label'}),el('th',{textContent:'Prefix'}),el('th',{textContent:'Created'}),el('th',{textContent:'Expires'}),el('th',{textContent:''}))),
+      tokTableBody
+    )
+  );
+  box.append(tokCard);
 }
 
 function renderAccountTab(){
