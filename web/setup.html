@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MCMesh Gateway Setup Wizard</title>
+  <style>
+    :root {
+      --bg: #090d16;
+      --card-bg: #111827;
+      --card-border: #1f2937;
+      --text: #f3f4f6;
+      --text-muted: #9ca3af;
+      --primary: #10b981;
+      --primary-hover: #059669;
+      --accent: #38bdf8;
+      --danger: #ef4444;
+      --code-bg: #030712;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body {
+      background: radial-gradient(circle at 50% 0%, #1e293b 0%, var(--bg) 75%);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem;
+    }
+    .container {
+      width: 100%;
+      max-width: 680px;
+      margin-top: 1rem;
+    }
+    .header {
+      text-align: center;
+      margin-bottom: 2rem;
+    }
+    .badge {
+      display: inline-block;
+      background: rgba(16, 185, 129, 0.15);
+      color: var(--primary);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      padding: 0.25rem 0.75rem;
+      border-radius: 9999px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      margin-bottom: 0.75rem;
+    }
+    h1 { font-size: 2rem; font-weight: 800; color: #fff; margin-bottom: 0.5rem; }
+    p.subtitle { color: var(--text-muted); font-size: 0.95rem; }
+    .stepper {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 2rem;
+      position: relative;
+    }
+    .stepper::before {
+      content: '';
+      position: absolute;
+      top: 50%;
+      left: 10%;
+      right: 10%;
+      height: 2px;
+      background: var(--card-border);
+      z-index: 1;
+      transform: translateY(-50%);
+    }
+    .step-item {
+      position: relative;
+      z-index: 2;
+      background: var(--bg);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 0 0.5rem;
+    }
+    .step-circle {
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      background: var(--card-bg);
+      border: 2px solid var(--card-border);
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 0.9rem;
+      transition: all 0.2s ease;
+    }
+    .step-item.active .step-circle {
+      background: var(--primary);
+      border-color: var(--primary);
+      color: #fff;
+      box-shadow: 0 0 15px rgba(16, 185, 129, 0.4);
+    }
+    .step-item.completed .step-circle {
+      background: rgba(16, 185, 129, 0.2);
+      border-color: var(--primary);
+      color: var(--primary);
+    }
+    .step-label {
+      margin-top: 0.5rem;
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--text-muted);
+    }
+    .step-item.active .step-label { color: #fff; }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 2rem;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+    }
+    .step-content { display: none; }
+    .step-content.active { display: block; }
+    .form-group {
+      margin-bottom: 1.5rem;
+    }
+    label {
+      display: block;
+      font-size: 0.85rem;
+      font-weight: 600;
+      margin-bottom: 0.5rem;
+      color: var(--text);
+    }
+    .help-text {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      margin-top: 0.35rem;
+    }
+    input[type="text"] {
+      width: 100%;
+      padding: 0.75rem 1rem;
+      background: var(--code-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      color: #fff;
+      font-size: 0.95rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    input[type="text"]:focus {
+      border-color: var(--primary);
+    }
+    .btn-row {
+      display: flex;
+      justify-content: space-between;
+      margin-top: 2rem;
+      gap: 1rem;
+    }
+    button {
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.95rem;
+      padding: 0.75rem 1.5rem;
+      border-radius: 8px;
+      border: none;
+      transition: all 0.2s;
+    }
+    .btn-primary {
+      background: var(--primary);
+      color: #fff;
+    }
+    .btn-primary:hover {
+      background: var(--primary-hover);
+    }
+    .btn-secondary {
+      background: transparent;
+      color: var(--text-muted);
+      border: 1px solid var(--card-border);
+    }
+    .btn-secondary:hover {
+      color: #fff;
+      border-color: var(--text-muted);
+    }
+    .discord-preview {
+      background: #2b2d31;
+      border-left: 4px solid var(--primary);
+      border-radius: 6px;
+      padding: 1.25rem;
+      margin-top: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+    }
+    .discord-title {
+      font-size: 1.1rem;
+      font-weight: 700;
+      color: #fff;
+    }
+    .discord-desc {
+      font-size: 0.9rem;
+      color: #dbdee1;
+      line-height: 1.4;
+    }
+    .discord-field {
+      display: flex;
+      flex-direction: column;
+      margin-top: 0.5rem;
+    }
+    .discord-field-name {
+      font-size: 0.75rem;
+      font-weight: 700;
+      color: #949ba4;
+      text-transform: uppercase;
+    }
+    .discord-field-value {
+      font-size: 0.85rem;
+      color: #fff;
+    }
+    .token-box {
+      background: var(--code-bg);
+      border: 1px dashed var(--card-border);
+      border-radius: 8px;
+      padding: 1rem;
+      font-family: monospace;
+      font-size: 0.9rem;
+      color: var(--accent);
+      word-break: break-all;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 0.5rem;
+    }
+    .copy-btn {
+      background: rgba(56, 189, 248, 0.1);
+      color: var(--accent);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+      padding: 0.35rem 0.75rem;
+      font-size: 0.8rem;
+      border-radius: 4px;
+      margin-left: 0.75rem;
+      white-space: nowrap;
+    }
+    .copy-btn:hover {
+      background: rgba(56, 189, 248, 0.2);
+    }
+    .card-img-preview {
+      width: 100%;
+      border-radius: 8px;
+      border: 1px solid var(--card-border);
+      margin-top: 1rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="badge">First-Time Setup</div>
+    <h1>MCMesh Gateway Setup</h1>
+    <p class="subtitle">Complete the 3-step walkthrough to bootstrap your community gateway</p>
+  </div>
+
+  <div class="container">
+    <div class="stepper">
+      <div class="step-item active" id="step-indicator-1">
+        <div class="step-circle">1</div>
+        <div class="step-label">Admin Access</div>
+      </div>
+      <div class="step-item" id="step-indicator-2">
+        <div class="step-circle">2</div>
+        <div class="step-label">Branding</div>
+      </div>
+      <div class="step-item" id="step-indicator-3">
+        <div class="step-circle">3</div>
+        <div class="step-label">World & Invites</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <!-- Step 1: Admin Credentials -->
+      <div class="step-content active" id="step-1">
+        <h2 style="font-size: 1.25rem; margin-bottom: 0.5rem;">Step 1: Admin Credentials</h2>
+        <p class="help-text" style="font-size: 0.85rem; margin-bottom: 1.5rem;">
+          Configure your primary gateway operator account. This grants full administrative control over world leases, mod requests, and panel settings.
+        </p>
+
+        <div class="form-group">
+          <label for="adminName">Admin Player Name</label>
+          <input type="text" id="adminName" placeholder="e.g. Steve" required />
+          <div class="help-text">Your Minecraft in-game username or nickname.</div>
+        </div>
+
+        <div class="btn-row" style="justify-content: flex-end;">
+          <button class="btn-primary" onclick="goToStep(2)">Next: Branding &rarr;</button>
+        </div>
+      </div>
+
+      <!-- Step 2: Community Branding -->
+      <div class="step-content" id="step-2">
+        <h2 style="font-size: 1.25rem; margin-bottom: 0.5rem;">Step 2: Community & Modpack Branding</h2>
+        <p class="help-text" style="font-size: 0.85rem; margin-bottom: 1.5rem;">
+          Customize how your server appears on Discord cards, mod client onboarding, and the web panel.
+        </p>
+
+        <div class="form-group">
+          <label for="communityName">Community / Server Name</label>
+          <input type="text" id="communityName" placeholder="e.g. Homestead SMP" />
+          <div class="help-text">Displayed on the WebUI header and player invite cards.</div>
+        </div>
+
+        <div class="form-group">
+          <label for="packName">Modpack Name</label>
+          <input type="text" id="packName" placeholder="e.g. All The Mods 10 / Create Astral" />
+          <div class="help-text">The modpack required by connecting guests.</div>
+        </div>
+
+        <div class="form-group">
+          <label for="serverMotd">Server MOTD</label>
+          <input type="text" id="serverMotd" placeholder="e.g. Welcome to our decentralized co-op world!" />
+          <div class="help-text">Welcome banner shown in client server list.</div>
+        </div>
+
+        <div class="btn-row">
+          <button class="btn-secondary" onclick="goToStep(1)">&larr; Back</button>
+          <button class="btn-primary" onclick="goToStep(3)">Next: World & Invites &rarr;</button>
+        </div>
+      </div>
+
+      <!-- Step 3: World & Discord Invite Card -->
+      <div class="step-content" id="step-3">
+        <h2 style="font-size: 1.25rem; margin-bottom: 0.5rem;">Step 3: World Setup & Discord Card</h2>
+        <p class="help-text" style="font-size: 0.85rem; margin-bottom: 1.5rem;">
+          Register an initial world ID and generate ready-to-share Discord invite cards.
+        </p>
+
+        <div class="form-group">
+          <label for="worldId">Initial World Identifier</label>
+          <input type="text" id="worldId" placeholder="e.g. main-world" value="main-world" />
+          <div class="help-text">Alphanumeric lowercase identifier for your primary mesh world.</div>
+        </div>
+
+        <div class="form-group">
+          <label for="worldName">World Display Name</label>
+          <input type="text" id="worldName" placeholder="e.g. Season 1: Create Overhaul" value="Season 1: Create Overhaul" />
+        </div>
+
+        <div id="setup-result" style="display: none; margin-top: 1.5rem;">
+          <label>Admin Device Token</label>
+          <div class="token-box">
+            <span id="resAdminToken">...</span>
+            <button class="copy-btn" onclick="copyToken()">Copy Token</button>
+          </div>
+
+          <label style="margin-top: 1rem;">Discord Invite Card Preview</label>
+          <img id="cardImg" class="card-img-preview" src="/v1/setup/discord-card" alt="Discord Invite Card" />
+
+          <div class="discord-preview" id="discordEmbed">
+            <div class="discord-title" id="previewTitle">Community Invite</div>
+            <div class="discord-desc" id="previewDesc">Join our peer-to-peer Minecraft mesh world!</div>
+            <div class="discord-field">
+              <span class="discord-field-name">Instant Connect Link</span>
+              <span class="discord-field-value" id="previewLink">https://.../join/...</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="btn-row">
+          <button class="btn-secondary" onclick="goToStep(2)">&larr; Back</button>
+          <button class="btn-primary" id="finishBtn" onclick="submitSetup()">Finish Setup &rarr;</button>
+          <button class="btn-primary" id="panelBtn" style="display: none;" onclick="window.location.href='/panel'">Go to Admin Panel &rarr;</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let currentStep = 1;
+
+    async function checkStatus() {
+      try {
+        const res = await fetch('/v1/setup/status');
+        if (res.ok) {
+          const data = await res.json();
+          if (data.community_name) document.getElementById('communityName').value = data.community_name;
+          if (data.pack_name) document.getElementById('packName').value = data.pack_name;
+        }
+      } catch (e) {
+        console.warn('Could not check setup status', e);
+      }
+    }
+    checkStatus();
+
+    function goToStep(step) {
+      if (step === 2 && !document.getElementById('adminName').value.trim()) {
+        alert('Please enter an admin username before proceeding.');
+        return;
+      }
+      currentStep = step;
+      for (let i = 1; i <= 3; i++) {
+        document.getElementById(`step-${i}`).classList.remove('active');
+        const indicator = document.getElementById(`step-indicator-${i}`);
+        indicator.classList.remove('active');
+        if (i < step) {
+          indicator.classList.add('completed');
+        } else {
+          indicator.classList.remove('completed');
+        }
+      }
+      document.getElementById(`step-${step}`).classList.add('active');
+      document.getElementById(`step-indicator-${step}`).classList.add('active');
+    }
+
+    async function submitSetup() {
+      const finishBtn = document.getElementById('finishBtn');
+      finishBtn.disabled = true;
+      finishBtn.textContent = 'Setting up...';
+
+      const payload = {
+        admin_name: document.getElementById('adminName').value.trim(),
+        community_name: document.getElementById('communityName').value.trim() || 'MCMesh Community',
+        pack_name: document.getElementById('packName').value.trim() || 'MCMesh Pack',
+        motd: document.getElementById('serverMotd').value.trim(),
+        initial_world_id: document.getElementById('worldId').value.trim(),
+        initial_world_name: document.getElementById('worldName').value.trim()
+      };
+
+      try {
+        const res = await fetch('/v1/setup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        if (!res.ok) {
+          const err = await res.text();
+          alert('Setup failed: ' + err);
+          finishBtn.disabled = false;
+          finishBtn.textContent = 'Finish Setup \u2192';
+          return;
+        }
+
+        const data = await res.json();
+        localStorage.setItem('mcmesh_token', data.admin_token);
+        localStorage.setItem('mcmesh_admin', data.admin_name);
+
+        document.getElementById('resAdminToken').textContent = data.admin_token;
+        document.getElementById('previewTitle').textContent = `${payload.community_name} \u2022 ${payload.pack_name}`;
+        document.getElementById('previewDesc').textContent = payload.motd || `Join ${payload.initial_world_name} on MCMesh P2P network.`;
+        document.getElementById('previewLink').textContent = `${window.location.origin}${data.invite_url}`;
+        document.getElementById('cardImg').src = `/v1/setup/discord-card?t=${Date.now()}`;
+
+        document.getElementById('setup-result').style.display = 'block';
+        finishBtn.style.display = 'none';
+        document.getElementById('panelBtn').style.display = 'inline-block';
+      } catch (err) {
+        alert('Network error during setup: ' + err.message);
+        finishBtn.disabled = false;
+        finishBtn.textContent = 'Finish Setup \u2192';
+      }
+    }
+
+    function copyToken() {
+      const token = document.getElementById('resAdminToken').textContent;
+      navigator.clipboard.writeText(token).then(() => alert('Admin token copied to clipboard!'));
+    }
+  </script>
+</body>
+</html>

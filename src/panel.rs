@@ -411,6 +411,210 @@ async fn panel_login(State(s): State<Arc<AppState>>, Json(b): Json<LoginReq>) ->
     Ok(Json(json!({ "token": token })))
 }
 
+#[derive(Deserialize)]
+struct SetupPayload {
+    admin_name: String,
+    community_name: Option<String>,
+    pack_name: Option<String>,
+    motd: Option<String>,
+    initial_world_id: Option<String>,
+    initial_world_name: Option<String>,
+}
+
+async fn setup_page() -> impl IntoResponse {
+    ([(header::CACHE_CONTROL, "no-cache")], Html(include_str!("../web/setup.html")))
+}
+
+async fn get_setup_status(State(s): State<Arc<AppState>>) -> R {
+    let gw = s.gw();
+    let admin_count: i64 = gw.db.query_row(
+        "SELECT COUNT(*) FROM gateway_admins",
+        [],
+        |r| r.get(0)
+    ).unwrap_or(0);
+    let worlds_count: i64 = gw.db.query_row(
+        "SELECT COUNT(*) FROM worlds",
+        [],
+        |r| r.get(0)
+    ).unwrap_or(0);
+    let community_name = gw.db.query_row(
+        "SELECT value FROM admin_settings WHERE key='community_name'",
+        [],
+        |r| r.get(0)
+    ).unwrap_or_else(|_| std::env::var("MCMESH_COMMUNITY_NAME").unwrap_or_else(|_| "MCMesh Community".into()));
+    let pack_name = gw.db.query_row(
+        "SELECT value FROM admin_settings WHERE key='pack_name'",
+        [],
+        |r| r.get(0)
+    ).unwrap_or_else(|_| std::env::var("MCMESH_PACK_NAME").unwrap_or_else(|_| "MCMesh Pack".into()));
+
+    Ok(Json(json!({
+        "configured": admin_count > 0,
+        "admin_count": admin_count,
+        "community_name": community_name,
+        "pack_name": pack_name,
+        "worlds_count": worlds_count,
+    })))
+}
+
+async fn post_setup(State(s): State<Arc<AppState>>, Json(b): Json<SetupPayload>) -> R {
+    let admin_name = b.admin_name.trim();
+    if admin_name.is_empty() {
+        return Err(ApiErr::BadRequest("admin_name required"));
+    }
+
+    let mut gw = s.gw();
+    let _ = gw.admin_init();
+    let now = crate::lease::wall_s();
+
+    // 1. Ensure player exists
+    let player_uuid: String = match gw.db.query_row(
+        "SELECT uuid FROM players WHERE name=? COLLATE NOCASE",
+        params![admin_name],
+        |r| r.get(0),
+    ) {
+        Ok(u) => u,
+        Err(_) => {
+            use sha2::{Digest, Sha256};
+            let hash = Sha256::digest(format!("player:{}", admin_name.to_lowercase()).as_bytes());
+            let u = hash[..16].iter().map(|b| format!("{b:02x}")).collect::<String>();
+            gw.db.execute(
+                "INSERT INTO players(uuid, name, created_at) VALUES(?, ?, ?)",
+                params![u, admin_name, now],
+            ).map_err(Error::Db)?;
+            u
+        }
+    };
+
+    // 2. Grant gateway_admin
+    gw.db.execute(
+        "INSERT OR IGNORE INTO gateway_admins(player_uuid, granted_by, granted_at) VALUES(?, 'setup', ?)",
+        params![player_uuid, now],
+    ).map_err(Error::Db)?;
+
+    // 3. Create device and admin session token
+    let dev_id = format!("dev-admin-{}", &player_uuid[..std::cmp::min(8, player_uuid.len())]);
+    let _ = gw.db.execute(
+        "INSERT OR IGNORE INTO devices(id, player_uuid, label, last_seen) VALUES(?, ?, 'Web Admin', ?)",
+        params![dev_id, player_uuid, now],
+    );
+
+    let mut raw = [0u8; 24];
+    getrandom::getrandom(&mut raw).map_err(|_| ApiErr::Domain(Error::Rand))?;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let token = URL_SAFE_NO_PAD.encode(raw);
+    gw.add_token(&dev_id, &token)?;
+
+    // 4. Save branding
+    let comm_name = b.community_name.unwrap_or_else(|| "MCMesh Community".into());
+    let pack_name = b.pack_name.unwrap_or_else(|| "MCMesh Modpack".into());
+    gw.db.execute("INSERT OR REPLACE INTO admin_settings(key, value) VALUES('community_name', ?)", params![comm_name]).map_err(Error::Db)?;
+    gw.db.execute("INSERT OR REPLACE INTO admin_settings(key, value) VALUES('pack_name', ?)", params![pack_name]).map_err(Error::Db)?;
+    if let Some(motd) = b.motd {
+        gw.db.execute("INSERT OR REPLACE INTO admin_settings(key, value) VALUES('motd', ?)", params![motd]).map_err(Error::Db)?;
+    }
+
+    // 5. Initial world
+    let mut invite_code = String::new();
+    let mut world_id = String::new();
+    if let Some(w_id_raw) = b.initial_world_id {
+        let w_id = w_id_raw.trim();
+        if !w_id.is_empty() {
+            world_id = w_id.to_string();
+            let w_name = b.initial_world_name.unwrap_or_else(|| w_id.to_string());
+            let _ = gw.db.execute(
+                "INSERT OR IGNORE INTO worlds(id, name, mc_version, loader, created_at) VALUES(?, ?, '1.21.1', 'neoforge', ?)",
+                params![w_id, w_name, now],
+            );
+            let _ = gw.db.execute(
+                "INSERT OR IGNORE INTO members(world_id, player_uuid, role) VALUES(?, ?, 'ADMIN')",
+                params![w_id, player_uuid],
+            );
+            let mut c_raw = [0u8; 6];
+            let _ = getrandom::getrandom(&mut c_raw);
+            invite_code = URL_SAFE_NO_PAD.encode(c_raw);
+            let _ = gw.db.execute(
+                "INSERT INTO invites(code, world_id, role, created_at) VALUES(?, ?, 'CLIENT_ONLY', ?)",
+                params![invite_code, w_id, now],
+            );
+        }
+    }
+
+    let invite_url = if !invite_code.is_empty() {
+        format!("/join/{invite_code}")
+    } else {
+        String::new()
+    };
+
+    Ok(Json(json!({
+        "ok": true,
+        "admin_name": admin_name,
+        "admin_token": token,
+        "device_id": dev_id,
+        "community_name": comm_name,
+        "pack_name": pack_name,
+        "world_id": world_id,
+        "invite_code": invite_code,
+        "invite_url": invite_url,
+        "discord_card_url": "/v1/setup/discord-card"
+    })))
+}
+
+async fn get_discord_card(State(s): State<Arc<AppState>>) -> impl IntoResponse {
+    let gw = s.gw();
+    let comm_name: String = gw.db.query_row(
+        "SELECT value FROM admin_settings WHERE key='community_name'",
+        [],
+        |r| r.get(0)
+    ).unwrap_or_else(|_| "MCMesh Community".into());
+    let pack_name: String = gw.db.query_row(
+        "SELECT value FROM admin_settings WHERE key='pack_name'",
+        [],
+        |r| r.get(0)
+    ).unwrap_or_else(|_| "MCMesh Modpack".into());
+    let motd: String = gw.db.query_row(
+        "SELECT value FROM admin_settings WHERE key='motd'",
+        [],
+        |r| r.get(0)
+    ).unwrap_or_else(|_| "Cooperative Decentralized Multiplayer".into());
+
+    let svg = format!(r##"<svg xmlns="http://www.w3.org/2000/svg" width="560" height="280" viewBox="0 0 560 280">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1e222d"/>
+      <stop offset="100%" stop-color="#141720"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+  </defs>
+  <rect width="560" height="280" rx="14" fill="url(#bg)" stroke="#2b3142" stroke-width="2"/>
+  <rect x="0" y="0" width="8" height="280" rx="4" fill="url(#accent)"/>
+  
+  <text x="36" y="48" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif" font-size="12" font-weight="700" fill="#10b981" letter-spacing="1">YOU'VE BEEN INVITED TO JOIN</text>
+  <text x="36" y="86" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif" font-size="24" font-weight="800" fill="#ffffff">{}</text>
+  <text x="36" y="118" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif" font-size="14" font-weight="500" fill="#949ba4">{}</text>
+
+  <rect x="36" y="146" width="488" height="1" fill="#2b3142"/>
+
+  <circle cx="48" cy="178" r="5" fill="#22c55e"/>
+  <text x="64" y="182" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif" font-size="13" font-weight="600" fill="#f1f5f9">Mesh Gateway Online</text>
+
+  <text x="36" y="224" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif" font-size="12" font-weight="600" fill="#64748b">MODPACK</text>
+  <text x="36" y="246" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif" font-size="14" font-weight="700" fill="#e2e8f0">{} (NeoForge 1.21.1)</text>
+
+  <rect x="360" y="206" width="164" height="42" rx="6" fill="#10b981"/>
+  <text x="442" y="232" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif" font-size="14" font-weight="700" fill="#ffffff" text-anchor="middle">Join World</text>
+</svg>"##, html_escape(&comm_name), html_escape(&motd), html_escape(&pack_name));
+
+    ([(header::CONTENT_TYPE, "image/svg+xml"), (header::CACHE_CONTROL, "no-cache")], svg)
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
 async fn page() -> impl IntoResponse {
     ([(header::CACHE_CONTROL, "no-cache")], Html(include_str!("../web/panel.html")))
 }
@@ -423,6 +627,10 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(landing))
         .route("/panel", get(page))
+        .route("/setup", get(setup_page))
+        .route("/v1/setup/status", get(get_setup_status))
+        .route("/v1/setup", post(post_setup))
+        .route("/v1/setup/discord-card", get(get_discord_card))
         .route("/v1/worlds/:id/mods", get(get_mods).put(put_mods).layer(axum::extract::DefaultBodyLimit::max(256 << 10)))
         .route("/v1/worlds/:id/members", get(get_members).put(put_member))
         .route("/v1/worlds/:id/mod-requests", get(get_mod_requests).post(post_mod_requests).layer(axum::extract::DefaultBodyLimit::max(256 << 10)))

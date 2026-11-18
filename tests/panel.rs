@@ -34,3 +34,65 @@ fn member_edits_are_admin_only_and_keep_one_admin() {
     let names: Vec<_> = g.members("w1").unwrap().into_iter().map(|m| m.0).collect();
     assert_eq!(names, ["bob"]);
 }
+
+#[tokio::test]
+async fn setup_wizard_bootstraps_gateway_and_generates_discord_card() {
+    let dir = std::env::temp_dir().join(format!("mcmesh-setup-{}", std::process::id()));
+    let g = Gateway::open(Connection::open_in_memory().unwrap(), Cas::open(dir).unwrap(), 0).unwrap();
+    let app = gatewayd::server::router(gatewayd::server::AppState::new(g));
+
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    // 1. Initial status is unconfigured
+    let req = Request::get("/v1/setup/status").body(Body::empty()).unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["configured"], false);
+
+    // 2. POST /v1/setup
+    let setup_body = serde_json::json!({
+        "admin_name": "SetupAdmin",
+        "community_name": "Test SMP",
+        "pack_name": "Test Pack",
+        "motd": "Welcome to test!",
+        "initial_world_id": "world-1",
+        "initial_world_name": "First World"
+    });
+    let req = Request::post("/v1/setup")
+        .header("content-type", "application/json")
+        .body(Body::from(setup_body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["admin_name"], "SetupAdmin");
+    assert!(!v["admin_token"].as_str().unwrap().is_empty());
+    assert!(!v["invite_url"].as_str().unwrap().is_empty());
+
+    // 3. Status now configured
+    let req = Request::get("/v1/setup/status").body(Body::empty()).unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["configured"], true);
+    assert_eq!(v["community_name"], "Test SMP");
+    assert_eq!(v["pack_name"], "Test Pack");
+
+    // 4. GET /v1/setup/discord-card returns SVG
+    let req = Request::get("/v1/setup/discord-card").body(Body::empty()).unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.headers().get("content-type").unwrap(), "image/svg+xml");
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let svg = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(svg.contains("<svg"));
+    assert!(svg.contains("Test SMP"));
+    assert!(svg.contains("Test Pack"));
+}
