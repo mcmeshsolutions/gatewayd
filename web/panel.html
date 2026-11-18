@@ -384,7 +384,11 @@ async function renderPulseCard(w,canAdmin){
   const sFo=el('small',{textContent:'Backup candidates'});
   const statFailover=el('div',{className:'stat'},el('div',{className:'k',textContent:'Failover Readiness'}),vFo,sFo);
 
-  statsGrid.append(statHw,statTps,statFailover);
+  const vP2p=el('div',{className:'v',textContent:'-'});
+  const sP2p=el('small',{textContent:'0% P2P · $0.00 saved'});
+  const statP2p=el('div',{className:'stat'},el('div',{className:'k',textContent:'P2P Offload & Savings'}),vP2p,sP2p);
+
+  statsGrid.append(statHw,statTps,statFailover,statP2p);
   card.append(statsGrid);
 
   let candSelect=null,frzBtn=null;
@@ -450,6 +454,10 @@ async function renderPulseCard(w,canAdmin){
         sTps.textContent='0 TPS';
         vFo.textContent='No Host';
         sFo.textContent='0 active sessions';
+        const sc=p.p2p_scorecard||{};
+        vP2p.textContent=sc.p2p_offload_rate_percent!=null?sc.p2p_offload_rate_percent.toFixed(1)+'%':'-';
+        const savedUsd=sc.cloud_cost_savings_usd!=null?'$'+sc.cloud_cost_savings_usd.toFixed(2):'$0.00';
+        sP2p.textContent=`${savedUsd} saved (Idle)`;
       }else{
         const host=p.host||{};
         bBadge.className='badge '+(host.health==='OPTIMAL'?'ok':host.health==='DEGRADED'?'warn':'bad');
@@ -466,6 +474,13 @@ async function renderPulseCard(w,canAdmin){
         vFo.textContent=fo.ready?`Ready (${fo.candidate_count})`:'Single Point';
         vFo.className='v'+(fo.ready?'':' over');
         sFo.textContent=fo.best_candidate?`Top backup: ${fo.best_candidate.player_name} (${fo.best_candidate.score.toFixed(1)})`:'No backup bidders';
+
+        const sc=p.p2p_scorecard||{};
+        vP2p.textContent=sc.p2p_offload_rate_percent!=null?sc.p2p_offload_rate_percent.toFixed(1)+'%':'-';
+        const savedUsd=sc.cloud_cost_savings_usd!=null?'$'+sc.cloud_cost_savings_usd.toFixed(2):'$0.00';
+        const p2pMb=sc.p2p_direct_bytes!=null?(sc.p2p_direct_bytes/(1024*1024)).toFixed(1)+' MB P2P':'0 MB';
+        const relayMb=sc.central_relay_total_bytes!=null?(sc.central_relay_total_bytes/(1024*1024)).toFixed(1)+' MB Relay':'0 MB';
+        sP2p.textContent=`${savedUsd} saved · ${p2pMb} / ${relayMb}`;
 
         if(candSelect){
           const curVal=candSelect.value;

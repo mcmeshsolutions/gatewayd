@@ -148,7 +148,7 @@ impl Gateway {
         Ok((bytes as u64, worlds as u64))
     }
 
-    pub(crate) fn meter_value(&self, world: &str, name: &str) -> u64 {
+    pub fn meter_value(&self, world: &str, name: &str) -> u64 {
         let v: Option<i64> = self.db.query_row("SELECT value FROM meters WHERE world_id=? AND name=?", params![world, name], |r| r.get(0)).optional().ok().flatten();
         v.unwrap_or(0).max(0) as u64
     }

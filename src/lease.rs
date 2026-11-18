@@ -880,7 +880,8 @@ impl Gateway {
                 "can_freeze": true,
                 "frozen": frozen,
                 "barrier_pending": barrier_pending,
-            }
+            },
+            "p2p_scorecard": self.p2p_scorecard(world).unwrap_or_else(|_| json!({})),
         }))
     }
 

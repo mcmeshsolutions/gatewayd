@@ -677,6 +677,14 @@ async fn post_pulse_freeze(State(s): State<Arc<AppState>>, h: HeaderMap, Path(wo
     Ok(Json(json!({ "ok": true, "frozen": b.frozen })))
 }
 
+async fn get_world_p2p_meter(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_member_or_admin(&s, &gw, &dev, &world)?;
+    let meter = gw.p2p_scorecard(&world)?;
+    Ok(Json(meter))
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(landing))
@@ -695,6 +703,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/worlds/:id/pulse/handover", post(post_pulse_handover))
         .route("/v1/worlds/:id/pulse/flush", post(post_pulse_flush))
         .route("/v1/worlds/:id/pulse/freeze", post(post_pulse_freeze))
+        .route("/v1/worlds/:id/p2p-meter", get(get_world_p2p_meter))
         .route("/v1/panel/code", post(panel_code))
         .route("/v1/panel/login", post(panel_login))
 }

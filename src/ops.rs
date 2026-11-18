@@ -81,6 +81,34 @@ impl Gateway {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Returns P2P bandwidth offload scorecard for a world.
+    pub fn p2p_scorecard(&self, world: &str) -> Result<Value, Error> {
+        let to_guest = self.meter_value(world, "relay_to_guest_bytes");
+        let to_host = self.meter_value(world, "relay_to_host_bytes");
+        let relay_total = to_guest + to_host;
+        let p2p_direct = self.meter_value(world, "p2p_direct_bytes");
+        let total_traffic = relay_total + p2p_direct;
+        let offload_pct = if total_traffic > 0 {
+            (p2p_direct as f64 / total_traffic as f64) * 100.0
+        } else {
+            0.0
+        };
+        // Standard cloud VPS egress benchmark: $0.09 per GB
+        let savings_usd = (p2p_direct as f64 / (1024.0 * 1024.0 * 1024.0)) * 0.09;
+        Ok(json!({
+            "world_id": world,
+            "relay_to_guest_bytes": to_guest,
+            "relay_to_host_bytes": to_host,
+            "central_relay_egress_bytes": to_guest,
+            "central_relay_total_bytes": relay_total,
+            "p2p_direct_bytes": p2p_direct,
+            "total_traffic_bytes": total_traffic,
+            "p2p_offload_rate_percent": (offload_pct * 10.0).round() / 10.0,
+            "cloud_cost_savings_usd": (savings_usd * 100.0).round() / 100.0,
+            "standard_rate_per_gb_usd": 0.09,
+        }))
+    }
+
     pub fn summary(&self) -> Result<Summary, Error> {
         let worlds = {
             let mut st = self.db.prepare("SELECT state, COUNT(*) FROM worlds GROUP BY state ORDER BY state")?;
