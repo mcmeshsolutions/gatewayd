@@ -720,6 +720,29 @@ async fn isomap_viewer(Path(_id): Path<String>) -> Response {
     Html(include_str!("../web/isomap.html")).into_response()
 }
 
+#[derive(Deserialize)]
+pub struct HeatmapQuery {
+    pub radius: Option<i32>,
+}
+
+async fn world_heatmap(
+    Path(world): Path<String>,
+    Query(q): Query<HeatmapQuery>,
+) -> Json<crate::timeline::HeatmapResponse> {
+    let r = q.radius.unwrap_or(8);
+    Json(crate::timeline::generate_heatmap(&world, r))
+}
+
+async fn world_hall_of_fame(
+    Path(world): Path<String>,
+) -> Json<crate::timeline::HallOfFameResponse> {
+    Json(crate::timeline::generate_hall_of_fame(&world))
+}
+
+async fn timeline_viewer(Path(_id): Path<String>) -> Response {
+    Html(include_str!("../web/timeline.html")).into_response()
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/status", get(status_page))
@@ -730,11 +753,14 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/view/:id", get(voxel_viewer))
         .route("/contraption", get(contraption_viewer))
         .route("/isomap/:id", get(isomap_viewer))
+        .route("/timeline/:id", get(timeline_viewer))
         .route("/v1/contraptions/inspect", post(contraption_inspect))
         .route("/v1/contraptions/demo", get(contraption_demo))
         .route("/v1/worlds/:id/voxels", get(world_voxels))
         .route("/v1/worlds/:id/timeline", get(world_timeline))
         .route("/v1/worlds/:id/isomap", get(world_isomap))
+        .route("/v1/worlds/:id/heatmap", get(world_heatmap))
+        .route("/v1/worlds/:id/hall-of-fame", get(world_hall_of_fame))
         .route("/v1/worlds/:id/events", get(world_events))
         .route("/v1/worlds/:id/events/stream", get(world_event_stream))
 }

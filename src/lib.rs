@@ -29,6 +29,7 @@ pub mod server;
 pub mod shard;
 pub mod skin;
 pub mod sso;
+pub mod timeline;
 pub mod tunnel;
 pub mod wal;
 pub mod worldgen;
