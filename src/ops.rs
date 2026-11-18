@@ -1047,6 +1047,41 @@ async fn homeassistant_discovery(State(s): State<Arc<AppState>>) -> Json<Value> 
     }))
 }
 
+async fn homelab_widget(State(s): State<Arc<AppState>>) -> Json<Value> {
+    let tunnels = s.live_worlds.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let gw = s.gw();
+    let summary = gw.summary().unwrap_or(Summary {
+        worlds: Vec::new(),
+        live_leases: 0,
+        players: 0,
+        revisions: 0,
+        last_commit_at: None,
+    });
+    let worlds_total: i64 = summary.worlds.iter().map(|(_, n)| *n).sum();
+    let worlds_active: i64 = summary
+        .worlds
+        .iter()
+        .filter(|(st, _)| st != "IDLE")
+        .map(|(_, n)| *n)
+        .sum();
+    let maint_on = gw.maintenance().is_some();
+    let last_commit_age_s = summary.last_commit_at.map(|t| (wall_s() - t).max(0));
+
+    Json(json!({
+        "ok": true,
+        "status": if maint_on { "maintenance" } else { "online" },
+        "worlds_total": worlds_total,
+        "worlds_active": worlds_active,
+        "live_leases": summary.live_leases,
+        "tunnels_active": tunnels,
+        "players_registered": summary.players,
+        "revisions_total": summary.revisions,
+        "last_commit_age_s": last_commit_age_s,
+        "uptime_s": s.uptime_s(),
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/healthz", get(healthz))
@@ -1055,6 +1090,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/doctor", get(doctor_json))
         .route("/v1/proxy/test", get(proxy_test))
         .route("/v1/monitoring/homeassistant", get(homeassistant_discovery))
+        .route("/v1/widget/homelab", get(homelab_widget))
         .route("/.well-known/mcmesh-gateway.json", get(well_known))
         .route("/metrics", get(metrics))
         .route("/invite/:code", get(invite_page))

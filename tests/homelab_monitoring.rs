@@ -58,5 +58,22 @@ async fn test_healthz_and_homeassistant_discovery() {
         "homeassistant/binary_sensor/mcmesh_gateway_online/config"
     );
 
+    // 3. GET /v1/widget/homelab
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/v1/widget/homelab")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = r.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let w: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(w["ok"], true);
+    assert_eq!(w["status"], "online");
+    assert_eq!(w["worlds_total"], 2);
+    assert_eq!(w["worlds_active"], 0);
+    assert_eq!(w["players_registered"], 1);
+    assert_eq!(w["revisions_total"], 2);
+
     let _ = std::fs::remove_dir_all(&temp);
 }

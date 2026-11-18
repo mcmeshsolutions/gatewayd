@@ -169,6 +169,7 @@ fn exempt_from_client_gate(path: &str, h: &HeaderMap) -> bool {
         || path == "/v1/motd"
         || path == "/v1/proxy/test"
         || path == "/v1/monitoring/homeassistant"
+        || path == "/v1/widget/homelab"
         || path.starts_with("/v1/admin/")
         || path.starts_with("/v1/panel/")
         || path.starts_with("/v1/sso/")
