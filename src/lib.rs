@@ -37,6 +37,7 @@ pub mod skin;
 pub mod s3;
 pub mod sso;
 pub mod tailscale;
+pub mod zfs;
 pub mod timeline;
 pub mod tunnel;
 pub mod wal;

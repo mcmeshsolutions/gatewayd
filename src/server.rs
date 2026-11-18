@@ -39,6 +39,7 @@ pub struct AppState {
     pub s3: Arc<crate::s3::S3Replicator>,
     pub shield: Arc<crate::shield::SecurityShield>,
     pub tailscale: Arc<crate::tailscale::TailscaleManager>,
+    pub zfs: Arc<crate::zfs::ZfsSnapshotter>,
 }
 
 impl AppState {
@@ -78,6 +79,7 @@ impl AppState {
             s3,
             shield,
             tailscale,
+            zfs: Arc::new(crate::zfs::ZfsSnapshotter::from_env()),
         })
     }
     /// Seconds since this world was last asked for by someone who could not get in, or None if never.
@@ -727,6 +729,12 @@ async fn commit(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Path<
         }
     };
     gw.meter(&world, "commits", 1);
+    if s.zfs.enabled() {
+        let (z, w, rev, kind, last) = (s.zfs.clone(), world.clone(), r.id.clone(), b.kind.clone(), b.last);
+        std::thread::spawn(move || {
+            z.on_commit(&w, &rev, &kind, last, now);
+        });
+    }
     if b.kind != "AUTOSAVE" {
         s.hooks.emit("revision.committed", &world, json!({ "rev": r.id, "seq": r.seq, "kind": b.kind }));
     }
