@@ -511,6 +511,8 @@ struct EpochReq {
     players: Option<u32>,
     #[serde(default)]
     load: Option<u32>,
+    #[serde(default)]
+    tps: Option<f64>,
 }
 
 async fn heartbeat(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Path<String>, Json(b): Json<EpochReq>) -> R {
@@ -518,15 +520,19 @@ async fn heartbeat(State(s): State<Arc<AppState>>, h: HeaderMap, Path(lease): Pa
     let mut gw = s.gw();
     let dev = auth(&gw, &h)?;
     own_lease(&gw, &dev, &lease)?;
-    let pending = gw.heartbeat_status(&lease, b.epoch, b.players, b.load, now)?;
+    let pending = gw.heartbeat_full(&lease, b.epoch, b.players, b.load, b.tps, now)?;
     if b.sync_total > 0 {
         s.sync.lock().unwrap_or_else(|e| e.into_inner()).insert(lease.clone(), (b.sync_done, b.sync_total, Instant::now()));
     }
     let dirs: Vec<Value> = pending
         .into_iter()
-        .map(|Directive::MigratePrepare { target_device, deadline_ms }| {
-            let name = target_device.as_deref().and_then(|d| gw.device_player(d).ok().flatten()).map(|(_, n)| n);
-            json!({ "type": "MIGRATE_PREPARE", "target_device": target_device, "target_name": name, "deadline_ms": deadline_ms })
+        .map(|d| match d {
+            Directive::MigratePrepare { target_device, deadline_ms } => {
+                let name = target_device.as_deref().and_then(|d| gw.device_player(d).ok().flatten()).map(|(_, n)| n);
+                json!({ "type": "MIGRATE_PREPARE", "target_device": target_device, "target_name": name, "deadline_ms": deadline_ms })
+            }
+            Directive::FlushBarrier => json!({ "type": "FLUSH_BARRIER" }),
+            Directive::LagFreeze { frozen } => json!({ "type": "LAG_FREEZE", "frozen": frozen }),
         })
         .collect();
     Ok(Json(json!({ "ok": true, "expires_in": EXPIRY_MS / 1000, "directives": dirs })))

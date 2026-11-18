@@ -171,6 +171,7 @@ function renderMotd(box,str){
 function unformatMotd(s){return (s||'').replace(/\u00a7([0-9a-fklmnor])/gi,'&$1');}
 
 function setTab(name){
+  if(pulseTimer){clearInterval(pulseTimer);pulseTimer=null;}
   state.activeTab=name;
   for(const b of $('#nav').querySelectorAll('button')){
     b.classList.toggle('on',b.dataset.tab===name);
@@ -358,7 +359,141 @@ function renderOverviewTab(){
   box.append(wCard);
 }
 
+let pulseTimer=null;
+
+async function renderPulseCard(w,canAdmin){
+  const card=el('div',{className:'card'});
+  const bBadge=el('span',{className:'badge',textContent:'Connecting...'});
+  const bUpdated=el('small',{textContent:''});
+  const pulseHead=el('div',{className:'between'},
+    el('div',{className:'row'},el('h2',{textContent:'Live Pulse & Remote Control'}),bBadge),
+    bUpdated
+  );
+  card.append(pulseHead);
+
+  const statsGrid=el('div',{className:'stats'});
+  const vHw=el('div',{className:'v',textContent:'-'});
+  const sHw=el('small',{textContent:'Awaiting host metrics'});
+  const statHw=el('div',{className:'stat'},el('div',{className:'k',textContent:'Host Hardware Score'}),vHw,sHw);
+
+  const vTps=el('div',{className:'v',textContent:'-'});
+  const sTps=el('small',{textContent:'Ticks / second'});
+  const statTps=el('div',{className:'stat'},el('div',{className:'k',textContent:'Active TPS / Health'}),vTps,sTps);
+
+  const vFo=el('div',{className:'v',textContent:'-'});
+  const sFo=el('small',{textContent:'Backup candidates'});
+  const statFailover=el('div',{className:'stat'},el('div',{className:'k',textContent:'Failover Readiness'}),vFo,sFo);
+
+  statsGrid.append(statHw,statTps,statFailover);
+  card.append(statsGrid);
+
+  let candSelect=null,frzBtn=null;
+  if(canAdmin){
+    const ctrlBox=el('div',{style:'margin-top:.75rem;padding-top:.75rem;border-top:1px solid var(--line)'});
+    ctrlBox.append(el('h3',{textContent:'Zero-SSH Remote Controls'}));
+    const ctrlRow=el('div',{className:'row'});
+
+    candSelect=el('select',{style:'min-width:10rem'},el('option',{value:'',textContent:'Auto: Best Candidate'}));
+    const handoverBtn=el('button',{className:'go',textContent:'Handover World'});
+    handoverBtn.onclick=async()=>{
+      if(!confirm(`Trigger immediate zero-SSH handover for ${w.name}?`))return;
+      handoverBtn.disabled=true;
+      try{
+        const target=candSelect.value||null;
+        const res=await api(`/v1/worlds/${w.id}/pulse/handover`,send('POST',{target_device:target}));
+        note(`Handover initiated towards ${res.target_device||'best candidate'}`);
+        updatePulse();
+      }catch(e){err(e.message);}
+      finally{handoverBtn.disabled=false;}
+    };
+
+    const flushBtn=el('button',{textContent:'WAL Barrier Flush'});
+    flushBtn.onclick=async()=>{
+      flushBtn.disabled=true;
+      try{
+        await api(`/v1/worlds/${w.id}/pulse/flush`,send('POST',{}));
+        note('WAL Barrier Flush queued for next host heartbeat');
+        updatePulse();
+      }catch(e){err(e.message);}
+      finally{flushBtn.disabled=false;}
+    };
+
+    frzBtn=el('button',{textContent:'Lag Freeze (Pause Ticks)'});
+    frzBtn.onclick=async()=>{
+      const isFrozen=frzBtn.dataset.frozen==='true';
+      if(!confirm(`${isFrozen?'Unfreeze':'Freeze'} tick processing on ${w.name}?`))return;
+      frzBtn.disabled=true;
+      try{
+        await api(`/v1/worlds/${w.id}/pulse/freeze`,send('POST',{frozen:!isFrozen}));
+        note(`World lag freeze ${!isFrozen?'activated':'deactivated'}`);
+        updatePulse();
+      }catch(e){err(e.message);}
+      finally{frzBtn.disabled=false;}
+    };
+
+    ctrlRow.append(candSelect,handoverBtn,flushBtn,frzBtn);
+    ctrlBox.append(ctrlRow);
+    card.append(ctrlBox);
+  }
+
+  async function updatePulse(){
+    try{
+      const p=await api(`/v1/worlds/${w.id}/pulse`);
+      bUpdated.textContent='Updated '+new Date().toLocaleTimeString();
+
+      if(p.world_state==='IDLE'){
+        bBadge.className='badge';
+        bBadge.textContent='World Idle';
+        vHw.textContent='Idle';
+        sHw.textContent='No host running';
+        vTps.textContent='-';
+        sTps.textContent='0 TPS';
+        vFo.textContent='No Host';
+        sFo.textContent='0 active sessions';
+      }else{
+        const host=p.host||{};
+        bBadge.className='badge '+(host.health==='OPTIMAL'?'ok':host.health==='DEGRADED'?'warn':'bad');
+        bBadge.textContent=`${p.world_state} (${host.player_name||'Host'})`;
+
+        vHw.textContent=host.hw_score!=null?host.hw_score.toFixed(1):'-';
+        const info=host.hw_info||{};
+        sHw.textContent=(info.cpu||'Host CPU')+(info.cores?` · ${info.cores}c`:'')+(info.heap_mb?` · ${info.heap_mb}MB`:'');
+
+        vTps.textContent=(host.tps!=null?host.tps.toFixed(1):'20.0')+' TPS';
+        sTps.textContent=`${host.players_online||0} players · Load shed L${host.load_shed_level||0}`;
+
+        const fo=p.failover||{};
+        vFo.textContent=fo.ready?`Ready (${fo.candidate_count})`:'Single Point';
+        vFo.className='v'+(fo.ready?'':' over');
+        sFo.textContent=fo.best_candidate?`Top backup: ${fo.best_candidate.player_name} (${fo.best_candidate.score.toFixed(1)})`:'No backup bidders';
+
+        if(candSelect){
+          const curVal=candSelect.value;
+          candSelect.replaceChildren();
+          candSelect.append(el('option',{value:'',textContent:'Auto: Best Candidate'}));
+          (fo.candidates||[]).forEach(c=>{
+            candSelect.append(el('option',{value:c.device_id,textContent:`${c.player_name} (Score ${c.score.toFixed(1)})`}));
+          });
+          candSelect.value=curVal;
+        }
+
+        if(frzBtn){
+          frzBtn.dataset.frozen=p.frozen?'true':'false';
+          frzBtn.className=p.frozen?'x':'';
+          frzBtn.textContent=p.frozen?'Unfreeze Ticks (Active)':'Lag Freeze (Pause Ticks)';
+        }
+      }
+    }catch(e){}
+  }
+
+  updatePulse();
+  if(pulseTimer)clearInterval(pulseTimer);
+  pulseTimer=setInterval(updatePulse,3000);
+  return card;
+}
+
 async function renderWorldTab(){
+  if(pulseTimer){clearInterval(pulseTimer);pulseTimer=null;}
   const box=$('#tab-world');
   box.replaceChildren();
   if(!state.worlds.length){
@@ -399,6 +534,9 @@ async function renderWorldTab(){
     )
   );
   box.append(headCard);
+
+  const pulseCard=await renderPulseCard(w,canAdmin);
+  box.append(pulseCard);
 
   // Hosting Control (superadmin only - these endpoints are gateway-admin gated server-side regardless of world role)
   if(state.me.superadmin){

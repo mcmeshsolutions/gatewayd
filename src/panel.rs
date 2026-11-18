@@ -623,6 +623,60 @@ async fn landing() -> impl IntoResponse {
     ([(header::CACHE_CONTROL, "no-cache")], Html(include_str!("../web/index.html")))
 }
 
+#[derive(Deserialize)]
+struct HandoverReq {
+    target_device: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FreezeReq {
+    frozen: bool,
+}
+
+async fn get_world_pulse(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> R {
+    let gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_member_or_admin(&s, &gw, &dev, &world)?;
+    let pulse = gw.world_pulse(&world, s.now())?;
+    Ok(Json(pulse))
+}
+
+async fn post_pulse_handover(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<HandoverReq>) -> R {
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_world_or_gw_admin(&s, &gw, &dev, &world)?;
+    if gw.active_lease(&world)?.is_none() {
+        return Err(ApiErr::Conflict("NO_ACTIVE_HOST"));
+    }
+    let target = gw.trigger_handover(&world, b.target_device.as_deref(), s.now())?;
+    if target.is_none() && b.target_device.is_some() {
+        return Err(ApiErr::Conflict("TARGET_NOT_BIDDING"));
+    }
+    gw.audit(&dev, "pulse.handover", &world, target.as_deref().unwrap_or(""), json!({ "target": target }));
+    Ok(Json(json!({ "ok": true, "target_device": target, "handover_initiated": true })))
+}
+
+async fn post_pulse_flush(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> R {
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_world_or_gw_admin(&s, &gw, &dev, &world)?;
+    if gw.active_lease(&world)?.is_none() {
+        return Err(ApiErr::Conflict("NO_ACTIVE_HOST"));
+    }
+    let queued = gw.trigger_flush_barrier(&world)?;
+    gw.audit(&dev, "pulse.flush_barrier", &world, "", json!({}));
+    Ok(Json(json!({ "ok": true, "barrier_pending": queued })))
+}
+
+async fn post_pulse_freeze(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>, Json(b): Json<FreezeReq>) -> R {
+    let mut gw = s.gw();
+    let dev = auth(&gw, &h)?;
+    require_world_or_gw_admin(&s, &gw, &dev, &world)?;
+    gw.set_world_frozen(&world, b.frozen)?;
+    gw.audit(&dev, "pulse.lag_freeze", &world, "", json!({ "frozen": b.frozen }));
+    Ok(Json(json!({ "ok": true, "frozen": b.frozen })))
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(landing))
@@ -637,6 +691,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/worlds/:id/mod-requests/resolve", post(post_mod_resolve))
         .route("/v1/worlds/:id/revisions", get(get_revisions))
         .route("/v1/worlds/:id/revert", post(post_revert))
+        .route("/v1/worlds/:id/pulse", get(get_world_pulse))
+        .route("/v1/worlds/:id/pulse/handover", post(post_pulse_handover))
+        .route("/v1/worlds/:id/pulse/flush", post(post_pulse_flush))
+        .route("/v1/worlds/:id/pulse/freeze", post(post_pulse_freeze))
         .route("/v1/panel/code", post(panel_code))
         .route("/v1/panel/login", post(panel_login))
 }

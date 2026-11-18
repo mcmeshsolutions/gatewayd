@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS worlds(
   state TEXT NOT NULL DEFAULT 'IDLE' CHECK(state IN('IDLE','LOCKED','MIGRATING')),
   phase TEXT,
   epoch INTEGER NOT NULL DEFAULT 0, head_ref TEXT NOT NULL DEFAULT 'main',
-  created_at INTEGER NOT NULL);
+  created_at INTEGER NOT NULL, frozen INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS members(
   world_id TEXT NOT NULL REFERENCES worlds(id), player_uuid TEXT NOT NULL REFERENCES players(uuid),
   role TEXT NOT NULL CHECK(role IN('ADMIN','HOST_ELIGIBLE','CLIENT_ONLY')),
@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS leases(
   device_id TEXT NOT NULL REFERENCES devices(id), epoch INTEGER NOT NULL, ref_name TEXT NOT NULL,
   base_rev TEXT NOT NULL, tier INTEGER NOT NULL, hmac_key BLOB NOT NULL,
   status TEXT NOT NULL CHECK(status IN('ACTIVE','HANDOFF','RELEASED','EXPIRED','FENCED')),
-  granted_at INTEGER NOT NULL, end_reason TEXT);
+  granted_at INTEGER NOT NULL, end_reason TEXT, players INTEGER, load INTEGER, tps REAL);
 CREATE UNIQUE INDEX IF NOT EXISTS one_live_lease ON leases(world_id) WHERE status IN('ACTIVE','HANDOFF');
 CREATE TABLE IF NOT EXISTS sessions(
   token_hash BLOB PRIMARY KEY, device_id TEXT NOT NULL REFERENCES devices(id));

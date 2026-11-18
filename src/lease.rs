@@ -1,6 +1,7 @@
 use crate::cas::{Cas, Hash};
 use crate::manifest::{self, Change};
 use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -127,6 +128,8 @@ pub enum Join {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Directive {
     MigratePrepare { target_device: Option<String>, deadline_ms: u64 },
+    FlushBarrier,
+    LagFreeze { frozen: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +222,8 @@ impl Gateway {
         let _ = db.execute("ALTER TABLE devices ADD COLUMN anchor INTEGER NOT NULL DEFAULT 0", []);
         let _ = db.execute("ALTER TABLE shard_offers ADD COLUMN players TEXT NOT NULL DEFAULT '[]'", []);
         let _ = db.execute("ALTER TABLE shard_leases ADD COLUMN merged INTEGER NOT NULL DEFAULT 0", []);
+        let _ = db.execute("ALTER TABLE leases ADD COLUMN tps REAL", []);
+        let _ = db.execute("ALTER TABLE worlds ADD COLUMN frozen INTEGER NOT NULL DEFAULT 0", []);
         db.execute("UPDATE sessions SET last_used=? WHERE last_used IS NULL", params![unix_s()])?;
         db.execute("DELETE FROM sessions WHERE last_used>0 AND last_used<?", params![unix_s() - session_ttl_s()])?;
         let mut g = Gateway {
@@ -626,6 +631,18 @@ impl Gateway {
 
     /// `load` is the host's load-shedding level, 0 to 3; None keeps the stored value (old mods never send it).
     pub fn heartbeat_status(&mut self, lease: &str, epoch: i64, players: Option<u32>, load: Option<u32>, now: u64) -> Result<Vec<Directive>> {
+        self.heartbeat_full(lease, epoch, players, load, None, now)
+    }
+
+    pub fn heartbeat_full(
+        &mut self,
+        lease: &str,
+        epoch: i64,
+        players: Option<u32>,
+        load: Option<u32>,
+        tps: Option<f64>,
+        now: u64,
+    ) -> Result<Vec<Directive>> {
         self.require_live(lease, epoch)?;
         if let Some(t) = self.timers.get_mut(lease) {
             t.last_hb = now;
@@ -635,6 +652,9 @@ impl Gateway {
         }
         if let Some(l) = load {
             self.db.execute("UPDATE leases SET load=? WHERE id=?", params![l.min(3), lease])?;
+        }
+        if let Some(t) = tps {
+            self.db.execute("UPDATE leases SET tps=? WHERE id=?", params![t.clamp(0.0, 100.0), lease])?;
         }
         Ok(self.directives.remove(lease).unwrap_or_default())
     }
@@ -663,6 +683,205 @@ impl Gateway {
             )
             .optional()?
             .flatten())
+    }
+
+    /// Last reported active TPS of the world's live host; None when unknown or no live lease.
+    pub fn lease_tps(&self, world: &str) -> Result<Option<f64>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT tps FROM leases WHERE world_id=? AND status IN('ACTIVE','HANDOFF')",
+                params![world],
+                |r| r.get::<_, Option<f64>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    pub fn world_is_frozen(&self, world: &str) -> Result<bool> {
+        Ok(self
+            .db
+            .query_row("SELECT frozen FROM worlds WHERE id=?", params![world], |r| {
+                r.get::<_, i64>(0)
+            })
+            .optional()?
+            .map(|v| v != 0)
+            .unwrap_or(false))
+    }
+
+    pub fn set_world_frozen(&mut self, world: &str, frozen: bool) -> Result<()> {
+        self.db.execute(
+            "UPDATE worlds SET frozen=? WHERE id=?",
+            params![if frozen { 1 } else { 0 }, world],
+        )?;
+        if let Some(lid) = self.lease_of_world(world) {
+            self.directives.entry(lid).or_default().push(Directive::LagFreeze { frozen });
+        }
+        Ok(())
+    }
+
+    pub fn trigger_flush_barrier(&mut self, world: &str) -> Result<bool> {
+        if let Some(lid) = self.lease_of_world(world) {
+            self.directives.entry(lid).or_default().push(Directive::FlushBarrier);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn has_pending_flush(&self, world: &str) -> bool {
+        if let Some(lid) = self.lease_of_world(world) {
+            self.directives.get(&lid).map_or(false, |dirs| {
+                dirs.iter().any(|d| matches!(d, Directive::FlushBarrier))
+            })
+        } else {
+            false
+        }
+    }
+
+    pub fn trigger_handover(&mut self, world: &str, target_device: Option<&str>, now: u64) -> Result<Option<String>> {
+        let lease = self.active_lease(world)?;
+        let Some((lid, cur_dev, _epoch, _cur_tier)) = lease else {
+            return Ok(None);
+        };
+
+        let target = match target_device {
+            Some(d) => Some(d.to_string()),
+            None => {
+                let cands = self.candidates(world, now);
+                cands
+                    .into_iter()
+                    .filter(|c| c.0 != cur_dev)
+                    .max_by(|a, b| a.2.total_cmp(&b.2))
+                    .map(|c| c.0)
+            }
+        };
+
+        self.set_state(world, "MIGRATING", Some("PREPARING"))?;
+        self.db.execute("UPDATE leases SET status='HANDOFF' WHERE id=?", params![lid])?;
+        self.directives.entry(lid).or_default().push(Directive::MigratePrepare {
+            target_device: target.clone(),
+            deadline_ms: 20_000,
+        });
+        Ok(target)
+    }
+
+    pub fn world_pulse(&self, world: &str, now: u64) -> Result<Value> {
+        let (state, phase, epoch) = self.world_state(world)?;
+        let lease = self.active_lease(world)?;
+        let frozen = self.world_is_frozen(world)?;
+
+        let host = if let Some((lid, dev_id, lease_epoch, tier)) = lease {
+            let timer = self.timers.get(&lid);
+            let last_hb_ms = timer.map(|t| now.saturating_sub(t.last_hb));
+            let hw_score = timer.map(|t| t.score).unwrap_or(0.0);
+
+            let (player_uuid, player_name) = self
+                .device_player(&dev_id)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| ("".into(), "Unknown".into()));
+
+            let hw_json: Option<Value> = self
+                .db
+                .query_row(
+                    "SELECT hw_json FROM devices WHERE id=?",
+                    params![dev_id],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .unwrap_or(None)
+                .and_then(|s| serde_json::from_str(&s).ok());
+
+            let (players, load, tps): (Option<u32>, Option<u32>, Option<f64>) = self
+                .db
+                .query_row(
+                    "SELECT players, load, tps FROM leases WHERE id=?",
+                    params![lid],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap_or((None, None, None));
+
+            let active_tps = tps.unwrap_or(20.0);
+            let active_load = load.unwrap_or(0);
+            let health = if active_tps >= 19.0 && active_load <= 1 {
+                "OPTIMAL"
+            } else if active_tps >= 15.0 || active_load == 2 {
+                "DEGRADED"
+            } else {
+                "CRITICAL"
+            };
+
+            Some(json!({
+                "lease_id": lid,
+                "device_id": dev_id,
+                "player_uuid": player_uuid,
+                "player_name": player_name,
+                "epoch": lease_epoch,
+                "tier": tier,
+                "hw_score": hw_score,
+                "hw_info": hw_json,
+                "players_online": players.unwrap_or(0),
+                "load_shed_level": active_load,
+                "tps": active_tps,
+                "health": health,
+                "last_heartbeat_ms_ago": last_hb_ms,
+            }))
+        } else {
+            None
+        };
+
+        let cur_host_dev = host.as_ref().and_then(|h| h.get("device_id")).and_then(|d| d.as_str());
+        let all_cands = self.candidates(world, now);
+        let mut backup_cands = Vec::new();
+        for (d, tier, score, seen) in &all_cands {
+            if Some(d.as_str()) == cur_host_dev {
+                continue;
+            }
+            let (_, name) = self
+                .device_player(d)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| ("".into(), d.clone()));
+            backup_cands.push(json!({
+                "device_id": d,
+                "player_name": name,
+                "tier": tier,
+                "score": score,
+                "age_s": (now.saturating_sub(*seen) / 1000) as i64,
+                "ready": true
+            }));
+        }
+        backup_cands.sort_by(|a, b| {
+            let sa = a["score"].as_f64().unwrap_or(0.0);
+            let sb = b["score"].as_f64().unwrap_or(0.0);
+            sb.total_cmp(&sa)
+        });
+
+        let best_candidate = backup_cands.first().cloned();
+        let failover_ready = !backup_cands.is_empty();
+        let barrier_pending = self.has_pending_flush(world);
+
+        Ok(json!({
+            "world_id": world,
+            "world_state": state,
+            "phase": phase,
+            "epoch": epoch,
+            "frozen": frozen,
+            "host": host,
+            "failover": {
+                "ready": failover_ready,
+                "candidate_count": backup_cands.len(),
+                "best_candidate": best_candidate,
+                "candidates": backup_cands,
+            },
+            "controls": {
+                "can_handover": host.is_some() && failover_ready,
+                "can_flush": host.is_some(),
+                "can_freeze": true,
+                "frozen": frozen,
+                "barrier_pending": barrier_pending,
+            }
+        }))
     }
 
     pub(crate) fn require_live(&self, lease: &str, epoch: i64) -> Result<(String, String)> {
