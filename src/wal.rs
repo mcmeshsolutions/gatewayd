@@ -165,17 +165,20 @@ impl Gateway {
         Ok(tag(&self.db, &self.cas, world, hash)?)
     }
 
-    pub fn blob_visible(&self, device: &str, hash: &[u8; 32]) -> Result<bool> {
+    pub fn blob_accessible_world(&self, device: &str, hash: &[u8; 32]) -> Result<Option<String>> {
         Ok(self
             .db
             .query_row(
-                "SELECT 1 FROM blob_world b JOIN members m ON m.world_id=b.world_id JOIN devices d ON d.player_uuid=m.player_uuid \
-                 WHERE b.hash=? AND d.id=? AND d.revoked=0",
+                "SELECT b.world_id FROM blob_world b JOIN members m ON m.world_id=b.world_id JOIN devices d ON d.player_uuid=m.player_uuid \
+                 WHERE b.hash=? AND d.id=? AND d.revoked=0 LIMIT 1",
                 params![&hash[..], device],
-                |_| Ok(()),
+                |r| r.get(0),
             )
-            .optional()?
-            .is_some())
+            .optional()?)
+    }
+
+    pub fn blob_visible(&self, device: &str, hash: &[u8; 32]) -> Result<bool> {
+        Ok(self.blob_accessible_world(device, hash)?.is_some())
     }
 
     pub fn cas(&self) -> &crate::cas::Cas {

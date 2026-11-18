@@ -23,6 +23,7 @@ pub const UDP_CLOSE: u8 = 8;
 pub const PING: u8 = 9;
 pub const PONG: u8 = 10;
 pub const CUDP: u8 = 11;
+pub const BCAST: u8 = 12;
 
 /// `token` is the legacy plaintext login. Newer hosts send `ts` (unix seconds) and `proof` instead:
 /// lowercase hex HMAC-SHA256 over "mcmesh-tunnel|lease|epoch|ts", keyed by SHA-256(token) as raw bytes.
@@ -79,12 +80,15 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, f: &Frame) -> io::Res
     if f.data.len() > MAX_PAYLOAD {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame too large"));
     }
-    let mut b = Vec::with_capacity(9 + f.data.len());
-    b.push(f.ty);
-    b.extend_from_slice(&f.id.to_be_bytes());
-    b.extend_from_slice(&(f.data.len() as u32).to_be_bytes());
-    b.extend_from_slice(&f.data);
-    w.write_all(&b).await
+    let mut hdr = [0u8; 9];
+    hdr[0] = f.ty;
+    hdr[1..5].copy_from_slice(&f.id.to_be_bytes());
+    hdr[5..9].copy_from_slice(&(f.data.len() as u32).to_be_bytes());
+    w.write_all(&hdr).await?;
+    if !f.data.is_empty() {
+        w.write_all(&f.data).await?;
+    }
+    Ok(())
 }
 
 /// Copies between a TCP socket and the tunnel until either side ends, then tells the peer with CLOSE.

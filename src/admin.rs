@@ -1013,6 +1013,7 @@ async fn rollback_region(State(s): State<Arc<AppState>>, h: HeaderMap, Path(worl
     match gw.rollback_region(&world, &b.revision, &b.dim, b.min_cx, b.min_cz, b.max_cx, b.max_cz)? {
         Ok(r) => {
             gw.audit(&dev, "world.rollback_region", &world, &r.revision, json!({ "from": b.revision, "dim": b.dim, "restored": r.restored, "removed": r.removed }));
+            s.hooks.emit("world.rollback", &world, json!({ "actor": dev, "from": b.revision, "to": r.revision, "dim": b.dim, "restored": r.restored, "removed": r.removed }));
             Ok(Json(json!({ "revision": r.revision, "restored": r.restored, "removed": r.removed })))
         }
         Err("BAD_REGION") => Err(ApiErr::BadRequest("BAD_REGION")),

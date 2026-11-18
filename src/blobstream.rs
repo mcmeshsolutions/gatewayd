@@ -224,8 +224,12 @@ fn spawn_store(state: Arc<AppState>, cas: Cas, device: String, sem: Arc<Semaphor
 fn spawn_fetch(state: Arc<AppState>, cas: Cas, device: String, sem: Arc<Semaphore>, tx: mpsc::Sender<Frame>, id: u32, hash: [u8; 32]) {
     tokio::spawn(async move {
         let _permit = sem.acquire().await;
-        let visible = state.gw().blob_visible(&device, &hash).unwrap_or(false);
-        if !visible || !cas.has(&hash) {
+        let world = state.gw().blob_accessible_world(&device, &hash).ok().flatten();
+        let Some(world) = world else {
+            let _ = tx.send(Frame::new(MISSING, id, Vec::new())).await;
+            return;
+        };
+        if !cas.has(&hash) {
             let _ = tx.send(Frame::new(MISSING, id, Vec::new())).await;
             return;
         }
@@ -237,12 +241,7 @@ fn spawn_fetch(state: Arc<AppState>, cas: Cas, device: String, sem: Arc<Semaphor
             let _ = tx.send(Frame::new(MISSING, id, Vec::new())).await;
             return;
         };
-        {
-            let gw = state.gw();
-            if let Some(world) = gw.blob_world_for(&device, &hash) {
-                gw.meter(&world, "blob_get_bytes", data.len() as u64);
-            }
-        }
+        state.gw().meter(&world, "blob_get_bytes", data.len() as u64);
         if tx.send(Frame::new(BLOB_BEGIN, id, (data.len() as u64).to_be_bytes().to_vec())).await.is_err() {
             return;
         }

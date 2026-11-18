@@ -815,11 +815,12 @@ async fn blob_get(State(s): State<Arc<AppState>>, h: HeaderMap, Path(hash): Path
     let want = parse_hex(&hash).ok_or(ApiErr::BadRequest("BAD_HASH"))?;
     let gw = s.gw();
     let dev = auth(&gw, &h)?;
-    if !gw.blob_visible(&dev, &want)? || !gw.cas().has(&want) {
+    let world = gw.blob_accessible_world(&dev, &want)?.ok_or(ApiErr::BadRequest("NO_SUCH_BLOB"))?;
+    if !gw.cas().has(&want) {
         return Err(ApiErr::BadRequest("NO_SUCH_BLOB"));
     }
     let data = gw.cas().get(&want).map_err(|e| ApiErr::Domain(e.into()))?;
-    gw.meter(&gw.blob_world_for(&dev, &want).unwrap_or_default(), "blob_get_bytes", data.len() as u64);
+    gw.meter(&world, "blob_get_bytes", data.len() as u64);
     Ok(data)
 }
 
@@ -858,15 +859,8 @@ async fn revision_files(State(s): State<Arc<AppState>>, h: HeaderMap, Path(rev):
     Ok(Json(json!({ "rev": rev, "root": hex(&root), "chunks": chunks, "aux": aux })))
 }
 
-/// Owner-only world download. `export_zip` needs `Seek`, so the zip goes through a temp file that is removed on every exit path.
+/// Owner-only world download. Streams zip directly without buffering the whole archive in memory.
 async fn world_export(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world): Path<String>) -> Result<Response, ApiErr> {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    struct TempZip(std::path::PathBuf);
-    impl Drop for TempZip {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
     let (root, cas) = {
         let gw = s.gw();
         let dev = auth(&gw, &h)?;
@@ -881,30 +875,39 @@ async fn world_export(State(s): State<Arc<AppState>>, h: HeaderMap, Path(world):
     } else {
         "world.zip".to_string()
     };
-    let path = std::env::temp_dir().join(format!(
-        "mcmesh-export-{}-{}.zip",
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let file = std::fs::File::create(&path).map_err(|e| ApiErr::Domain(e.into()))?;
-    let _cleanup = TempZip(path.clone());
-    let read_path = path.clone();
-    let bytes = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
-        crate::maintenance::export_zip(&cas, root, file)?;
-        std::fs::read(read_path)
-    })
-    .await
-    .map_err(|_| ApiErr::Domain(Error::Store("export task failed".into())))?
-    .map_err(|e| match e.kind() {
-        std::io::ErrorKind::InvalidData => ApiErr::Conflict("EXPORT_CORRUPT"),
-        _ => ApiErr::Domain(e.into()),
-    })?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(16);
+    tokio::task::spawn_blocking(move || {
+        struct Pipe(tokio::sync::mpsc::Sender<std::io::Result<Bytes>>);
+        impl std::io::Write for Pipe {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.blocking_send(Ok(Bytes::copy_from_slice(buf)))
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client disconnected"))?;
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        if let Err(e) = crate::maintenance::export_zip(&cas, root, Pipe(tx.clone())) {
+            let _ = tx.blocking_send(Err(e));
+        }
+    });
+    let first = match rx.recv().await {
+        Some(Ok(b)) => b,
+        Some(Err(e)) if e.kind() == std::io::ErrorKind::InvalidData => return Err(ApiErr::Conflict("EXPORT_CORRUPT")),
+        Some(Err(e)) => return Err(ApiErr::Domain(e.into())),
+        None => Bytes::new(),
+    };
+    use futures_util::StreamExt;
+    let rest = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    let stream = futures_util::stream::once(async move { Ok::<_, std::io::Error>(first) }).chain(rest);
+    let body = axum::body::Body::from_stream(stream);
     Ok((
         [
             (axum::http::header::CONTENT_TYPE, "application/zip".to_string()),
             (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\"")),
         ],
-        bytes,
+        body,
     )
         .into_response())
 }

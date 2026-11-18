@@ -379,7 +379,7 @@ fn build_mca(cas: &Cas, chunks: &[(usize, Hash)]) -> std::io::Result<Vec<u8>> {
 type RegionGroup = ((String, manifest::Kind, i32, i32), Vec<(usize, Hash)>);
 
 /// Writes revision `root` as a vanilla world folder zip. Refuses, before writing anything, if any referenced blob is missing or corrupt.
-pub fn export_zip<W: std::io::Write + std::io::Seek>(cas: &Cas, root: Hash, out: W) -> std::io::Result<ExportStats> {
+pub fn export_zip<W: std::io::Write>(cas: &Cas, root: Hash, out: W) -> std::io::Result<ExportStats> {
     export_zip_limit(cas, root, out, 0xFFFF_FFFF)
 }
 

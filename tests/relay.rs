@@ -538,3 +538,89 @@ async fn a_guest_whose_player_file_a_shard_wrote_is_routed_to_that_shard_host() 
     let got = send_and_read(e.guests, &[hs, login].concat(), want.len()).await;
     assert_eq!(got, want.to_ascii_uppercase(), "Carol reached the main host");
 }
+
+#[tokio::test]
+async fn tunnel_broadcast_fans_out_to_all_guests() {
+    let e = env_with(false).await;
+    let mut agent = TcpStream::connect(e.agents).await.unwrap();
+    let (mut rd, mut wr) = agent.split();
+    let h = Hello { lease: e.lease.clone(), epoch: 1, token: "tok-a".into(), ts: None, proof: None };
+    write_frame(&mut wr, &Frame::new(HELLO, 0, serde_json::to_vec(&h).unwrap())).await.unwrap();
+    let f = read_frame(&mut rd).await.unwrap();
+    assert_eq!(f.ty, HELLO_OK);
+
+    async fn next_frame<R: tokio::io::AsyncRead + Unpin>(rd: &mut R) -> Frame {
+        loop {
+            let f = read_frame(rd).await.unwrap();
+            if f.ty != PING {
+                return f;
+            }
+        }
+    }
+
+    // Guest 1 connects
+    let mut g1 = TcpStream::connect(e.guests).await.unwrap();
+    g1.write_all(b"g1 hello").await.unwrap();
+    let op1 = next_frame(&mut rd).await;
+    assert_eq!(op1.ty, OPEN);
+    let d1 = next_frame(&mut rd).await;
+    assert_eq!(d1.ty, DATA);
+
+    // Guest 2 connects
+    let mut g2 = TcpStream::connect(e.guests).await.unwrap();
+    g2.write_all(b"g2 hello").await.unwrap();
+    let op2 = next_frame(&mut rd).await;
+    assert_eq!(op2.ty, OPEN);
+    let d2 = next_frame(&mut rd).await;
+    assert_eq!(d2.ty, DATA);
+
+    // Host sends BCAST with id=0 (all guests)
+    write_frame(&mut wr, &Frame::new(BCAST, 0, b"broadcast to all".to_vec())).await.unwrap();
+
+    let mut b1 = vec![0u8; 16];
+    g1.read_exact(&mut b1).await.unwrap();
+    assert_eq!(&b1[..], b"broadcast to all");
+
+    let mut b2 = vec![0u8; 16];
+    g2.read_exact(&mut b2).await.unwrap();
+    assert_eq!(&b2[..], b"broadcast to all");
+
+    // Host sends BCAST with id=op1.id (exclude guest 1)
+    write_frame(&mut wr, &Frame::new(BCAST, op1.id, b"for guest 2 only".to_vec())).await.unwrap();
+    let mut b2_filtered = vec![0u8; 16];
+    g2.read_exact(&mut b2_filtered).await.unwrap();
+    assert_eq!(&b2_filtered[..], b"for guest 2 only");
+}
+
+#[tokio::test]
+async fn guest_connecting_before_host_is_held_in_limbo_and_connected_when_tunnel_opens() {
+    let e = env_with(true).await;
+    let (mc, vc) = fake_server().await;
+
+    let t = ticket(&e, "tok-b").await;
+    assert!(!t.is_empty());
+    let (hs, login) = login_bytes(&format!("play.example.org\0mesh={t}"), "Bob", 2);
+    let (clean_hs, _) = login_bytes("play.example.org", "Bob", 2);
+    let mut want = clean_hs.clone();
+    want.extend_from_slice(&login);
+
+    // Guest connects BEFORE the host agent starts up
+    let mut guest = TcpStream::connect(e.guests).await.unwrap();
+    guest.write_all(&[hs, login].concat()).await.unwrap();
+
+    // Give it 150ms to hit the relay and enter the limbo holding pattern
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Now start the host agent
+    run_agent(&e, "tok-a", 1, mc, vc).await.unwrap();
+
+    // Guest connection should not have been closed, and should roundtrip through the new tunnel
+    let mut out = vec![0u8; want.len()];
+    tokio::time::timeout(Duration::from_secs(5), guest.read_exact(&mut out))
+        .await
+        .expect("limbo guest connection timed out")
+        .unwrap();
+    assert_eq!(out, want.to_ascii_uppercase());
+}
+
+

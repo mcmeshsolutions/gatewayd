@@ -201,6 +201,7 @@ pub(crate) fn wall_s() -> i64 {
 
 impl Gateway {
     pub fn open(db: Connection, cas: Cas, now: u64) -> Result<Self> {
+        db.busy_timeout(std::time::Duration::from_secs(5))?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "NORMAL")?;
         db.pragma_update(None, "foreign_keys", "ON")?;

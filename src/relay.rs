@@ -51,8 +51,8 @@ pub struct Relay {
     udp: Option<Arc<UdpSocket>>,
     /// Extra channels in config order, channel number = index + 1. UDP ones keep their socket here.
     chan_udp: Mutex<HashMap<u8, Arc<UdpSocket>>>,
-    /// Source addresses that recently passed the ticket gate; extra TCP channels only talk to them.
-    known_ips: Mutex<HashMap<std::net::IpAddr, Instant>>,
+    /// Source addresses that recently passed the ticket gate and their target world; extra TCP channels only talk to them.
+    known_ips: Mutex<HashMap<std::net::IpAddr, (Option<String>, Instant)>>,
     cur: Mutex<HashMap<String, Arc<Tunnel>>>,
     /// Shard hosts' tunnels by shard lease id.
     shards: Mutex<HashMap<String, Arc<Tunnel>>>,
@@ -60,6 +60,8 @@ pub struct Relay {
     proxy_protocol: bool,
     /// Guests that have connected but not yet passed the ticket gate; bounded so slow or silent connections cannot pile up.
     pre_auth: Arc<tokio::sync::Semaphore>,
+    /// Signals when a new host tunnel is established so guests held in limbo can resume immediately.
+    pub tunnel_up: Arc<Notify>,
 }
 
 impl Relay {
@@ -68,7 +70,7 @@ impl Relay {
     }
 
     pub fn with_proxy_protocol(state: Arc<AppState>, default_world: Option<&str>, udp: Option<Arc<UdpSocket>>, proxy_protocol: bool) -> Arc<Self> {
-        Arc::new(Relay { state, default_world: default_world.map(Into::into), udp, chan_udp: Mutex::new(HashMap::new()), known_ips: Mutex::new(HashMap::new()), cur: Mutex::new(HashMap::new()), shards: Mutex::new(HashMap::new()), proxy_protocol, pre_auth: Arc::new(tokio::sync::Semaphore::new(MAX_PRE_AUTH)) })
+        Arc::new(Relay { state, default_world: default_world.map(Into::into), udp, chan_udp: Mutex::new(HashMap::new()), known_ips: Mutex::new(HashMap::new()), cur: Mutex::new(HashMap::new()), shards: Mutex::new(HashMap::new()), proxy_protocol, pre_auth: Arc::new(tokio::sync::Semaphore::new(MAX_PRE_AUTH)), tunnel_up: Arc::new(Notify::new()) })
     }
 
     /// Per-source-address limit shared with the HTTP side, so a flood on any listener is cut at the same place.
@@ -94,16 +96,21 @@ impl Relay {
 
     /// With tickets required, only addresses that recently passed the TCP ticket gate may use side channels.
     fn known(&self, ip: std::net::IpAddr) -> bool {
-        !self.state.auth.require_ticket || lock(&self.known_ips).get(&ip).is_some_and(|t| t.elapsed() < KNOWN_IP_TTL)
+        !self.state.auth.require_ticket || lock(&self.known_ips).get(&ip).is_some_and(|(_, t)| t.elapsed() < KNOWN_IP_TTL)
     }
 
     fn all(&self) -> Vec<Arc<Tunnel>> {
         lock(&self.cur).values().cloned().collect()
     }
 
-    /// UDP carries no world name: it goes to the default world, or to the only tunnel when there is just one.
-    fn udp_tunnel(&self) -> Option<Arc<Tunnel>> {
+    /// Resolves tunnel by client IP from known_ips, falling back to default world or single active world.
+    fn udp_tunnel_for(&self, ip: std::net::IpAddr) -> Option<Arc<Tunnel>> {
         let cur = lock(&self.cur);
+        if let Some((Some(world), _)) = lock(&self.known_ips).get(&ip) {
+            if let Some(t) = cur.get(world) {
+                return Some(t.clone());
+            }
+        }
         match &self.default_world {
             Some(w) => cur.get(w).cloned(),
             None if cur.len() == 1 => cur.values().next().cloned(),
@@ -217,6 +224,7 @@ async fn agent_session(relay: Arc<Relay>, sock: TcpStream) {
         relay.drop_tunnel(&t);
         return;
     }
+    relay.tunnel_up.notify_waiters();
     let since = Instant::now();
     let host = relay.state.gw().lease_device(&t.lease).ok().flatten().unwrap_or_default();
     eprintln!("tunnel up: world={} host_device={host} epoch={}", t.world, t.epoch);
@@ -273,6 +281,22 @@ async fn agent_session(relay: Arc<Relay>, sock: TcpStream) {
                 let tx = lock(&t.streams).get(&f.id).cloned();
                 if let Some(tx) = tx {
                     let _ = tx.send(f.data).await;
+                }
+            }
+            BCAST => {
+                let targets: Vec<mpsc::Sender<Vec<u8>>> = {
+                    let map = lock(&t.streams);
+                    map.iter()
+                        .filter(|(&id, _)| f.id == 0 || id != f.id)
+                        .map(|(_, tx)| tx.clone())
+                        .collect()
+                };
+                let count = targets.len() as u64;
+                for tx in targets {
+                    let _ = tx.send(f.data.clone()).await;
+                }
+                if count > 0 {
+                    relay.state.relay_meter(&t.world, 0, f.data.len() as u64 * count);
                 }
             }
             CLOSE => {
@@ -426,8 +450,8 @@ async fn guest_session(relay: Arc<Relay>, mut sock: TcpStream, peer: SocketAddr)
             Some((b, w, u)) => {
                 {
                     let mut k = lock(&relay.known_ips);
-                    k.retain(|_, t| t.elapsed() < KNOWN_IP_TTL);
-                    k.insert(peer.ip(), Instant::now());
+                    k.retain(|_, (_, t)| t.elapsed() < KNOWN_IP_TTL);
+                    k.insert(peer.ip(), (Some(w.clone()), Instant::now()));
                 }
                 (Some(b), w, u)
             }
@@ -438,6 +462,11 @@ async fn guest_session(relay: Arc<Relay>, mut sock: TcpStream, peer: SocketAddr)
         }
     } else {
         let Some(w) = relay.default_world.clone() else { return };
+        {
+            let mut k = lock(&relay.known_ips);
+            k.retain(|_, (_, t)| t.elapsed() < KNOWN_IP_TTL);
+            k.insert(peer.ip(), (Some(w.clone()), Instant::now()));
+        }
         (None, w, None)
     };
     drop(permit);
@@ -451,10 +480,42 @@ async fn guest_session(relay: Arc<Relay>, mut sock: TcpStream, peer: SocketAddr)
         return;
     }
     let home = uuid.as_deref().and_then(|u| relay.state.gw().shard_home(&world, u).ok().flatten());
-    let tunnel = match &home {
+    let mut tunnel = match &home {
         Some(lease) => relay.shard_current(lease).filter(|t| relay.live(t)),
         None => relay.current(&world).filter(|t| relay.live(t)),
     };
+    let is_login = first.as_deref().is_some_and(|b| !is_status(b));
+    let has_active_lease = relay.state.gw().lease_of_world(&world).is_some();
+    if tunnel.is_none() && is_login && has_active_lease {
+        let limbo_timeout = std::env::var("MCMESH_LIMBO_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20);
+        if limbo_timeout > 0 {
+            eprintln!("relay: holding guest in limbo for {world} up to {limbo_timeout}s while host prepares save");
+            let deadline = Instant::now() + Duration::from_secs(limbo_timeout);
+            let mut peek_buf = [0u8; 1];
+            while tunnel.is_none() && Instant::now() < deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                tokio::select! {
+                    _ = relay.tunnel_up.notified() => {},
+                    _ = tokio::time::sleep(remaining.min(Duration::from_millis(100))) => {},
+                    res = sock.peek(&mut peek_buf) => {
+                        if let Ok(0) | Err(_) = res {
+                            return;
+                        }
+                    }
+                }
+                tunnel = match &home {
+                    Some(lease) => relay.shard_current(lease).filter(|t| relay.live(t)),
+                    None => relay.current(&world).filter(|t| relay.live(t)),
+                };
+            }
+        }
+    }
     let Some(t) = tunnel else {
         eprintln!("relay: guest turned away, no live host tunnel for {world}{}", if home.is_some() { " (the shard host of this player)" } else { "" });
         if let Some(b) = first.as_deref().filter(|b| is_status(b)) {
@@ -533,7 +594,7 @@ pub async fn serve_voice(relay: Arc<Relay>, sock: Arc<UdpSocket>) {
         if !relay.known(from.ip()) {
             continue;
         }
-        let Some(t) = relay.udp_tunnel() else { continue };
+        let Some(t) = relay.udp_tunnel_for(from.ip()) else { continue };
         let id = {
             let mut p = lock(&t.peers);
             if let Some(e) = p.by_addr.get_mut(&(0, from)) {
@@ -566,7 +627,7 @@ pub async fn serve_channel_tcp(relay: Arc<Relay>, chan: u8, l: TcpListener) {
             if !r.known(from.ip()) {
                 return;
             }
-            let Some(t) = r.udp_tunnel() else { return };
+            let Some(t) = r.udp_tunnel_for(from.ip()) else { return };
             if !r.live(&t) {
                 return;
             }
@@ -594,7 +655,7 @@ pub async fn serve_channel_udp(relay: Arc<Relay>, chan: u8, sock: Arc<UdpSocket>
         if !relay.known(from.ip()) {
             continue;
         }
-        let Some(t) = relay.udp_tunnel() else { continue };
+        let Some(t) = relay.udp_tunnel_for(from.ip()) else { continue };
         let id = {
             let mut p = lock(&t.peers);
             if let Some(e) = p.by_addr.get_mut(&(chan, from)) {

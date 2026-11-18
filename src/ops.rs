@@ -559,6 +559,10 @@ async fn invite_page(State(s): State<Arc<AppState>>, h: HeaderMap, Path(code): P
     })
 }
 
+async fn voxel_viewer(axum::extract::Path(_id): axum::extract::Path<String>) -> Response {
+    Html(include_str!("../web/voxel.html")).into_response()
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/status", get(status_page))
@@ -566,6 +570,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/.well-known/mcmesh-gateway.json", get(well_known))
         .route("/metrics", get(metrics))
         .route("/invite/:code", get(invite_page))
+        .route("/view/:id", get(voxel_viewer))
         .route("/v1/worlds/:id/events", get(world_events))
         .route("/v1/worlds/:id/events/stream", get(world_event_stream))
 }
