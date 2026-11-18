@@ -11,6 +11,7 @@ pub mod mcproto;
 pub mod ops;
 pub mod chain;
 pub mod devsig;
+pub mod isomap;
 pub mod lease;
 pub mod locks;
 #[cfg(test)]

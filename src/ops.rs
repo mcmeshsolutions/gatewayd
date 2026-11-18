@@ -677,6 +677,49 @@ async fn contraption_viewer() -> Response {
     Html(include_str!("../web/contraption.html")).into_response()
 }
 
+#[derive(Deserialize)]
+pub struct IsoQuery {
+    pub rev: Option<String>,
+    pub cx: Option<i32>,
+    pub cz: Option<i32>,
+    pub radius: Option<i32>,
+    pub time_of_day: Option<i64>,
+    pub sun_angle: Option<f32>,
+    pub ao: Option<bool>,
+}
+
+async fn world_isomap(
+    State(s): State<Arc<AppState>>,
+    Path(world): Path<String>,
+    Query(q): Query<IsoQuery>,
+) -> Result<Json<crate::isomap::IsoMapData>, ApiErr> {
+    let gw = s.gw();
+    let rev = match q.rev {
+        Some(r) => r,
+        None => gw.head(&world)?,
+    };
+    let cx = q.cx.unwrap_or(0);
+    let cz = q.cz.unwrap_or(0);
+    let radius = q.radius.unwrap_or(3);
+    let time_of_day = q.time_of_day.unwrap_or(6000);
+    let ao = q.ao.unwrap_or(true);
+
+    Ok(Json(crate::isomap::generate_isomap(
+        &world,
+        &rev,
+        cx,
+        cz,
+        radius,
+        time_of_day,
+        q.sun_angle,
+        ao,
+    )))
+}
+
+async fn isomap_viewer(Path(_id): Path<String>) -> Response {
+    Html(include_str!("../web/isomap.html")).into_response()
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/status", get(status_page))
@@ -686,10 +729,12 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/invite/:code", get(invite_page))
         .route("/view/:id", get(voxel_viewer))
         .route("/contraption", get(contraption_viewer))
+        .route("/isomap/:id", get(isomap_viewer))
         .route("/v1/contraptions/inspect", post(contraption_inspect))
         .route("/v1/contraptions/demo", get(contraption_demo))
         .route("/v1/worlds/:id/voxels", get(world_voxels))
         .route("/v1/worlds/:id/timeline", get(world_timeline))
+        .route("/v1/worlds/:id/isomap", get(world_isomap))
         .route("/v1/worlds/:id/events", get(world_events))
         .route("/v1/worlds/:id/events/stream", get(world_event_stream))
 }
