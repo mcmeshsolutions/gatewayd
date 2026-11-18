@@ -920,12 +920,141 @@ async fn doctor_json(State(s): State<Arc<AppState>>) -> Json<crate::doctor::Doct
     Json(crate::doctor::run_doctor(&gw))
 }
 
+async fn healthz(State(s): State<Arc<AppState>>) -> Response {
+    let tunnels = s.live_worlds.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let gw = s.gw();
+    let db_ok = gw.db.query_row("SELECT 1", [], |r| r.get::<_, i64>(0)).is_ok();
+    let summary = gw.summary().unwrap_or(Summary {
+        worlds: Vec::new(),
+        live_leases: 0,
+        players: 0,
+        revisions: 0,
+        last_commit_at: None,
+    });
+    let worlds_total: i64 = summary.worlds.iter().map(|(_, n)| *n).sum();
+    let maint_on = gw.maintenance().is_some();
+
+    let status_str = if !db_ok {
+        "degraded"
+    } else if maint_on {
+        "maintenance"
+    } else {
+        "healthy"
+    };
+
+    let code = if db_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        code,
+        Json(json!({
+            "ok": db_ok,
+            "status": status_str,
+            "uptime_s": s.uptime_s(),
+            "worlds_total": worlds_total,
+            "live_leases": summary.live_leases,
+            "tunnels_active": tunnels,
+            "maintenance": maint_on,
+            "version": env!("CARGO_PKG_VERSION"),
+        })),
+    )
+        .into_response()
+}
+
+async fn homeassistant_discovery(State(s): State<Arc<AppState>>) -> Json<Value> {
+    let tunnels = s.live_worlds.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let gw = s.gw();
+    let summary = gw.summary().unwrap_or(Summary {
+        worlds: Vec::new(),
+        live_leases: 0,
+        players: 0,
+        revisions: 0,
+        last_commit_at: None,
+    });
+    let worlds_total: i64 = summary.worlds.iter().map(|(_, n)| *n).sum();
+    let maint_on = gw.maintenance().is_some();
+    let blocked_threats = s.shield.total_blocked();
+    let state_topic = "mcmesh/gateway/state";
+
+    let device = json!({
+        "identifiers": ["mcmesh_gateway"],
+        "name": "MCMesh Gateway",
+        "manufacturer": "mcmeshsolutions",
+        "model": "gatewayd",
+        "sw_version": env!("CARGO_PKG_VERSION"),
+    });
+
+    let sensor = |id: &str, name: &str, field: &str, icon: &str, unit: Option<&str>| {
+        let mut payload = json!({
+            "unique_id": format!("mcmesh_gateway_{id}"),
+            "name": name,
+            "state_topic": state_topic,
+            "value_template": format!("{{{{ value_json.{field} }}}}"),
+            "icon": icon,
+            "device": device,
+        });
+        if let Some(u) = unit {
+            payload["unit_of_measurement"] = json!(u);
+        }
+        json!({
+            "topic": format!("homeassistant/sensor/mcmesh_gateway_{id}/config"),
+            "payload": payload,
+        })
+    };
+
+    let discovery_configs = vec![
+        json!({
+            "topic": "homeassistant/binary_sensor/mcmesh_gateway_online/config",
+            "payload": {
+                "unique_id": "mcmesh_gateway_online",
+                "name": "MCMesh Gateway Online",
+                "state_topic": state_topic,
+                "value_template": "{{ value_json.online }}",
+                "payload_on": "ON",
+                "payload_off": "OFF",
+                "device_class": "connectivity",
+                "device": device,
+            }
+        }),
+        sensor("worlds", "MCMesh Worlds Total", "worlds_total", "mdi:earth", Some("worlds")),
+        sensor("live_leases", "MCMesh Active Host Leases", "live_leases", "mdi:server-network", Some("leases")),
+        sensor("tunnels", "MCMesh Active Relay Tunnels", "tunnels_active", "mdi:lan-connect", Some("tunnels")),
+        sensor("players", "MCMesh Registered Players", "players_registered", "mdi:account-group", Some("players")),
+        sensor("revisions", "MCMesh World Revisions", "revisions_total", "mdi:source-Commit", Some("revisions")),
+        sensor("blocked_threats", "MCMesh Blocked Threats", "blocked_threats", "mdi:shield-lock", Some("requests")),
+    ];
+
+    Json(json!({
+        "ok": true,
+        "discovery_prefix": "homeassistant",
+        "state_topic": state_topic,
+        "state": {
+            "online": "ON",
+            "status": if maint_on { "maintenance" } else { "healthy" },
+            "uptime_s": s.uptime_s(),
+            "worlds_total": worlds_total,
+            "live_leases": summary.live_leases,
+            "tunnels_active": tunnels,
+            "players_registered": summary.players,
+            "revisions_total": summary.revisions,
+            "blocked_threats": blocked_threats,
+            "s3_enabled": s.s3.is_enabled(),
+        },
+        "discovery_configs": discovery_configs,
+    }))
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/healthz", get(healthz))
         .route("/status", get(status_page))
         .route("/v1/status", get(status_json))
         .route("/v1/doctor", get(doctor_json))
         .route("/v1/proxy/test", get(proxy_test))
+        .route("/v1/monitoring/homeassistant", get(homeassistant_discovery))
         .route("/.well-known/mcmesh-gateway.json", get(well_known))
         .route("/metrics", get(metrics))
         .route("/invite/:code", get(invite_page))
