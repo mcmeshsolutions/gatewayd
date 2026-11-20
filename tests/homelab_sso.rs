@@ -14,8 +14,9 @@ async fn test_forward_auth_and_oidc_flow() {
     listener.set_nonblocking(true).unwrap();
 
     std::thread::spawn(move || {
-        for _ in 0..200 {
+        for _ in 0..1000 {
             if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_nonblocking(false);
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut req_line = String::new();
                 let _ = reader.read_line(&mut req_line);
