@@ -29,7 +29,7 @@
 ```mermaid
 flowchart LR
     Guest["Minecraft Guests (:25565 / :24454 UDP)"] <-->|Relayed TCP/UDP| GW["gatewayd"]
-    Host["Active Host (mcmesh mod)"] <-->|Outbound Tunnel (:9000) & CAS (:9100)| GW
+    Host["Active Host (mcmesh mod)"] <-->|"Outbound Tunnel :9000 & CAS :9100"| GW
     Standby["Standby Peer"] -.->|Heartbeat & Lease Watch| GW
     GW -->|WAL + Blobs| DB[("SQLite + CAS Store")]
     GW -.->|Async Replication| S3[("S3 / R2 / MinIO")]
